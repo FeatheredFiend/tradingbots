@@ -36,10 +36,17 @@ The named-watchlist bot HARD-EXITS on any ambiguous or unresolved name,
 because getting a specific hand-picked symbol wrong matters. This bot's
 whole point is breadth, not precision on any one name, so instead it
 SKIPS any pool entry that fails to resolve cleanly (logs why) and carries
-on with whatever did resolve. Expect more of the ~35 entries to need a
-"Name:EPIC" pin or to simply drop out than the 10-name watchlist did —
-this hasn't been run against a live account yet, so treat the whole
-POOL list as a first draft to refine from real output.
+on with whatever did resolve. When a name has several plausible matches
+it auto-picks one and logs every candidate, so a wrong pick can be fixed by
+changing that DEFAULT_POOL entry to "Name:EPIC".
+
+Rate limiting
+-------------
+IG allows only ~30 non-trading requests per minute, account-wide. Every
+search, market-details, bars and positions call here is paced to stay under
+that, so startup resolution takes about a minute and a full pass over the
+pool takes a few minutes. Running this alongside ig_cfd_ema_bot.py on the
+same IG account shares that one budget between them.
 
 Setup
 -----
@@ -108,7 +115,10 @@ BARS_LOOKBACK = 50            # streak detection only needs recent bars, unlike 
 STOP_LOSS_PCT = 0.02
 TAKE_PROFIT_PCT = 0.05
 
-LOOP_INTERVAL_SECONDS = 60
+# No fixed loop interval: the rate limiter below paces every request, so a
+# full pass over ~27-35 symbols naturally takes ~3-4 minutes — still far more
+# often than a 15-minute bar can change.
+ERROR_BACKOFF_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
 
 assert STREAK_LENGTH >= 2, "STREAK_LENGTH must be at least 2 to mean anything"
@@ -122,6 +132,33 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("ig_momentum_bot")
+
+
+# ---------------------------------------------------------------------------
+# RATE LIMITING
+# ---------------------------------------------------------------------------
+class _RateLimiter:
+    """IG allows only ~30 non-trading requests/minute, account-wide, shared
+    across every non-trading endpoint (search, market details, bars,
+    positions). A burst of unpaced calls (e.g. resolving a ~35-symbol pool)
+    blows through that almost immediately and gets 403'd — including calls
+    for symbols that had just succeeded moments earlier. trading-ig's own
+    built-in pacing does not catch this (it reacts to 429s, IG returns 403
+    for this specific case), so every non-trading call in this script goes
+    through this pacer instead of relying on the library."""
+
+    def __init__(self, max_per_minute: int = 28):  # a little under IG's 30 for margin
+        self._min_interval = 60.0 / max_per_minute
+        self._last_call = 0.0
+
+    def wait(self) -> None:
+        remaining = self._min_interval - (time.monotonic() - self._last_call)
+        if remaining > 0:
+            time.sleep(remaining)
+        self._last_call = time.monotonic()
+
+
+_rate_limiter = _RateLimiter()
 
 
 # ---------------------------------------------------------------------------
@@ -149,10 +186,17 @@ def get_ig_service() -> IGService:
     return ig_service
 
 
-NOISE_NAME_MARKERS = ["Leverage", "GraniteShares", "IncomeShares", "ETP", "(DE)", "(FR)", "(ES)", "(IT)", "(CH)", "(NL)"]
+# Fund/leveraged products that are never "the company itself" — e.g. a plain
+# "JPMorgan" search otherwise auto-picked "JPMorgan Active Growth ETF".
+FUND_NOISE_MARKERS = ["Leverage", "GraniteShares", "IncomeShares", "ETP", "ETF"]
+
+# Foreign cross-listings of UK/US shares — shares only, since indices and
+# commodities use parentheses for contract size instead, e.g. "(£10)".
+FOREIGN_LISTING_PATTERN = r"\((?:DE|FR|ES|IT|CH|NL|SE|BE|PT|AT|IE|DK|FI|NO)\)"
 
 
 def fetch_market_details(ig_service: IGService, epic: str) -> Optional[dict]:
+    _rate_limiter.wait()
     try:
         market = ig_service.fetch_market_by_epic(epic)
     except IGException as e:
@@ -198,10 +242,13 @@ def resolve_pool_epics(ig_service: IGService) -> list:
             continue
 
         term = entry
+        _rate_limiter.wait()
         try:
             markets = ig_service.search_markets(term)
         except Exception as e:
-            log.warning(f"Skipping '{term}': search failed ({e}).")
+            # IG returns an empty body on a rate-limit 403, so a blank message
+            # here almost always means the non-trading allowance was exceeded.
+            log.warning(f"Skipping '{term}': search failed ({e or 'empty response - likely rate limited'}).")
             continue
 
         if markets is None or len(markets) == 0:
@@ -215,8 +262,10 @@ def resolve_pool_epics(ig_service: IGService) -> list:
                 candidates = typed
 
         if "instrumentName" in candidates:
-            noise_pattern = "|".join(re.escape(m) for m in NOISE_NAME_MARKERS)
-            clean = candidates[~candidates["instrumentName"].str.contains(noise_pattern, case=False, regex=True)]
+            fund_pattern = "|".join(re.escape(m) for m in FUND_NOISE_MARKERS)
+            clean = candidates[~candidates["instrumentName"].str.contains(fund_pattern, case=False, regex=True)]
+            if expected_type == "SHARES":
+                clean = clean[~clean["instrumentName"].str.contains(FOREIGN_LISTING_PATTERN, regex=True)]
             if len(clean) > 0:
                 candidates = clean
 
@@ -224,14 +273,20 @@ def resolve_pool_epics(ig_service: IGService) -> list:
             log.warning(f"Skipping '{term}': nothing plausible after filtering.")
             continue
 
-        if len(candidates) > 1:
-            extended_hours = candidates[candidates["instrumentName"].str.contains("24 Hours", case=False)] \
-                if "instrumentName" in candidates else candidates
-            candidates = extended_hours if len(extended_hours) >= 1 else candidates
+        if len(candidates) > 1 and "instrumentName" in candidates:
+            extended_hours = candidates[candidates["instrumentName"].str.contains("24 Hours", case=False)]
+            if len(extended_hours) >= 1:
+                candidates = extended_hours
 
         row = candidates.iloc[0]
         if len(candidates) > 1:
-            log.info(f"'{term}' had {len(candidates)} plausible matches — auto-picked the first: {row.get('instrumentName', term)}")
+            listing = "; ".join(
+                f"{r['epic']} = {r.get('instrumentName', '?')}" for _, r in candidates.iterrows()
+            )
+            log.info(
+                f"'{term}' had {len(candidates)} plausible matches — auto-picked the first. "
+                f"If wrong, change its DEFAULT_POOL entry to '{term}:EPIC'. Candidates: {listing}"
+            )
 
         resolved.append({"term": term, "epic": row["epic"], "name": row.get("instrumentName", term)})
         log.info(f"Resolved '{term}' -> epic={row['epic']} ({row.get('instrumentName', term)})")
@@ -247,6 +302,7 @@ def resolve_pool_epics(ig_service: IGService) -> list:
 # MARKET DATA / SIGNAL
 # ---------------------------------------------------------------------------
 def fetch_bars(ig_service: IGService, epic: str) -> Optional[pd.DataFrame]:
+    _rate_limiter.wait()
     try:
         data = ig_service.fetch_historical_prices_by_epic_and_num_points(epic, BAR_RESOLUTION, BARS_LOOKBACK)
     except Exception as e:
@@ -278,13 +334,17 @@ def detect_streak(df: pd.DataFrame) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # POSITIONS / ORDERS
 # ---------------------------------------------------------------------------
-def get_open_position(ig_service: IGService, epic: str) -> Optional[dict]:
+def fetch_all_positions(ig_service: IGService) -> Optional[pd.DataFrame]:
+    """One call per pass, not per symbol — it returns every open position."""
+    _rate_limiter.wait()
     try:
-        positions = ig_service.fetch_open_positions()
+        return ig_service.fetch_open_positions()
     except Exception as e:
-        log.error(f"Error fetching positions: {e}")
+        log.error(f"Error fetching positions: {e or 'empty response - likely rate limited'}")
         raise
 
+
+def find_position(positions: Optional[pd.DataFrame], epic: str) -> Optional[dict]:
     if positions is None or len(positions) == 0:
         return None
     match = positions[positions["market.epic"] == epic]
@@ -338,17 +398,17 @@ def close_position(ig_service: IGService, epic: str, name: str, position: dict, 
 # ---------------------------------------------------------------------------
 # TRADING CYCLE
 # ---------------------------------------------------------------------------
-def trading_cycle(ig_service: IGService, item: dict) -> None:
+def trading_cycle(ig_service: IGService, item: dict, positions: Optional[pd.DataFrame]) -> None:
     epic, name = item["epic"], item["name"]
 
     details = fetch_market_details(ig_service, epic)
     if details is None:
         return
     if details["market_status"] != "TRADEABLE":
-        log.info(f"{name} ({epic}) | market_status={details['market_status']} — skipping this cycle.")
+        log.info(f"{name} ({epic}) | market_status={details['market_status']} — skipping this pass.")
         return
 
-    position = get_open_position(ig_service, epic)
+    position = find_position(positions, epic)
 
     df = fetch_bars(ig_service, epic)
     if df is None or len(df) < STREAK_LENGTH + 1:
@@ -380,13 +440,14 @@ def sleep_after_error(consecutive_errors: int) -> None:
     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
         log.critical(f"Reached {MAX_CONSECUTIVE_ERRORS} consecutive errors. Exiting for safety.")
         sys.exit(1)
-    backoff = min(LOOP_INTERVAL_SECONDS * consecutive_errors, 300)
+    backoff = min(ERROR_BACKOFF_SECONDS * consecutive_errors, 300)
     log.info(f"Retrying in {backoff}s...")
     time.sleep(backoff)
 
 
 def run_bot() -> None:
     ig_service = get_ig_service()
+    log.info("Resolving pool (paced to IG's ~30 requests/minute limit — takes about a minute)...")
     pool = resolve_pool_epics(ig_service)
 
     log.info("=" * 78)
@@ -399,22 +460,34 @@ def run_bot() -> None:
     log.info("=" * 78)
 
     consecutive_errors = 0
+    pass_number = 0
     while True:
-        cycle_had_error = False
+        pass_number += 1
+        pass_started = time.monotonic()
+        pass_had_error = False
+
+        try:
+            positions = fetch_all_positions(ig_service)
+        except Exception:
+            consecutive_errors += 1
+            sleep_after_error(consecutive_errors)
+            continue
+
         for item in pool:
             try:
-                trading_cycle(ig_service, item)
+                trading_cycle(ig_service, item, positions)
             except Exception as e:
-                cycle_had_error = True
-                log.error(f"Error processing {item['name']} this cycle: {e}")
+                pass_had_error = True
+                log.error(f"Error processing {item['name']} this pass: {e or 'empty response - likely rate limited'}")
 
-        if cycle_had_error:
+        log.info(f"Pass {pass_number} complete in {time.monotonic() - pass_started:.0f}s")
+
+        if pass_had_error:
             consecutive_errors += 1
             sleep_after_error(consecutive_errors)
             continue
 
         consecutive_errors = 0
-        time.sleep(LOOP_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":

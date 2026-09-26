@@ -114,6 +114,27 @@ logging.basicConfig(
 log = logging.getLogger("ig_cfd_bot")
 
 
+class _RateLimiter:
+    """IG allows only ~30 non-trading requests/minute, account-wide, shared
+    by every non-trading endpoint (search, market details, bars, positions).
+    trading-ig's built-in pacing reacts to 429s, but IG answers an exceeded
+    allowance with a 403 — so unpaced bursts cascade into failures for every
+    later call. Every non-trading call here goes through this pacer."""
+
+    def __init__(self, max_per_minute: int = 28):  # a little under IG's 30 for margin
+        self._min_interval = 60.0 / max_per_minute
+        self._last_call = 0.0
+
+    def wait(self) -> None:
+        remaining = self._min_interval - (time.monotonic() - self._last_call)
+        if remaining > 0:
+            time.sleep(remaining)
+        self._last_call = time.monotonic()
+
+
+_rate_limiter = _RateLimiter()
+
+
 # ---------------------------------------------------------------------------
 # CLIENT / STARTUP CHECKS
 # ---------------------------------------------------------------------------
@@ -155,7 +176,10 @@ def get_ig_service() -> IGService:
 # Search results for a company name include leveraged/inverse ETPs and
 # regional cross-listings alongside the actual underlying-stock CFD — these
 # substring markers reliably identify the noise, not the real thing.
-NOISE_NAME_MARKERS = ["Leverage", "GraniteShares", "IncomeShares", "ETP", "(DE)", "(FR)", "(ES)", "(IT)", "(CH)", "(NL)"]
+NOISE_NAME_MARKERS = [
+    "Leverage", "GraniteShares", "IncomeShares", "ETP", "ETF",
+    "(DE)", "(FR)", "(ES)", "(IT)", "(CH)", "(NL)", "(SE)", "(BE)", "(PT)", "(AT)", "(IE)", "(DK)", "(FI)", "(NO)",
+]
 
 
 def resolve_watchlist_epics(ig_service: IGService) -> list:
@@ -185,6 +209,7 @@ def resolve_watchlist_epics(ig_service: IGService) -> list:
 
         term = entry
         try:
+            _rate_limiter.wait()
             markets = ig_service.search_markets(term)
         except IGException as e:
             log.error(f"IG API error searching for '{term}': {e}")
@@ -229,6 +254,7 @@ def resolve_watchlist_epics(ig_service: IGService) -> list:
 
 def fetch_market_details(ig_service: IGService, epic: str) -> Optional[dict]:
     try:
+        _rate_limiter.wait()
         market = ig_service.fetch_market_by_epic(epic)
     except IGException as e:
         log.error(f"IG API error fetching market details for {epic}: {e}")
@@ -260,6 +286,7 @@ def fetch_market_details(ig_service: IGService, epic: str) -> Optional[dict]:
 def fetch_bars(ig_service: IGService, epic: str) -> Optional[pd.DataFrame]:
     """Fetch recent 15-minute bars as a flat OHLC frame (mid of bid/ask)."""
     try:
+        _rate_limiter.wait()
         data = ig_service.fetch_historical_prices_by_epic_and_num_points(
             epic, BAR_RESOLUTION, BARS_LOOKBACK
         )
@@ -305,17 +332,18 @@ def detect_crossover(df: pd.DataFrame) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # POSITIONS
 # ---------------------------------------------------------------------------
-def get_open_position(ig_service: IGService, epic: str) -> Optional[dict]:
-    """Return the open position dict for `epic`, or None if flat."""
+def fetch_all_positions(ig_service: IGService) -> Optional[pd.DataFrame]:
+    """One call per cycle, not per symbol — it returns every open position."""
+    _rate_limiter.wait()
     try:
-        positions = ig_service.fetch_open_positions()
-    except IGException as e:
-        log.error(f"IG API error fetching positions: {e}")
-        raise
+        return ig_service.fetch_open_positions()
     except Exception as e:
-        log.error(f"Network error fetching positions: {e}")
+        log.error(f"Error fetching positions: {e or 'empty response - likely rate limited'}")
         raise
 
+
+def find_position(positions: Optional[pd.DataFrame], epic: str) -> Optional[dict]:
+    """Return the open position dict for `epic`, or None if flat."""
     if positions is None or len(positions) == 0:
         return None
 
@@ -402,7 +430,7 @@ def close_open_position_ig(ig_service: IGService, epic: str, name: str, position
 # ---------------------------------------------------------------------------
 # TRADING CYCLE
 # ---------------------------------------------------------------------------
-def trading_cycle(ig_service: IGService, watch_item: dict) -> None:
+def trading_cycle(ig_service: IGService, watch_item: dict, positions: Optional[pd.DataFrame]) -> None:
     epic = watch_item["epic"]
     name = watch_item["name"]
 
@@ -413,7 +441,7 @@ def trading_cycle(ig_service: IGService, watch_item: dict) -> None:
         log.info(f"{name} ({epic}) | market_status={details['market_status']} — skipping this cycle.")
         return
 
-    position = get_open_position(ig_service, epic)
+    position = find_position(positions, epic)
 
     df = fetch_bars(ig_service, epic)
     if df is None or len(df) < EMA_LONG_PERIOD + 1:
@@ -483,13 +511,20 @@ def run_bot() -> None:
     consecutive_errors = 0
 
     while True:
+        try:
+            positions = fetch_all_positions(ig_service)
+        except Exception:
+            consecutive_errors += 1
+            sleep_after_error(consecutive_errors)
+            continue
+
         cycle_had_error = False
         for watch_item in watchlist:
             try:
-                trading_cycle(ig_service, watch_item)
+                trading_cycle(ig_service, watch_item, positions)
             except Exception as e:
                 cycle_had_error = True
-                log.error(f"Error processing {watch_item['name']} this cycle: {e}")
+                log.error(f"Error processing {watch_item['name']} this cycle: {e or 'empty response - likely rate limited'}")
 
         if cycle_had_error:
             consecutive_errors += 1
