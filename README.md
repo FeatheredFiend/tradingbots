@@ -112,10 +112,24 @@ optional env vars.
 hard-exits on any ambiguous or unresolved name, because getting one specific
 hand-picked symbol wrong matters. This bot's whole point is breadth, not
 precision on any one name, so it *skips* (logs why, keeps going) any pool
-entry that doesn't resolve cleanly instead of stopping the whole bot. The
-~35-instrument pool hasn't been run against a live account yet — treat it as
-a first draft likely to need some names skipped or pinned with `Name:EPIC`
-once real output is seen.
+entry that doesn't resolve cleanly instead of stopping the whole bot. When a
+name has several plausible matches it auto-picks one and logs every
+candidate; if the pick is wrong, change that `DEFAULT_POOL` entry to
+`Name:EPIC`. On its first run 27 of 35 resolved (the rest were rate-limit
+casualties, since fixed — see below).
+
+## IG rate limits (both IG bots)
+
+IG allows only **~30 non-trading requests per minute, account-wide** —
+shared by market search, market details, price bars and position reads. IG
+answers an exceeded allowance with a 403, which `trading-ig`'s own pacing
+doesn't catch, so an unpaced burst makes every later call fail too. Both IG
+bots pace every non-trading call to stay under it, which means:
+
+- The momentum bot takes about a minute to resolve its pool at startup, and
+  a full pass over it takes a few minutes (fine for 15-minute bars).
+- Running both IG bots at once on the same account splits that one budget
+  between them, so each slows down.
 
 ## Repo layout
 
