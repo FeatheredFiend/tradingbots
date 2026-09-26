@@ -70,7 +70,12 @@ IG_API_KEY = os.environ.get("IG_API_KEY", "")
 ACCOUNT_TYPE = "DEMO"  # Hardcoded — this script never trades a LIVE account.
 CURRENCY_CODE = os.environ.get("IG_CURRENCY_CODE", "GBP")
 
-DEFAULT_WATCHLIST = "Apple,Microsoft,Amazon,Google,Tesla"
+# "Google" is pinned to an explicit epic because IG lists Alphabet's Class A
+# (GOOGL, voting) and Class C shares as separate markets with the same search
+# hit — defaulting to Class A, the ticker most people mean by "Google stock".
+# Override any entry with "Name:EPIC" (e.g. "Google:UB.D.GOOGUS.CASH.IP" for
+# Class C instead).
+DEFAULT_WATCHLIST = "Apple,Microsoft,Amazon,Google:UB.D.GOOGL.CASH.IP,Tesla"
 WATCHLIST_SEARCH_TERMS = [
     s.strip()
     for s in os.environ.get("IG_WATCHLIST", DEFAULT_WATCHLIST).split(",")
