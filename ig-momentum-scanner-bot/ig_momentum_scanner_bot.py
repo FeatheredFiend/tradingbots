@@ -89,8 +89,10 @@ DEFAULT_POOL = [
     ("JPMorgan", "SHARES"), ("Walmart", "SHARES"),
     # UK shares
     ("BP", "SHARES"), ("HSBC", "SHARES"), ("Tesco", "SHARES"),
-    ("Vodafone", "SHARES"), ("AstraZeneca", "SHARES"), ("GlaxoSmithKline", "SHARES"),
-    ("Barclays", "SHARES"), ("Lloyds Banking", "SHARES"), ("Unilever", "SHARES"),
+    ("Vodafone", "SHARES"), ("AstraZeneca", "SHARES"), ("GSK", "SHARES"),
+    # Unilever pinned to its London listing — a plain search also finds the
+    # pre-2020 Dutch "Unilever NV" entity and picks that first.
+    ("Barclays", "SHARES"), ("Lloyds Banking", "SHARES"), ("Unilever:KA.D.ULVR.CASH.IP", "SHARES"),
     ("Rolls-Royce", "SHARES"),
     # Indices
     ("FTSE 100", "INDICES"), ("US 500", "INDICES"), ("Wall Street", "INDICES"),
@@ -118,6 +120,12 @@ TAKE_PROFIT_PCT = 0.05
 # No fixed loop interval: the rate limiter below paces every request, so a
 # full pass over ~27-35 symbols naturally takes ~3-4 minutes — still far more
 # often than a 15-minute bar can change.
+# IG's limit is ~30/min for the whole account. Bots don't coordinate, so if
+# two run at once on the same account, give each a share (e.g. 18 and 10).
+REQUESTS_PER_MINUTE = int(os.environ.get("IG_REQUESTS_PER_MINUTE", "28"))
+# Retry waits for a name that fails to resolve at startup — nearly always a
+# rate-limit 403, which clears within a minute, not a missing market.
+RESOLVE_RETRY_WAITS = (20, 40, 60)
 ERROR_BACKOFF_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
 
@@ -158,7 +166,7 @@ class _RateLimiter:
         self._last_call = time.monotonic()
 
 
-_rate_limiter = _RateLimiter()
+_rate_limiter = _RateLimiter(REQUESTS_PER_MINUTE)
 
 
 # ---------------------------------------------------------------------------
@@ -186,13 +194,64 @@ def get_ig_service() -> IGService:
     return ig_service
 
 
-# Fund/leveraged products that are never "the company itself" — e.g. a plain
-# "JPMorgan" search otherwise auto-picked "JPMorgan Active Growth ETF".
-FUND_NOISE_MARKERS = ["Leverage", "GraniteShares", "IncomeShares", "ETP", "ETF"]
+# Products that are never "the market itself": fund/leveraged wrappers (a
+# plain "JPMorgan" search once picked "JPMorgan Active Growth ETF"), old
+# rights issues, retired markets, and IG's separate weekend-only markets.
+NOT_THE_MARKET_MARKERS = [
+    "Leverage", "GraniteShares", "IncomeShares", "ETP", "ETF",
+    "Rights Issue", "NOT IN USE", "Weekend",
+]
 
 # Foreign cross-listings of UK/US shares — shares only, since indices and
 # commodities use parentheses for contract size instead, e.g. "(£10)".
 FOREIGN_LISTING_PATTERN = r"\((?:DE|FR|ES|IT|CH|NL|SE|BE|PT|AT|IE|DK|FI|NO)\)"
+
+# Per-point contract value in IG's market names: "(£10)", "($250)", "(E25)",
+# "(GBP1)", "(500oz)", "(£1 Contract)" — but not "(24 Hours)".
+CONTRACT_SIZE_PATTERN = r"\((?:£|\$|€|E|GBP|USD|EUR)?([\d.]+)\s*(?:oz|Contract)?\)"
+
+
+def _normalized_name(name: str) -> str:
+    """'FTSE 100 Cash (£10)' -> 'ftse 100', 'GBP/EUR Mini' -> 'gbp/eur'."""
+    name = re.sub(r"\([^)]*\)", " ", name.lower())
+    name = re.sub(r"\b(?:cash|mini)\b", " ", name)
+    return " ".join(name.split())
+
+
+def _contract_size(name: str) -> float:
+    """Currency is ignored — this only needs to rank versions small to large."""
+    match = re.search(CONTRACT_SIZE_PATTERN, name)
+    return float(match.group(1)) if match else float("inf")
+
+
+def _narrow(candidates: pd.DataFrame, mask) -> pd.DataFrame:
+    """Apply a preference only if something survives it."""
+    narrowed = candidates[mask]
+    return narrowed if len(narrowed) > 0 else candidates
+
+
+def _call_with_retry(what: str, call):
+    """Retry a startup lookup instead of dropping the name for the whole run:
+    failures here are nearly always a rate-limit 403 that clears within a
+    minute, not a missing market. Returns None only after every retry fails."""
+    for wait in (*RESOLVE_RETRY_WAITS, None):
+        try:
+            result = call()
+            reason = "no response"
+        except Exception as e:
+            result, reason = None, str(e) or "empty response - likely rate limited"
+        if result is not None:
+            return result
+        if wait is None:
+            log.warning(f"Giving up on {what} ({reason}).")
+            return None
+        log.warning(f"{what} failed ({reason}); retrying in {wait}s.")
+        time.sleep(wait)
+
+
+def _paced_search(ig_service: IGService, term: str):
+    _rate_limiter.wait()
+    return ig_service.search_markets(term)
 
 
 def fetch_market_details(ig_service: IGService, epic: str) -> Optional[dict]:
@@ -233,7 +292,9 @@ def resolve_pool_epics(ig_service: IGService) -> list:
         if ":" in entry:
             term, explicit_epic = entry.split(":", 1)
             term, explicit_epic = term.strip(), explicit_epic.strip()
-            details = fetch_market_details(ig_service, explicit_epic)
+            details = _call_with_retry(
+                f"'{term}' ({explicit_epic})", lambda: fetch_market_details(ig_service, explicit_epic)
+            )
             if details is None:
                 log.warning(f"Skipping '{term}': explicit epic '{explicit_epic}' did not resolve.")
                 continue
@@ -242,41 +303,44 @@ def resolve_pool_epics(ig_service: IGService) -> list:
             continue
 
         term = entry
-        _rate_limiter.wait()
-        try:
-            markets = ig_service.search_markets(term)
-        except Exception as e:
-            # IG returns an empty body on a rate-limit 403, so a blank message
-            # here almost always means the non-trading allowance was exceeded.
-            log.warning(f"Skipping '{term}': search failed ({e or 'empty response - likely rate limited'}).")
+        markets = _call_with_retry(f"search for '{term}'", lambda: _paced_search(ig_service, term))
+        if markets is None:
+            log.warning(f"Skipping '{term}': search kept failing.")
             continue
-
-        if markets is None or len(markets) == 0:
+        if len(markets) == 0:
             log.warning(f"Skipping '{term}': no markets found.")
             continue
 
         candidates = markets
         if expected_type and "instrumentType" in candidates:
-            typed = candidates[candidates["instrumentType"] == expected_type]
-            if len(typed) > 0:
-                candidates = typed
+            candidates = _narrow(candidates, candidates["instrumentType"] == expected_type)
 
         if "instrumentName" in candidates:
-            fund_pattern = "|".join(re.escape(m) for m in FUND_NOISE_MARKERS)
-            clean = candidates[~candidates["instrumentName"].str.contains(fund_pattern, case=False, regex=True)]
+            names = candidates["instrumentName"]
+            noise = "|".join(re.escape(m) for m in NOT_THE_MARKET_MARKERS)
+            keep = ~names.str.contains(noise, case=False, regex=True)
             if expected_type == "SHARES":
-                clean = clean[~clean["instrumentName"].str.contains(FOREIGN_LISTING_PATTERN, regex=True)]
-            if len(clean) > 0:
-                candidates = clean
+                keep &= ~names.str.contains(FOREIGN_LISTING_PATTERN, regex=True)
+            candidates = _narrow(candidates, keep)
 
-        if len(candidates) == 0:
-            log.warning(f"Skipping '{term}': nothing plausible after filtering.")
-            continue
+            # Exact name first — a "GBP/EUR" search lists the inverse EUR/GBP first.
+            candidates = _narrow(
+                candidates, candidates["instrumentName"].map(_normalized_name) == _normalized_name(term)
+            )
+
+        # Undated (rolling) markets over dated futures — no expiry to roll.
+        if "expiry" in candidates:
+            candidates = _narrow(candidates, candidates["expiry"].isin(["-", "DFB"]))
 
         if len(candidates) > 1 and "instrumentName" in candidates:
-            extended_hours = candidates[candidates["instrumentName"].str.contains("24 Hours", case=False)]
-            if len(extended_hours) >= 1:
-                candidates = extended_hours
+            candidates = _narrow(candidates, candidates["instrumentName"].str.contains("24 Hours", case=False))
+
+            # Smallest contract for a small-capital bot — e.g. US 500 at £1 a
+            # point, not $250. "Mini" breaks ties where names carry no size (FX).
+            order = candidates["instrumentName"].map(
+                lambda n: (_contract_size(n), 0 if "mini" in n.lower() else 1)
+            )
+            candidates = candidates.loc[order.sort_values(kind="stable").index]
 
         row = candidates.iloc[0]
         if len(candidates) > 1:
@@ -284,7 +348,8 @@ def resolve_pool_epics(ig_service: IGService) -> list:
                 f"{r['epic']} = {r.get('instrumentName', '?')}" for _, r in candidates.iterrows()
             )
             log.info(
-                f"'{term}' had {len(candidates)} plausible matches — auto-picked the first. "
+                f"'{term}' had {len(candidates)} plausible matches — auto-picked the first "
+                f"(smallest contract where sizes differ). "
                 f"If wrong, change its DEFAULT_POOL entry to '{term}:EPIC'. Candidates: {listing}"
             )
 

@@ -100,6 +100,12 @@ TAKE_PROFIT_PCT = 0.05         # 5% take-profit, attached to the order itself.
 
 LOOP_INTERVAL_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
+# IG's limit is ~30/min for the whole account. Bots don't coordinate, so if
+# two run at once on the same account, give each a share (e.g. 10 and 18).
+REQUESTS_PER_MINUTE = int(os.environ.get("IG_REQUESTS_PER_MINUTE", "28"))
+# Retry waits for a name that fails to resolve at startup — nearly always a
+# rate-limit 403, which clears within a minute, not a missing market.
+RESOLVE_RETRY_WAITS = (20, 40, 60)
 
 assert TARGET_NOTIONAL > 0, "TARGET_NOTIONAL must be positive"
 
@@ -132,7 +138,31 @@ class _RateLimiter:
         self._last_call = time.monotonic()
 
 
-_rate_limiter = _RateLimiter()
+_rate_limiter = _RateLimiter(REQUESTS_PER_MINUTE)
+
+
+def _call_with_retry(what: str, call):
+    """Retry a startup lookup rather than exiting on the first failure:
+    failures here are nearly always a rate-limit 403 that clears within a
+    minute. Returns None only after every retry fails."""
+    for wait in (*RESOLVE_RETRY_WAITS, None):
+        try:
+            result = call()
+            reason = "no response"
+        except Exception as e:
+            result, reason = None, str(e) or "empty response - likely rate limited"
+        if result is not None:
+            return result
+        if wait is None:
+            log.error(f"Giving up on {what} ({reason}).")
+            return None
+        log.warning(f"{what} failed ({reason}); retrying in {wait}s.")
+        time.sleep(wait)
+
+
+def _paced_search(ig_service: IGService, term: str):
+    _rate_limiter.wait()
+    return ig_service.search_markets(term)
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +207,7 @@ def get_ig_service() -> IGService:
 # regional cross-listings alongside the actual underlying-stock CFD — these
 # substring markers reliably identify the noise, not the real thing.
 NOISE_NAME_MARKERS = [
-    "Leverage", "GraniteShares", "IncomeShares", "ETP", "ETF",
+    "Leverage", "GraniteShares", "IncomeShares", "ETP", "ETF", "Rights Issue", "NOT IN USE", "Weekend",
     "(DE)", "(FR)", "(ES)", "(IT)", "(CH)", "(NL)", "(SE)", "(BE)", "(PT)", "(AT)", "(IE)", "(DK)", "(FI)", "(NO)",
 ]
 
@@ -199,7 +229,9 @@ def resolve_watchlist_epics(ig_service: IGService) -> list:
         if ":" in entry:
             term, explicit_epic = entry.split(":", 1)
             term, explicit_epic = term.strip(), explicit_epic.strip()
-            details = fetch_market_details(ig_service, explicit_epic)
+            details = _call_with_retry(
+                f"'{term}' ({explicit_epic})", lambda: fetch_market_details(ig_service, explicit_epic)
+            )
             if details is None:
                 log.critical(f"Explicit epic '{explicit_epic}' for '{term}' could not be resolved. Exiting.")
                 sys.exit(1)
@@ -208,14 +240,9 @@ def resolve_watchlist_epics(ig_service: IGService) -> list:
             continue
 
         term = entry
-        try:
-            _rate_limiter.wait()
-            markets = ig_service.search_markets(term)
-        except IGException as e:
-            log.error(f"IG API error searching for '{term}': {e}")
-            sys.exit(1)
-        except Exception as e:
-            log.error(f"Network error searching for '{term}': {e}")
+        markets = _call_with_retry(f"search for '{term}'", lambda: _paced_search(ig_service, term))
+        if markets is None:
+            log.critical(f"Search for '{term}' kept failing. Exiting.")
             sys.exit(1)
 
         if markets is None or len(markets) == 0:

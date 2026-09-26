@@ -113,10 +113,11 @@ hard-exits on any ambiguous or unresolved name, because getting one specific
 hand-picked symbol wrong matters. This bot's whole point is breadth, not
 precision on any one name, so it *skips* (logs why, keeps going) any pool
 entry that doesn't resolve cleanly instead of stopping the whole bot. When a
-name has several plausible matches it auto-picks one and logs every
-candidate; if the pick is wrong, change that `DEFAULT_POOL` entry to
-`Name:EPIC`. On its first run 27 of 35 resolved (the rest were rate-limit
-casualties, since fixed — see below).
+name has several plausible matches it prefers, in order: an exact name match
+(so `GBP/EUR` doesn't become the inverse `EUR/GBP`), an undated market over
+dated futures, and the **smallest contract size** — e.g. US 500 at £1 a
+point rather than $250, and FX "Mini" contracts. It logs every candidate, so
+if a pick is wrong, change that `DEFAULT_POOL` entry to `Name:EPIC`.
 
 ## IG rate limits (both IG bots)
 
@@ -128,8 +129,14 @@ bots pace every non-trading call to stay under it, which means:
 
 - The momentum bot takes about a minute to resolve its pool at startup, and
   a full pass over it takes a few minutes (fine for 15-minute bars).
-- Running both IG bots at once on the same account splits that one budget
-  between them, so each slows down.
+- A startup lookup that fails is retried (after 20s, 40s, then 60s) rather
+  than dropped, since it's nearly always a temporary 403 — e.g. from a bot
+  you stopped less than a minute ago.
+- **Each bot paces itself, but they don't coordinate.** Running both at once
+  on the same account would overrun the limit together. Split it between
+  them with `IG_REQUESTS_PER_MINUTE` (default `28`), set in each bot's own
+  window, keeping the total under 30 — e.g. `18` for the scanner and `10`
+  for the EMA bot.
 
 ## Repo layout
 
