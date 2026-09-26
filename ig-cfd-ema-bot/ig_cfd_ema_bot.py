@@ -42,8 +42,10 @@ Setup
 2. $env:IG_USERNAME = "your_ig_username"
    $env:IG_PASSWORD = "your_ig_password"
    $env:IG_API_KEY  = "your_ig_api_key"
-3. (Optional) $env:IG_WATCHLIST = "Apple,Microsoft,Amazon,Google,Tesla"
-   (comma-separated search terms — resolved to IG "epics" at startup)
+3. (Optional) $env:IG_WATCHLIST = "Apple,Microsoft,BP,HSBC,Google:UB.D.GOOGL.CASH.IP"
+   (comma-separated search terms, UK and US freely mixed — resolved to IG
+   "epics" at startup; append ":EPIC" to a name to pin an exact market when
+   a plain search is ambiguous, same as Google's share classes above)
 4. (Optional) $env:IG_CURRENCY_CODE = "GBP"
 5. Run:
        python ig_cfd_ema_bot.py
@@ -75,7 +77,10 @@ CURRENCY_CODE = os.environ.get("IG_CURRENCY_CODE", "GBP")
 # hit — defaulting to Class A, the ticker most people mean by "Google stock".
 # Override any entry with "Name:EPIC" (e.g. "Google:UB.D.GOOGUS.CASH.IP" for
 # Class C instead).
-DEFAULT_WATCHLIST = "Apple,Microsoft,Amazon,Google:UB.D.GOOGL.CASH.IP,Tesla"
+DEFAULT_WATCHLIST = (
+    "Apple,Microsoft,Amazon,Google:UB.D.GOOGL.CASH.IP,Tesla,"
+    "BP,HSBC,Tesco,Vodafone,AstraZeneca"
+)
 WATCHLIST_SEARCH_TERMS = [
     s.strip()
     for s in os.environ.get("IG_WATCHLIST", DEFAULT_WATCHLIST).split(",")

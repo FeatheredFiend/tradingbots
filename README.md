@@ -53,7 +53,7 @@ pip install -r ig-cfd-ema-bot/requirements.txt
 export IG_USERNAME="your_ig_username"
 export IG_PASSWORD="your_ig_password"
 export IG_API_KEY="your_ig_api_key"
-export IG_WATCHLIST="Apple,Microsoft,Amazon,Google,Tesla"   # optional, this is the default
+export IG_WATCHLIST="Apple,Microsoft,Amazon,Google:UB.D.GOOGL.CASH.IP,Tesla,BP,HSBC,Tesco,Vodafone,AstraZeneca"   # optional, this is the default
 python ig-cfd-ema-bot/ig_cfd_ema_bot.py
 ```
 
@@ -64,6 +64,16 @@ bot itself is hardcoded to `ACCOUNT_TYPE = "DEMO"` and never trades live.
 CFD minimum deal sizes are usually well above a $2-equivalent position, so
 the bot targets $2 exposure but clamps up to whatever each market's real
 minimum size is — expect demo positions sized larger than $2 in practice.
+
+**`IG_WATCHLIST` is a fixed list, not a screener** — the bot only ever
+trades exactly what's named here (comma-separated company names, UK and US
+freely mixed, each resolved to an IG "epic" at startup and then followed on
+its own exchange's hours). When a name is ambiguous — multiple share
+classes, leveraged ETPs, foreign cross-listings all matching the same
+search — the bot refuses to guess and exits showing the candidates instead.
+Pin the exact one with `Name:EPIC` syntax, e.g. `Google:UB.D.GOOGL.CASH.IP`
+(used above because "Google" alone matches both Alphabet's Class A and
+Class C shares as separate markets).
 
 ## Repo layout
 
