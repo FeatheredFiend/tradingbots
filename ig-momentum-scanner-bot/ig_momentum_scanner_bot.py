@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""
+IG Markets Demo (Paper) Momentum Streak Scanner — HIGH-RISK / EXPERIMENTAL
+=============================================================================
+
+A third, deliberately riskier bot: instead of a small named watchlist, it
+scans a broad, curated POOL of ~35 liquid CFDs (shares, indices, commodities,
+FX) every cycle and trades whichever ones show a raw momentum streak — no
+named symbol is chosen in advance, the bot decides purely from the data.
+
+Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
+-----------------------------------------------------------------------
+- Timeframe : 15-minute bars
+- Buy       : STREAK_LENGTH consecutive HIGHER closes in a row  -> open LONG
+- Sell      : STREAK_LENGTH consecutive LOWER closes in a row   -> open SHORT
+- A reversal streak closes an opposing open position; the same-direction
+  streak while already positioned is a no-op (no pyramiding).
+- Risk mgmt : 2% stop-loss / 5% take-profit, attached natively to the order
+  (same mechanism as ig_cfd_ema_bot.py — IG's CFD orders support this
+  directly, no manual polling needed).
+
+Unlike ig_cfd_ema_bot.py, this bot can go SHORT (CFDs support it) — a
+genuinely different, higher-risk capability than the long-only Alpaca and
+named-watchlist IG bots.
+
+Why this is riskier than the other two bots, on purpose:
+- No trend confirmation (no EMA smoothing) — a streak of 3 candles is a much
+  weaker, noisier signal than a moving-average crossover, so expect more
+  false signals and more round-trips hitting the stop-loss.
+- The universe is broad and resolved automatically, not hand-verified one by
+  one the way the 10-name IG watchlist was — see "soft resolution" below.
+
+Soft resolution (deliberately different from ig_cfd_ema_bot.py)
+-----------------------------------------------------------------
+The named-watchlist bot HARD-EXITS on any ambiguous or unresolved name,
+because getting a specific hand-picked symbol wrong matters. This bot's
+whole point is breadth, not precision on any one name, so instead it
+SKIPS any pool entry that fails to resolve cleanly (logs why) and carries
+on with whatever did resolve. Expect more of the ~35 entries to need a
+"Name:EPIC" pin or to simply drop out than the 10-name watchlist did —
+this hasn't been run against a live account yet, so treat the whole
+POOL list as a first draft to refine from real output.
+
+Setup
+-----
+1. pip install trading-ig pandas   (same deps as ig_cfd_ema_bot.py — reuse
+   the ig-bot-env venv, no need for a separate one)
+2. Same IG_USERNAME / IG_PASSWORD / IG_API_KEY env vars as ig_cfd_ema_bot.py
+3. Run:
+       python ig_momentum_scanner_bot.py
+"""
+
+import logging
+import os
+import re
+import sys
+import time
+from typing import Optional
+
+import pandas as pd
+
+from trading_ig import IGService
+from trading_ig.rest import IGException
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------------------------
+IG_USERNAME = os.environ.get("IG_USERNAME", "")
+IG_PASSWORD = os.environ.get("IG_PASSWORD", "")
+IG_API_KEY = os.environ.get("IG_API_KEY", "")
+ACCOUNT_TYPE = "DEMO"  # Hardcoded — this script never trades a LIVE account.
+CURRENCY_CODE = os.environ.get("IG_CURRENCY_CODE", "GBP")
+
+# (search term or "term:EPIC" override, expected IG instrumentType)
+# ~35 liquid instruments across categories, deliberately broader than a
+# hand-picked watchlist — this is the "random CFD" scanning pool.
+DEFAULT_POOL = [
+    # US mega-cap shares
+    ("Apple", "SHARES"), ("Microsoft", "SHARES"), ("Amazon", "SHARES"),
+    ("Google:UB.D.GOOGL.CASH.IP", "SHARES"), ("Tesla", "SHARES"),
+    ("Meta Platforms", "SHARES"), ("Netflix", "SHARES"), ("Nvidia", "SHARES"),
+    ("JPMorgan", "SHARES"), ("Walmart", "SHARES"),
+    # UK shares
+    ("BP", "SHARES"), ("HSBC", "SHARES"), ("Tesco", "SHARES"),
+    ("Vodafone", "SHARES"), ("AstraZeneca", "SHARES"), ("GlaxoSmithKline", "SHARES"),
+    ("Barclays", "SHARES"), ("Lloyds Banking", "SHARES"), ("Unilever", "SHARES"),
+    ("Rolls-Royce", "SHARES"),
+    # Indices
+    ("FTSE 100", "INDICES"), ("US 500", "INDICES"), ("Wall Street", "INDICES"),
+    ("US Tech 100", "INDICES"), ("Germany 40", "INDICES"), ("Japan 225", "INDICES"),
+    # Commodities
+    ("Spot Gold", "COMMODITIES"), ("Spot Silver", "COMMODITIES"),
+    ("Oil - Brent Crude", "COMMODITIES"), ("Oil - US Crude", "COMMODITIES"),
+    # FX majors
+    ("EUR/USD", "CURRENCIES"), ("GBP/USD", "CURRENCIES"), ("USD/JPY", "CURRENCIES"),
+    ("GBP/EUR", "CURRENCIES"), ("AUD/USD", "CURRENCIES"),
+]
+POOL_ENTRIES = [
+    p.strip() for p in os.environ.get("IG_POOL", "").split(",") if p.strip()
+] or None  # env override replaces the whole pool (as "term" or "term:EPIC", one type: SHARES)
+
+STREAK_LENGTH = int(os.environ.get("STREAK_LENGTH", "3"))  # consecutive up/down bars to trigger
+
+TARGET_NOTIONAL = 2.00
+BAR_RESOLUTION = "15Min"
+BARS_LOOKBACK = 50            # streak detection only needs recent bars, unlike a 21-EMA warm-up
+
+STOP_LOSS_PCT = 0.02
+TAKE_PROFIT_PCT = 0.05
+
+LOOP_INTERVAL_SECONDS = 60
+MAX_CONSECUTIVE_ERRORS = 10
+
+assert STREAK_LENGTH >= 2, "STREAK_LENGTH must be at least 2 to mean anything"
+
+# ---------------------------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("ig_momentum_bot")
+
+
+# ---------------------------------------------------------------------------
+# CLIENT
+# ---------------------------------------------------------------------------
+def get_ig_service() -> IGService:
+    if not IG_USERNAME or not IG_PASSWORD or not IG_API_KEY:
+        log.error("Missing credentials. Set IG_USERNAME, IG_PASSWORD and IG_API_KEY.")
+        sys.exit(1)
+    ig_service = IGService(IG_USERNAME, IG_PASSWORD, IG_API_KEY, ACCOUNT_TYPE)
+    try:
+        session = ig_service.create_session()
+    except IGException as e:
+        log.error(f"IG login failed: {e}")
+        sys.exit(1)
+    except Exception as e:
+        log.error(f"Network error during IG login: {e}")
+        sys.exit(1)
+
+    try:
+        log.info(f"IG session established | account={session.get('currentAccountId', 'N/A')} ({ACCOUNT_TYPE})")
+    except Exception:
+        pass
+
+    return ig_service
+
+
+NOISE_NAME_MARKERS = ["Leverage", "GraniteShares", "IncomeShares", "ETP", "(DE)", "(FR)", "(ES)", "(IT)", "(CH)", "(NL)"]
+
+
+def fetch_market_details(ig_service: IGService, epic: str) -> Optional[dict]:
+    try:
+        market = ig_service.fetch_market_by_epic(epic)
+    except IGException as e:
+        log.warning(f"IG API error fetching market details for {epic}: {e}")
+        return None
+    except Exception as e:
+        log.warning(f"Network error fetching market details for {epic}: {e}")
+        return None
+
+    try:
+        instrument = market["instrument"]
+        dealing_rules = market["dealingRules"]
+        snapshot = market["snapshot"]
+        return {
+            "expiry": instrument.get("expiry", "-"),
+            "min_deal_size": float(dealing_rules["minDealSize"]["value"]),
+            "scaling_factor": float(snapshot.get("scalingFactor", 1)),
+            "market_status": snapshot.get("marketStatus", "UNKNOWN"),
+        }
+    except (KeyError, TypeError) as e:
+        log.warning(f"Unexpected market-details shape for {epic}: {e}")
+        return None
+
+
+def resolve_pool_epics(ig_service: IGService) -> list:
+    """Best-effort resolution: SKIP (don't exit) any entry that fails to
+    resolve cleanly, logging why, so one bad search term out of ~35 doesn't
+    take the whole bot down. See module docstring for why this differs from
+    ig_cfd_ema_bot.py's strict, hard-exit resolution."""
+    pool = [(p, None) for p in POOL_ENTRIES] if POOL_ENTRIES else DEFAULT_POOL
+    resolved = []
+
+    for entry, expected_type in pool:
+        if ":" in entry:
+            term, explicit_epic = entry.split(":", 1)
+            term, explicit_epic = term.strip(), explicit_epic.strip()
+            details = fetch_market_details(ig_service, explicit_epic)
+            if details is None:
+                log.warning(f"Skipping '{term}': explicit epic '{explicit_epic}' did not resolve.")
+                continue
+            resolved.append({"term": term, "epic": explicit_epic, "name": term})
+            log.info(f"Resolved '{term}' -> epic={explicit_epic} (explicit)")
+            continue
+
+        term = entry
+        try:
+            markets = ig_service.search_markets(term)
+        except Exception as e:
+            log.warning(f"Skipping '{term}': search failed ({e}).")
+            continue
+
+        if markets is None or len(markets) == 0:
+            log.warning(f"Skipping '{term}': no markets found.")
+            continue
+
+        candidates = markets
+        if expected_type and "instrumentType" in candidates:
+            typed = candidates[candidates["instrumentType"] == expected_type]
+            if len(typed) > 0:
+                candidates = typed
+
+        if "instrumentName" in candidates:
+            noise_pattern = "|".join(re.escape(m) for m in NOISE_NAME_MARKERS)
+            clean = candidates[~candidates["instrumentName"].str.contains(noise_pattern, case=False, regex=True)]
+            if len(clean) > 0:
+                candidates = clean
+
+        if len(candidates) == 0:
+            log.warning(f"Skipping '{term}': nothing plausible after filtering.")
+            continue
+
+        if len(candidates) > 1:
+            extended_hours = candidates[candidates["instrumentName"].str.contains("24 Hours", case=False)] \
+                if "instrumentName" in candidates else candidates
+            candidates = extended_hours if len(extended_hours) >= 1 else candidates
+
+        row = candidates.iloc[0]
+        if len(candidates) > 1:
+            log.info(f"'{term}' had {len(candidates)} plausible matches — auto-picked the first: {row.get('instrumentName', term)}")
+
+        resolved.append({"term": term, "epic": row["epic"], "name": row.get("instrumentName", term)})
+        log.info(f"Resolved '{term}' -> epic={row['epic']} ({row.get('instrumentName', term)})")
+
+    if len(resolved) == 0:
+        log.critical("Nothing in the pool resolved to a usable epic. Exiting.")
+        sys.exit(1)
+
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+# MARKET DATA / SIGNAL
+# ---------------------------------------------------------------------------
+def fetch_bars(ig_service: IGService, epic: str) -> Optional[pd.DataFrame]:
+    try:
+        data = ig_service.fetch_historical_prices_by_epic_and_num_points(epic, BAR_RESOLUTION, BARS_LOOKBACK)
+    except Exception as e:
+        log.error(f"Error fetching bars for {epic}: {e}")
+        return None
+
+    raw = data.get("prices")
+    if raw is None or raw.empty:
+        return None
+
+    df = pd.DataFrame(index=raw.index)
+    df["Close"] = (raw["bid"]["Close"] + raw["ask"]["Close"]) / 2.0
+    return df
+
+
+def detect_streak(df: pd.DataFrame) -> Optional[str]:
+    """STREAK_LENGTH consecutive higher (or lower) closes in a row."""
+    if len(df) < STREAK_LENGTH + 1:
+        return None
+    closes = df["Close"].iloc[-(STREAK_LENGTH + 1):]
+    diffs = closes.diff().dropna()
+    if (diffs > 0).all():
+        return "bullish"
+    if (diffs < 0).all():
+        return "bearish"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# POSITIONS / ORDERS
+# ---------------------------------------------------------------------------
+def get_open_position(ig_service: IGService, epic: str) -> Optional[dict]:
+    try:
+        positions = ig_service.fetch_open_positions()
+    except Exception as e:
+        log.error(f"Error fetching positions: {e}")
+        raise
+
+    if positions is None or len(positions) == 0:
+        return None
+    match = positions[positions["market.epic"] == epic]
+    if len(match) == 0:
+        return None
+    row = match.iloc[0]
+    return {
+        "deal_id": row["position.dealId"],
+        "direction": row["position.direction"],
+        "size": float(row["position.size"]),
+    }
+
+
+def compute_deal_size(target_notional: float, price: float, min_deal_size: float) -> float:
+    return round(max(target_notional / price, min_deal_size), 2)
+
+
+def compute_point_distance(price: float, pct: float, scaling_factor: float) -> float:
+    return round((price * pct) * scaling_factor, 1)
+
+
+def open_position(ig_service: IGService, epic: str, name: str, details: dict, price: float, direction: str) -> None:
+    size = compute_deal_size(TARGET_NOTIONAL, price, details["min_deal_size"])
+    stop_distance = compute_point_distance(price, STOP_LOSS_PCT, details["scaling_factor"])
+    limit_distance = compute_point_distance(price, TAKE_PROFIT_PCT, details["scaling_factor"])
+    try:
+        result = ig_service.create_open_position(
+            currency_code=CURRENCY_CODE, direction=direction, epic=epic, expiry=details["expiry"],
+            force_open=True, guaranteed_stop=False, level=None, limit_distance=limit_distance,
+            limit_level=None, order_type="MARKET", quote_id=None, size=size,
+            stop_distance=stop_distance, stop_level=None, trailing_stop=False, trailing_stop_increment=None,
+        )
+        log.info(f"{direction} submitted -> {name} ({epic}) size={size} stop_dist={stop_distance} "
+                 f"limit_dist={limit_distance} result={result.get('dealStatus', result)}")
+    except Exception as e:
+        log.error(f"Error submitting {direction} for {name} ({epic}): {e}")
+
+
+def close_position(ig_service: IGService, epic: str, name: str, position: dict, details: dict, reason: str) -> None:
+    close_direction = "SELL" if position["direction"] == "BUY" else "BUY"
+    try:
+        result = ig_service.close_open_position(
+            deal_id=position["deal_id"], direction=close_direction, epic=epic, expiry=details["expiry"],
+            level=None, order_type="MARKET", quote_id=None, size=position["size"],
+        )
+        log.info(f"CLOSE submitted ({reason}) -> {name} ({epic}) result={result.get('dealStatus', result)}")
+    except Exception as e:
+        log.error(f"Error closing position for {name} ({epic}) ({reason}): {e}")
+
+
+# ---------------------------------------------------------------------------
+# TRADING CYCLE
+# ---------------------------------------------------------------------------
+def trading_cycle(ig_service: IGService, item: dict) -> None:
+    epic, name = item["epic"], item["name"]
+
+    details = fetch_market_details(ig_service, epic)
+    if details is None:
+        return
+    if details["market_status"] != "TRADEABLE":
+        log.info(f"{name} ({epic}) | market_status={details['market_status']} — skipping this cycle.")
+        return
+
+    position = get_open_position(ig_service, epic)
+
+    df = fetch_bars(ig_service, epic)
+    if df is None or len(df) < STREAK_LENGTH + 1:
+        log.warning(f"Not enough bars for {name} ({epic}) yet; skipping.")
+        return
+
+    signal = detect_streak(df)
+    price = float(df["Close"].iloc[-1])
+    position_desc = f"{position['direction']} size={position['size']}" if position else "FLAT"
+
+    log.info(f"{name} ({epic}) | price={price:.2f} | streak={signal or 'none'} | position={position_desc}")
+
+    if signal == "bullish":
+        if position is None:
+            open_position(ig_service, epic, name, details, price, "BUY")
+        elif position["direction"] == "SELL":
+            close_position(ig_service, epic, name, position, details, "bullish reversal")
+    elif signal == "bearish":
+        if position is None:
+            open_position(ig_service, epic, name, details, price, "SELL")
+        elif position["direction"] == "BUY":
+            close_position(ig_service, epic, name, position, details, "bearish reversal")
+
+
+# ---------------------------------------------------------------------------
+# MAIN LOOP
+# ---------------------------------------------------------------------------
+def sleep_after_error(consecutive_errors: int) -> None:
+    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+        log.critical(f"Reached {MAX_CONSECUTIVE_ERRORS} consecutive errors. Exiting for safety.")
+        sys.exit(1)
+    backoff = min(LOOP_INTERVAL_SECONDS * consecutive_errors, 300)
+    log.info(f"Retrying in {backoff}s...")
+    time.sleep(backoff)
+
+
+def run_bot() -> None:
+    ig_service = get_ig_service()
+    pool = resolve_pool_epics(ig_service)
+
+    log.info("=" * 78)
+    log.info("IG Momentum Streak Scanner starting — DEMO ACCOUNT ONLY — HIGH RISK / EXPERIMENTAL")
+    log.info(f"Resolved {len(pool)}/{len(POOL_ENTRIES or DEFAULT_POOL)} pool entries")
+    log.info(
+        f"Streak length={STREAK_LENGTH} bars | Target notional=${TARGET_NOTIONAL:.2f}/symbol | "
+        f"Stop-loss={STOP_LOSS_PCT:.0%} | Take-profit={TAKE_PROFIT_PCT:.0%} | Timeframe=15Min"
+    )
+    log.info("=" * 78)
+
+    consecutive_errors = 0
+    while True:
+        cycle_had_error = False
+        for item in pool:
+            try:
+                trading_cycle(ig_service, item)
+            except Exception as e:
+                cycle_had_error = True
+                log.error(f"Error processing {item['name']} this cycle: {e}")
+
+        if cycle_had_error:
+            consecutive_errors += 1
+            sleep_after_error(consecutive_errors)
+            continue
+
+        consecutive_errors = 0
+        time.sleep(LOOP_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    try:
+        run_bot()
+    except KeyboardInterrupt:
+        log.info("Bot stopped manually (KeyboardInterrupt). Goodbye.")
+        sys.exit(0)

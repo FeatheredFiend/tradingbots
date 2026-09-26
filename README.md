@@ -1,15 +1,17 @@
 # tradingbots
 
-Small, paper/demo-only trading bots. Every bot here runs the same strategy —
-an EMA(9/21) crossover on 15-minute bars — against a different broker's API,
-sized for a small-capital account. **Nothing in this repo trades real money.**
+Small, paper/demo-only trading bots against different brokers' APIs, sized
+for a small-capital account. **Nothing in this repo trades real money.**
 
-## Strategy (common to all bots)
+## EMA crossover strategy (`alpaca-ema-bot/`, `ig-cfd-ema-bot/`)
 
 - Timeframe: 15-minute bars
 - Buy: 9-period EMA crosses **above** the 21-period EMA
 - Sell / close: 9-period EMA crosses **below** the 21-period EMA
 - Risk management: 2% stop-loss / 5% take-profit from the position's entry price
+
+`ig-momentum-scanner-bot/` runs a different, higher-risk momentum strategy —
+see its own section below.
 
 ## Bots
 
@@ -74,6 +76,46 @@ search — the bot refuses to guess and exits showing the candidates instead.
 Pin the exact one with `Name:EPIC` syntax, e.g. `Google:UB.D.GOOGL.CASH.IP`
 (used above because "Google" alone matches both Alphabet's Class A and
 Class C shares as separate markets).
+
+### `ig-momentum-scanner-bot/` — high-risk / experimental
+
+A deliberately riskier third bot. Instead of a small named watchlist, it
+scans a broad ~35-instrument pool (US/UK shares, indices, commodities, FX
+majors) every cycle and trades whichever ones show a raw momentum streak —
+no symbol is chosen in advance, the bot decides purely from the data:
+
+- Buy (open **long**): 3 consecutive higher closes in a row
+- Sell (open **short**): 3 consecutive lower closes in a row
+- A reversal streak closes an opposing position; same-direction streak while
+  already positioned is a no-op
+
+Unlike the other two bots, this one can go **short** — CFDs support it, and
+that's a genuinely higher-risk capability than the long-only bots. It also
+has no trend-confirmation smoothing (no EMA), so expect more false signals
+and more round-trips hitting the stop-loss than the EMA bots. Same native
+stop-loss/take-profit (2%/5%) and $2 target notional as `ig-cfd-ema-bot/`.
+
+```bash
+pip install -r ig-momentum-scanner-bot/requirements.txt
+export IG_USERNAME="your_ig_username"
+export IG_PASSWORD="your_ig_password"
+export IG_API_KEY="your_ig_api_key"
+python ig-momentum-scanner-bot/ig_momentum_scanner_bot.py
+```
+
+Requires the same live-IG-account-for-an-API-key step as `ig-cfd-ema-bot/`,
+and is hardcoded to the demo account. `STREAK_LENGTH` (default `3`) and
+`IG_POOL` (comma-separated override of the whole scanning pool) are
+optional env vars.
+
+**Resolution is intentionally looser here than `ig-cfd-ema-bot/`:** that bot
+hard-exits on any ambiguous or unresolved name, because getting one specific
+hand-picked symbol wrong matters. This bot's whole point is breadth, not
+precision on any one name, so it *skips* (logs why, keeps going) any pool
+entry that doesn't resolve cleanly instead of stopping the whole bot. The
+~35-instrument pool hasn't been run against a live account yet — treat it as
+a first draft likely to need some names skipped or pinned with `Name:EPIC`
+once real output is seen.
 
 ## Repo layout
 
