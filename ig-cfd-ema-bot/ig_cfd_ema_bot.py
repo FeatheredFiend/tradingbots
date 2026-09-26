@@ -51,6 +51,7 @@ Setup
 
 import logging
 import os
+import re
 import sys
 import time
 from typing import Optional
@@ -141,12 +142,38 @@ def get_ig_service() -> IGService:
     return ig_service
 
 
+# Search results for a company name include leveraged/inverse ETPs and
+# regional cross-listings alongside the actual underlying-stock CFD — these
+# substring markers reliably identify the noise, not the real thing.
+NOISE_NAME_MARKERS = ["Leverage", "GraniteShares", "IncomeShares", "ETP", "(DE)", "(FR)", "(ES)", "(IT)", "(CH)", "(NL)"]
+
+
 def resolve_watchlist_epics(ig_service: IGService) -> list:
-    """Resolve each human search term (e.g. "Apple") to exactly one tradable
-    IG epic. Exits with the candidate list shown if a term is ambiguous or
-    matches nothing, so the exact epic can be hardcoded instead if needed."""
+    """Resolve each watchlist entry to exactly one IG epic.
+
+    An entry can be either a plain search term ("Apple") or an explicit
+    override "Apple:UA.D.AAPL.CASH.IP" to skip searching entirely. Resolution
+    is based on instrument identity only — NOT current tradability, since
+    markets are legitimately closed/edits-only outside trading hours and that
+    must never block picking which epic to use (tradability is re-checked
+    every cycle in trading_cycle() instead). Exits with the candidate list
+    shown if a term is still ambiguous after filtering out obvious noise
+    (leveraged ETPs, options, foreign cross-listings).
+    """
     resolved = []
-    for term in WATCHLIST_SEARCH_TERMS:
+    for entry in WATCHLIST_SEARCH_TERMS:
+        if ":" in entry:
+            term, explicit_epic = entry.split(":", 1)
+            term, explicit_epic = term.strip(), explicit_epic.strip()
+            details = fetch_market_details(ig_service, explicit_epic)
+            if details is None:
+                log.critical(f"Explicit epic '{explicit_epic}' for '{term}' could not be resolved. Exiting.")
+                sys.exit(1)
+            log.info(f"Using explicit epic for '{term}' -> {explicit_epic}")
+            resolved.append({"term": term, "epic": explicit_epic, "name": term})
+            continue
+
+        term = entry
         try:
             markets = ig_service.search_markets(term)
         except IGException as e:
@@ -160,23 +187,29 @@ def resolve_watchlist_epics(ig_service: IGService) -> list:
             log.critical(f"No markets found for search term '{term}'. Exiting.")
             sys.exit(1)
 
-        tradable = markets[markets.get("marketStatus", "") == "TRADEABLE"] if "marketStatus" in markets else markets
+        shares = markets[markets["instrumentType"] == "SHARES"] if "instrumentType" in markets else markets
+        noise_pattern = "|".join(re.escape(marker) for marker in NOISE_NAME_MARKERS)
+        clean = shares[~shares["instrumentName"].str.contains(noise_pattern, case=False, regex=True)]
 
-        if len(tradable) == 1:
-            row = tradable.iloc[0]
-        elif len(tradable) > 1:
-            candidates = tradable[["epic", "instrumentName", "instrumentType"]].to_string(index=False)
-            log.critical(
-                f"'{term}' matched {len(tradable)} tradable markets — too ambiguous to "
-                f"pick automatically. Set an exact epic in IG_WATCHLIST instead. Candidates:\n{candidates}"
-            )
-            sys.exit(1)
-        else:
+        if len(clean) == 0:
             candidates = markets[["epic", "instrumentName", "instrumentType", "marketStatus"]].to_string(index=False)
-            log.critical(
-                f"'{term}' matched markets, but none are currently TRADEABLE. Candidates:\n{candidates}"
-            )
+            log.critical(f"'{term}' matched markets, but none look like the underlying share CFD. Candidates:\n{candidates}")
             sys.exit(1)
+        elif len(clean) == 1:
+            row = clean.iloc[0]
+        else:
+            # Prefer the near-continuous-hours variant when there's a tie —
+            # it stays tradable through more of the bot's polling loop.
+            extended_hours = clean[clean["instrumentName"].str.contains("24 Hours", case=False)]
+            if len(extended_hours) == 1:
+                row = extended_hours.iloc[0]
+            else:
+                candidates = clean[["epic", "instrumentName", "instrumentType"]].to_string(index=False)
+                log.critical(
+                    f"'{term}' still matches {len(clean)} plausible markets after filtering — too ambiguous "
+                    f"to pick automatically. Pin the exact epic in IG_WATCHLIST as 'Name:EPIC' instead. Candidates:\n{candidates}"
+                )
+                sys.exit(1)
 
         log.info(f"Resolved '{term}' -> epic={row['epic']} ({row.get('instrumentName', term)})")
         resolved.append({"term": term, "epic": row["epic"], "name": row.get("instrumentName", term)})
