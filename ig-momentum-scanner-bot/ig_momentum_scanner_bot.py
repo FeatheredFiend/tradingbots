@@ -86,7 +86,7 @@ DEFAULT_POOL = [
     ("Apple", "SHARES"), ("Microsoft", "SHARES"), ("Amazon", "SHARES"),
     ("Google:UB.D.GOOGL.CASH.IP", "SHARES"), ("Tesla", "SHARES"),
     ("Meta Platforms", "SHARES"), ("Netflix", "SHARES"), ("Nvidia", "SHARES"),
-    ("JPMorgan", "SHARES"), ("Walmart", "SHARES"),
+    ("JPMorgan Chase", "SHARES"), ("Walmart", "SHARES"),
     # UK shares
     ("BP", "SHARES"), ("HSBC", "SHARES"), ("Tesco", "SHARES"),
     ("Vodafone", "SHARES"), ("AstraZeneca", "SHARES"), ("GSK", "SHARES"),
@@ -224,6 +224,10 @@ def _contract_size(name: str) -> float:
     return float(match.group(1)) if match else float("inf")
 
 
+def _describe(candidates: pd.DataFrame) -> str:
+    return "; ".join(f"{r['epic']} = {r.get('instrumentName', '?')}" for _, r in candidates.iterrows())
+
+
 def _narrow(candidates: pd.DataFrame, mask) -> pd.DataFrame:
     """Apply a preference only if something survives it."""
     narrowed = candidates[mask]
@@ -328,6 +332,23 @@ def resolve_pool_epics(ig_service: IGService) -> list:
                 candidates, candidates["instrumentName"].map(_normalized_name) == _normalized_name(term)
             )
 
+            if expected_type == "SHARES":
+                # A share must be named after the search term. If none is, the
+                # search only found products that mention it — a plain "JPMorgan"
+                # search returned only JPMorgan-branded investment trusts — so any
+                # pick would be wrong. Skip instead of trading the wrong thing.
+                term_pattern = rf"{re.escape(_normalized_name(term))}\b"
+                named = candidates["instrumentName"].map(
+                    lambda n: re.match(term_pattern, _normalized_name(n)) is not None
+                )
+                if not named.any():
+                    log.warning(
+                        f"Skipping '{term}': no share is named after it — pin one with "
+                        f"'{term}:EPIC' if it's there. Candidates: {_describe(candidates)}"
+                    )
+                    continue
+                candidates = candidates[named]
+
         # Undated (rolling) markets over dated futures — no expiry to roll.
         if "expiry" in candidates:
             candidates = _narrow(candidates, candidates["expiry"].isin(["-", "DFB"]))
@@ -335,22 +356,20 @@ def resolve_pool_epics(ig_service: IGService) -> list:
         if len(candidates) > 1 and "instrumentName" in candidates:
             candidates = _narrow(candidates, candidates["instrumentName"].str.contains("24 Hours", case=False))
 
-            # Smallest contract for a small-capital bot — e.g. US 500 at £1 a
-            # point, not $250. "Mini" breaks ties where names carry no size (FX).
+            # Plainest name first ("BP PLC" over "BP PLC - Pfd"), then the
+            # smallest contract for a small-capital bot — US 500 at £1 a point,
+            # not $250. "Mini" breaks ties where names carry no size (FX).
             order = candidates["instrumentName"].map(
-                lambda n: (_contract_size(n), 0 if "mini" in n.lower() else 1)
+                lambda n: (len(_normalized_name(n)), _contract_size(n), 0 if "mini" in n.lower() else 1)
             )
             candidates = candidates.loc[order.sort_values(kind="stable").index]
 
         row = candidates.iloc[0]
         if len(candidates) > 1:
-            listing = "; ".join(
-                f"{r['epic']} = {r.get('instrumentName', '?')}" for _, r in candidates.iterrows()
-            )
             log.info(
                 f"'{term}' had {len(candidates)} plausible matches — auto-picked the first "
-                f"(smallest contract where sizes differ). "
-                f"If wrong, change its DEFAULT_POOL entry to '{term}:EPIC'. Candidates: {listing}"
+                f"(plainest name, then smallest contract). "
+                f"If wrong, change its DEFAULT_POOL entry to '{term}:EPIC'. Candidates: {_describe(candidates)}"
             )
 
         resolved.append({"term": term, "epic": row["epic"], "name": row.get("instrumentName", term)})

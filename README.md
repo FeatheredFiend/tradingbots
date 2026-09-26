@@ -115,9 +115,12 @@ precision on any one name, so it *skips* (logs why, keeps going) any pool
 entry that doesn't resolve cleanly instead of stopping the whole bot. When a
 name has several plausible matches it prefers, in order: an exact name match
 (so `GBP/EUR` doesn't become the inverse `EUR/GBP`), an undated market over
-dated futures, and the **smallest contract size** — e.g. US 500 at £1 a
-point rather than $250, and FX "Mini" contracts. It logs every candidate, so
-if a pick is wrong, change that `DEFAULT_POOL` entry to `Name:EPIC`.
+dated futures, the plainest name (`BP PLC` over `BP PLC - Pfd`), and the
+**smallest contract size** — e.g. US 500 at £1 a point rather than $250, and
+FX "Mini" contracts. A share must be named after its search term, or it's
+skipped rather than guessed: a plain "JPMorgan" search on IG returned only
+JPMorgan-branded investment trusts. It logs every candidate, so if a pick is
+wrong, change that `DEFAULT_POOL` entry to `Name:EPIC`.
 
 ## IG rate limits (both IG bots)
 
