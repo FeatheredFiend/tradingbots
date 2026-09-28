@@ -67,7 +67,9 @@ search, market-details and positions call here is paced to stay under
 that, so startup resolution takes about a minute and a full pass over the
 pool (one market-details call per symbol) takes a minute or two. Running
 this alongside ig_cfd_ema_bot.py on the same IG account shares that one
-budget between them.
+budget between them. Reporting to the dashboard adds about one request a
+minute (the balance) plus one every five (closed trades); the open
+positions it sends are the ones each pass fetches anyway.
 
 Setup
 -----
@@ -80,10 +82,12 @@ Setup
 
 import json
 import logging
+import math
 import os
 import re
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
@@ -212,12 +216,17 @@ def get_ig_service() -> IGService:
         log.error(f"Network error during IG login: {e}")
         sys.exit(1)
 
+    global _account_id
     try:
-        log.info(f"IG session established | account={session.get('currentAccountId', 'N/A')} ({ACCOUNT_TYPE})")
+        _account_id = session.get("currentAccountId")
+        log.info(f"IG session established | account={_account_id or 'N/A'} ({ACCOUNT_TYPE})")
     except Exception:
         pass
 
     return ig_service
+
+
+_account_id = None  # the account the session trades on, for the dashboard's balance
 
 
 # Products that are never "the market itself": fund/leveraged wrappers (a
@@ -548,6 +557,130 @@ def close_position(ig_service: IGService, epic: str, name: str, position: dict, 
 
 
 # ---------------------------------------------------------------------------
+# DASHBOARD
+# ---------------------------------------------------------------------------
+# Open positions come free with every pass. The account costs one request
+# about once a minute and closed trades one every TRADES_EVERY_SECONDS, both
+# through the same pacer as everything else, so a pass takes a little longer
+# but IG's limit still holds.
+TRADES_EVERY_SECONDS = 300
+TRADES_LOOKBACK_DAYS = 7
+_last_trades_fetch = 0.0
+
+
+def _number(value) -> Optional[float]:
+    """A float, or None for anything missing — pandas fills gaps with NaN,
+    which isn't valid JSON and would get the whole report refused."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _money(text) -> Optional[float]:
+    """IG's '£-12.34' / 'E1,234.50' amounts as numbers."""
+    return _number(re.sub(r"[^\d.\-]", "", str(text))) if isinstance(text, str) else _number(text)
+
+
+def _utc_seconds(value) -> Optional[float]:
+    """IG's UTC times ('2026-09-28T14:03:12', sometimes with milliseconds)
+    as Unix seconds, so the dashboard can't take them for local time."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.rstrip("Z")).replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def dashboard_positions(positions: Optional[pd.DataFrame], pool: list) -> list:
+    """This bot's open positions in the dashboard's shape. IG's REST API
+    gives no per-position profit, so that's left out — the account's
+    unrealised total, sent with the balance, is exact."""
+    names = {item["epic"]: item["name"] for item in pool}
+    rows = []
+    if positions is None or len(positions) == 0:
+        return rows
+    for _, p in positions.iterrows():
+        if p["epic"] not in names:
+            continue
+        is_long = p["direction"] == "BUY"
+        rows.append({
+            "symbol": names[p["epic"]],
+            "direction": "long" if is_long else "short",
+            "size": _number(p["size"]),
+            "entryPrice": _number(p["level"]),
+            "currentPrice": _number(p["bid"] if is_long else p["offer"]),
+            "stopLoss": _number(p.get("stopLevel")),
+            "takeProfit": _number(p.get("limitLevel")),
+            "openedAt": _utc_seconds(p.get("createdDateUTC")),
+        })
+    return rows
+
+
+def fetch_account(ig_service: IGService) -> Optional[dict]:
+    """Balance, equity and unrealised P/L of the account the session trades on."""
+    _rate_limiter.wait()
+    accounts = ig_service.fetch_accounts()
+    if len(accounts) == 0:
+        return None
+    current = accounts[accounts["accountId"] == _account_id]
+    row = (current if len(current) else accounts).iloc[0]
+    balance, unrealized = _number(row["balance"]), _number(row["profitLoss"])
+    if balance is None:
+        return None
+    return {"balance": balance, "equity": balance + (unrealized or 0.0), "unrealizedPl": unrealized}
+
+
+def fetch_closed_trades(ig_service: IGService, pool: list) -> list:
+    """Closed trades in this bot's markets over the last week, from IG's
+    transaction history (which has the realised profit, costs included)."""
+    names = {item["name"] for item in pool}
+    since = datetime.now(timezone.utc) - timedelta(days=TRADES_LOOKBACK_DAYS)
+    _rate_limiter.wait()
+    history = ig_service.fetch_transaction_history(
+        trans_type="ALL_DEAL", from_date=since.strftime("%Y-%m-%dT%H:%M:%S"), page_size=200,
+    )
+    trades = []
+    for _, t in history.iterrows():
+        size = _number(str(t.get("size", "")).replace("+", ""))
+        closed_at = _utc_seconds(t.get("dateUtc"))
+        if t.get("instrumentName") not in names or not t.get("reference") or not size or closed_at is None:
+            continue
+        trades.append({
+            "ref": str(t["reference"]),
+            "symbol": t["instrumentName"],
+            "direction": "short" if size < 0 else "long",
+            "size": abs(size),
+            "entryPrice": _number(t.get("openLevel")),
+            "exitPrice": _number(t.get("closeLevel")),
+            "openedAt": _utc_seconds(t.get("openDateUtc")),
+            "closedAt": closed_at,
+            "pnl": _money(t.get("profitAndLoss")),
+        })
+    return trades
+
+
+def report_to_dashboard(ig_service: IGService, positions: Optional[pd.DataFrame], pool: list) -> None:
+    """Hands the dashboard reporter this pass's positions, plus the account
+    and closed trades when they're due. A failure only skips them."""
+    global _last_trades_fetch
+    if not dashboard.enabled:
+        return
+    try:
+        report = {"positions": dashboard_positions(positions, pool)}
+        if dashboard.due():
+            report["account"] = fetch_account(ig_service)
+            if time.monotonic() - _last_trades_fetch >= TRADES_EVERY_SECONDS:
+                _last_trades_fetch = time.monotonic()
+                report["trades"] = fetch_closed_trades(ig_service, pool)
+        dashboard.update(**report)
+    except Exception as e:
+        log.warning(f"Couldn't gather this pass's dashboard report: {e or 'empty response - likely rate limited'}")
+
+
+# ---------------------------------------------------------------------------
 # TRADING CYCLE
 # ---------------------------------------------------------------------------
 def trading_cycle(ig_service: IGService, item: dict, positions: Optional[pd.DataFrame]) -> None:
@@ -615,8 +748,7 @@ def run_bot() -> None:
         f"Stop-loss={STOP_LOSS_PCT * 100:g}% | Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe=15Min"
     )
     log.info("=" * 78)
-    # Log lines and a heartbeat only: IG's tight request limits leave no room for extra snapshot calls.
-    dashboard.describe(currency=CURRENCY_CODE, config={
+    dashboard.describe(account=_account_id, currency=CURRENCY_CODE, config={
         "markets": [item["name"] for item in pool], "streakLength": STREAK_LENGTH,
         "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
     })
@@ -634,6 +766,7 @@ def run_bot() -> None:
             consecutive_errors += 1
             sleep_after_error(consecutive_errors)
             continue
+        report_to_dashboard(ig_service, positions, pool)
 
         for item in pool:
             try:

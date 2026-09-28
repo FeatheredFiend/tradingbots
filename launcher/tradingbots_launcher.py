@@ -48,7 +48,7 @@ STOP_TIMEOUT_SECONDS = 20
 class Bot:
     key: str          # also its name on the dashboard and in start_bot.bat
     name: str
-    broker: str       # alpaca / oanda / pepperstone / ig - picks the Python environment
+    broker: str       # alpaca / oanda / pepperstone / capital / ig - picks the Python environment
     strategy: str
     script: str       # relative to the repo
 
@@ -65,6 +65,10 @@ BOTS = [
         r"pepperstone-momentum-scanner-bot\pepperstone_momentum_scanner_bot.py"),
     Bot("pepperstone-ema-bot", "Pepperstone EMA crossover", "pepperstone", "EMA 9/21 crossover",
         r"pepperstone-ema-bot\pepperstone_ema_bot.py"),
+    Bot("capital-momentum-scanner", "Capital.com momentum scanner", "capital", "Momentum streak",
+        r"capital-momentum-scanner-bot\capital_momentum_scanner_bot.py"),
+    Bot("capital-ema-bot", "Capital.com EMA crossover", "capital", "EMA 9/21 crossover",
+        r"capital-ema-bot\capital_ema_bot.py"),
     Bot("alpaca-momentum-scanner", "Alpaca momentum scanner", "alpaca", "Momentum streak (buys only)",
         r"alpaca-momentum-scanner-bot\alpaca_momentum_scanner_bot.py"),
     Bot("alpaca-ema-bot", "Alpaca EMA crossover", "alpaca", "EMA 9/21 crossover", r"alpaca-ema-bot\alpaca_ema_bot.py"),
@@ -72,7 +76,7 @@ BOTS = [
         r"ig-momentum-scanner-bot\ig_momentum_scanner_bot.py"),
     Bot("ig-ema-bot", "IG EMA crossover", "ig", "EMA 9/21 crossover", r"ig-cfd-ema-bot\ig_cfd_ema_bot.py"),
 ]
-BROKERS = {"oanda": "OANDA", "pepperstone": "Pepperstone", "alpaca": "Alpaca", "ig": "IG"}
+BROKERS = {"oanda": "OANDA", "pepperstone": "Pepperstone", "capital": "Capital.com", "alpaca": "Alpaca", "ig": "IG"}
 
 
 def default_config() -> dict:
@@ -82,6 +86,7 @@ def default_config() -> dict:
         "venvs": {
             "oanda": str(home / "ig-bot-env"),  # OANDA only needs requests, which ig-bot-env has
             "pepperstone": str(home / "pepperstone-bot-env"),
+            "capital": str(home / "ig-bot-env"),  # Capital.com only needs requests too
             "alpaca": str(home / "alpaca-bot-env"),
             "ig": str(home / "ig-bot-env"),
         },
@@ -247,7 +252,7 @@ SETTING_GROUPS = [
         Setting("DASHBOARD_URL", "Dashboard address", "e.g. https://tradingdashboard.proprietary-data.com"),
         Setting("DASHBOARD_TOKEN", "Dashboard token", "The dashboard's INGEST_TOKEN", secret=True),
     ]),
-    ("All momentum scanners", "Shared by the Alpaca, OANDA, Pepperstone and IG scanners.", [
+    ("All momentum scanners", "Shared by the Alpaca, OANDA, Pepperstone, Capital.com and IG scanners.", [
         Setting("STREAK_LENGTH", "Streak length", "Bars in a row that trigger a trade - default 3", number=True),
         Setting("STOP_LOSS_PERCENT", "Stop-loss %", "Of the entry price - default 2", number=True),
         Setting("TAKE_PROFIT_PERCENT", "Take-profit %", "Of the entry price - default 5", number=True),
@@ -269,6 +274,16 @@ SETTING_GROUPS = [
         Setting("PEPPERSTONE_POOL", "Scanner markets", "Comma-separated MT5 symbols - empty for the default 15"),
         Setting("PEPPERSTONE_WATCHLIST", "EMA bot markets", "Comma-separated - empty for AAPL.US, MSFT.US and co."),
         Setting("MT5_TERMINAL_PATH", "MT5 terminal", "Path to terminal64.exe, if it isn't found on its own"),
+    ]),
+    ("Capital.com", "Demo account: Settings > API integrations (needs two-factor login turned on).", [
+        Setting("CAPITAL_API_KEY", "API key", secret=True),
+        Setting("CAPITAL_EMAIL", "Login email"),
+        Setting("CAPITAL_EMAIL_PASSWORD", "API key password", "The password set when the key was generated", secret=True),
+        Setting("CAPITAL_ACCOUNT_ID", "Account ID", "Only needed to trade other than the preferred account"),
+        Setting("CAPITAL_BUDGET", "Budget", "Total exposure in the account currency - default 600", number=True),
+        Setting("CAPITAL_MAX_POSITIONS", "Max positions", "Budget slices - default 5", number=True),
+        Setting("CAPITAL_POOL", "Scanner markets", "Comma-separated epics, e.g. US500,GOLD - empty for the default 15"),
+        Setting("CAPITAL_WATCHLIST", "EMA bot markets", "Comma-separated epics - empty for AAPL, MSFT and co."),
     ]),
     ("Alpaca", "Paper account keys.", [
         Setting("APCA_API_KEY_ID", "API key ID"),
@@ -503,7 +518,7 @@ class BotsTab:
 class BotRow:
     def __init__(self, parent, row: int, bot: Bot, app: LauncherApp):
         self.bot, self.app = bot, app
-        pad = {"pady": px(7)}
+        pad = {"pady": px(4)}  # 10 bots have to fit a 4K screen at 300%
         self.in_start_all = tk.BooleanVar(value=bot.key in app.config["start_all"])
         ttk.Checkbutton(parent, variable=self.in_start_all, command=self.on_start_all_changed
                         ).grid(row=row, column=0, padx=(px(14), px(20)), **pad)

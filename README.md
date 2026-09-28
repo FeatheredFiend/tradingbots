@@ -9,9 +9,10 @@ each broker; what differs is how small a trade can be:
 | Alpaca | free paper account | $1 of a US share | anywhere |
 | OANDA | free practice account | 1 unit — about £1 of a currency pair | anywhere |
 | Pepperstone | demo account on MetaTrader 5 | 0.01 lots — about £1,000 of a currency pair | Windows only |
+| Capital.com | free demo account | a tenth of a share, a hundredth of an index — about £5–£110 | anywhere |
 | IG | needs an approved live account for the API key | IG's minimum — thousands, see [IG position sizing](#ig-position-sizing-both-ig-bots) | anywhere |
 
-## EMA crossover strategy (`alpaca-ema-bot/`, `ig-cfd-ema-bot/`, `oanda-ema-bot/`, `pepperstone-ema-bot/`)
+## EMA crossover strategy (`alpaca-ema-bot/`, `ig-cfd-ema-bot/`, `oanda-ema-bot/`, `pepperstone-ema-bot/`, `capital-ema-bot/`)
 
 - Timeframe: 15-minute bars
 - Buy: 9-period EMA crosses **above** the 21-period EMA
@@ -309,6 +310,58 @@ number and ignore all others, so they can share one account with each
 other and with your manual trades — on a hedging account, that is. The
 startup log shows the account type and warns if it isn't hedging.
 
+### Capital.com bots (`capital-momentum-scanner-bot/`, `capital-ema-bot/`)
+
+The IG bots' two strategies on a [Capital.com](https://capital.com)
+**demo** account, through Capital.com's REST API. Compared with IG:
+
+- **No live account needed for the API.** Turn on two-factor login, then
+  Settings > API integrations > Generate new key, giving the key its own
+  password.
+- **Small trades:** a hundredth of the US 500, a tenth of a share, 100
+  units of a currency pair — so trades are sized from a budget, not a
+  broker minimum.
+- **Free price history for everything, shares included**, so both bots use
+  Capital.com's own closed 15-minute bars (no warm-up, no bar file), and
+  the EMA bot can trade the US shares the IG bot never could.
+- Stop-loss/take-profit are attached to the order, as on IG.
+
+```powershell
+pip install -r capital-momentum-scanner-bot/requirements.txt   # just requests; capital-ema-bot/ has the same file
+[Environment]::SetEnvironmentVariable("CAPITAL_API_KEY", "the key", "User")
+[Environment]::SetEnvironmentVariable("CAPITAL_EMAIL", "your login email", "User")
+[Environment]::SetEnvironmentVariable("CAPITAL_EMAIL_PASSWORD", "the key's password", "User")
+python capital-momentum-scanner-bot/capital_momentum_scanner_bot.py
+python capital-ema-bot/capital_ema_bot.py
+```
+
+`CAPITAL_ACCOUNT_ID` picks an account other than the login's preferred
+one. **They only ever use the demo endpoint.**
+
+**Sizing:** the same budget-slice scheme as the OANDA bots, with
+`CAPITAL_BUDGET` / `CAPITAL_MAX_POSITIONS`. The default budget is **600**
+(5 slices of £120), about the smallest that takes in the scanner's whole
+pool: in September 2026 the smallest trades were about £107 for the UK 100
+(0.01 contracts), £55–£100 for 100 units of a currency pair, £25–£70 for
+the other indices, gold, silver and oil, and up to about £25 for a US share. The
+budget is exposure, not margin — a £120 index trade ties up about £6.
+
+**Scanner:** the same as the OANDA scanner. `CAPITAL_POOL` overrides the
+pool, as Capital.com epics (`UK100`, `US500`, `DE40`, `GOLD`, `OIL_BRENT`,
+`EURUSD`, ...); an epic it doesn't have is skipped, with similar markets.
+
+**EMA bot:** long only, fixed 2%/5%. `CAPITAL_WATCHLIST` defaults to
+`AAPL,MSFT,AMZN,GOOGL,TSLA,NVDA,META,NFLX` — US shares, which trade
+14:30–21:00 UK time. An epic Capital.com doesn't have stops it at startup.
+
+**Both** treat every position in their markets as their own. Their default
+markets don't overlap, so they can share one account (the dashboard then
+shows the same balance for both); for separate balances, add a second demo
+account on Capital.com and set `CAPITAL_ACCOUNT_ID` per bot. Capital.com
+has no list of closed trades, so for the dashboard they're pieced together
+from the activity history (entry, exit, and whether a stop-loss or
+take-profit closed it) and the transaction history (the realised profit).
+
 ## IG position sizing (both IG bots)
 
 Both IG bots trade **each market's minimum deal size** — the smallest trade
@@ -401,8 +454,10 @@ to 2,000 log lines to send later. What each broker can report:
 |---|---|---|
 | OANDA | yes - trades with why they closed (stop-loss, take-profit, reversal) | 3 a minute |
 | Pepperstone | yes - trades matched from MT5's deal history by the bot's magic number | none (local terminal) |
+| Capital.com | yes - trades pieced together from the activity and transaction history, with why they closed | 4 a minute |
 | Alpaca | yes - trades as the bot closes them, priced at Alpaca's value just before the sell | 2 a minute |
-| IG | log and running status only - IG's request limits leave no room | none |
+| IG scanner | yes - but no profit per open position (IG's REST API doesn't give one; the account's unrealised total is exact); trades from the transaction history every 5 minutes | about 1.2 a minute, inside its pacing |
+| IG EMA bot | log and running status only | none |
 
 ## Launcher (`launcher/`) - a Windows app for all of this
 
@@ -415,7 +470,7 @@ to 2,000 log lines to send later. What each broker can report:
   on the right Python environment. Stopping presses Ctrl+C in that window,
   so the bot shuts down cleanly and tells the dashboard it stopped (after
   20 seconds without an answer it's force-stopped instead). Only the ticked
-  bots start with "Start all": by default the four scanners, since an EMA
+  bots start with "Start all": by default the scanners, since an EMA
   bot and a scanner on the same OANDA or Alpaca account would close each
   other's trades. Closing the app leaves the bots running.
 - **Settings:** a form for every environment variable the bots read -
