@@ -463,16 +463,18 @@ def fetch_all_positions(ig_service: IGService) -> Optional[pd.DataFrame]:
 
 
 def find_position(positions: Optional[pd.DataFrame], epic: str) -> Optional[dict]:
+    # trading-ig flattens each position's nested "market"/"position" fields
+    # into plain columns — "epic", "dealId", ... — with no prefix.
     if positions is None or len(positions) == 0:
         return None
-    match = positions[positions["market.epic"] == epic]
+    match = positions[positions["epic"] == epic]
     if len(match) == 0:
         return None
     row = match.iloc[0]
     return {
-        "deal_id": row["position.dealId"],
-        "direction": row["position.direction"],
-        "size": float(row["position.size"]),
+        "deal_id": row["dealId"],
+        "direction": row["direction"],
+        "size": float(row["size"]),
     }
 
 
