@@ -1,19 +1,25 @@
 # tradingbots
 
 Small, paper/demo-only trading bots against different brokers' APIs.
-**Nothing in this repo trades real money.** Only the Alpaca bots' trades are
-genuinely small ($2 and $20 each); the IG bots trade IG's minimum size,
-which is still big — see [IG position sizing](#ig-position-sizing-both-ig-bots).
+**Nothing in this repo trades real money.** The same two strategies run on
+each broker; what differs is how small a trade can be:
 
-## EMA crossover strategy (`alpaca-ema-bot/`, `ig-cfd-ema-bot/`)
+| Broker | API access | Smallest trade | Runs on |
+|---|---|---|---|
+| Alpaca | free paper account | $1 of a US share | anywhere |
+| OANDA | free practice account | 1 unit — about £1 of a currency pair | anywhere |
+| Pepperstone | demo account on MetaTrader 5 | 0.01 lots — about £1,000 of a currency pair | Windows only |
+| IG | needs an approved live account for the API key | IG's minimum — thousands, see [IG position sizing](#ig-position-sizing-both-ig-bots) | anywhere |
+
+## EMA crossover strategy (`alpaca-ema-bot/`, `ig-cfd-ema-bot/`, `oanda-ema-bot/`, `pepperstone-ema-bot/`)
 
 - Timeframe: 15-minute bars
 - Buy: 9-period EMA crosses **above** the 21-period EMA
 - Sell / close: 9-period EMA crosses **below** the 21-period EMA
 - Risk management: 2% stop-loss / 5% take-profit from the position's entry price
 
-`ig-momentum-scanner-bot/` and `alpaca-momentum-scanner-bot/` run a
-different, higher-risk momentum strategy — see their own sections below.
+The `*-momentum-scanner-bot/` folders run a different, higher-risk momentum
+strategy — see the IG scanner's section below.
 
 ## Bots
 
@@ -195,6 +201,111 @@ Differences from the IG scanner worth knowing:
 Don't run it alongside `alpaca-ema-bot/` on the same paper account — both
 trade AAPL, MSFT and friends, and each would close the other's positions.
 
+### OANDA bots (`oanda-momentum-scanner-bot/`, `oanda-ema-bot/`)
+
+The IG bots' two strategies on an [OANDA](https://www.oanda.com)
+**practice** (demo) account, through OANDA's v20 REST API. Compared with IG:
+
+- **No live account needed for the API.** Log into the practice account in
+  the OANDA hub, then Tools > API > Generate.
+- **Trades as small as one unit** (one unit of EUR/USD is one euro), so
+  trades are sized from a small budget, not a broker minimum.
+- **Free price history for every market**, so both bots use OANDA's own
+  closed 15-minute bars: no warm-up, no bar file.
+- Stop-loss/take-profit are attached to the order, as on IG.
+
+```bash
+pip install -r oanda-momentum-scanner-bot/requirements.txt   # just requests; oanda-ema-bot/ has the same file
+export OANDA_API_TOKEN="your_practice_token"
+export OANDA_ACCOUNT_ID="101-004-1234567-001"   # optional if the token can only see one account
+python oanda-momentum-scanner-bot/oanda_momentum_scanner_bot.py
+python oanda-ema-bot/oanda_ema_bot.py
+```
+
+**Sizing (both bots):** `OANDA_BUDGET` (default `100`, in the account's
+currency) is split into `OANDA_MAX_POSITIONS` (default `5`) slices, and
+each trade is worth one slice — so a 2% stop-loss on a £20 trade costs about
+£0.40. The budget is **exposure** (what the positions are worth), not
+margin: the default uses no leverage, and setting it above the balance uses
+some. Each bot has its own budget. Sizes come from the budget, not the
+balance, so the bots trade the same on OANDA's 100,000 practice balance as
+on a real £100. A market whose smallest trade is worth more than a slice is
+skipped at startup, with the reason logged: **at the default £100 only
+currency pairs trade** — one unit of silver or oil is worth about £35–50,
+and one unit of an index or of gold is worth thousands.
+
+**Scanner:** the IG scanner's rules (3-bar streak, long and short, a reversal
+closes) and the same `STREAK_LENGTH` / `STOP_LOSS_PERCENT` /
+`TAKE_PROFIT_PERCENT` env vars — if those are set for the other scanners,
+this one uses them too. `OANDA_POOL` overrides its pool: the IG scanner's 15
+markets in OANDA's names (`EUR_USD`, `SPX500_USD`, `XAU_USD`, ...). A name
+the account doesn't offer is skipped, with similar names it does offer.
+Once `OANDA_MAX_POSITIONS` are open further signals are skipped; when
+several markets signal at once, the biggest streak gets the slot first.
+
+**EMA bot:** long only, fixed 2%/5% like the IG EMA bot. `OANDA_WATCHLIST`
+defaults to eight currency pairs, since OANDA has no single-company shares.
+A name the account doesn't offer stops it at startup.
+
+**Both** act on each bar as it closes, so after a start nothing happens
+until the next 15-minute bar closes. **Give each bot its own OANDA
+sub-account** (add one in the hub; set `OANDA_ACCOUNT_ID` in each bot's
+window): each treats every position in its markets as its own, and OANDA
+nets buys and sells of one market into a single position, so two bots on
+one account would close each other's trades.
+
+### Pepperstone bots (`pepperstone-momentum-scanner-bot/`, `pepperstone-ema-bot/`) — Windows only
+
+The IG bots' two strategies on a [Pepperstone](https://pepperstone.com)
+**MetaTrader 5 demo** account. Pepperstone has no web API of its own; these
+use MetaQuotes' `MetaTrader5` Python package, which drives the MT5 terminal
+on the same PC. So they need **Windows**, Pepperstone's MT5 terminal, and a
+demo account opened **on MetaTrader 5** — not MT4, cTrader or TradingView.
+
+1. Open the demo account choosing MetaTrader 5, install Pepperstone's MT5
+   terminal, and log into the demo account in it once.
+2. Switch on **Algo Trading** on the terminal's toolbar. Without it the
+   terminal refuses every order; the bots check this at startup.
+3. Install and run (PowerShell):
+
+```powershell
+pip install -r pepperstone-momentum-scanner-bot/requirements.txt   # MetaTrader5 + numpy; pepperstone-ema-bot/ has the same file
+python pepperstone-momentum-scanner-bot/pepperstone_momentum_scanner_bot.py
+python pepperstone-ema-bot/pepperstone_ema_bot.py
+```
+
+The bots attach to whichever account the terminal is logged into (starting
+the terminal if it's closed), or log in themselves when
+`PEPPERSTONE_LOGIN`, `PEPPERSTONE_PASSWORD` and `PEPPERSTONE_SERVER` (the
+server name in the login dialog, e.g. `Pepperstone-Demo`) are set. Set
+`MT5_TERMINAL_PATH` to `terminal64.exe` if the package can't find the
+terminal. **They exit unless the account is a demo account.**
+
+**Sizing:** the same budget-slice scheme as the OANDA bots, with
+`PEPPERSTONE_BUDGET` / `PEPPERSTONE_MAX_POSITIONS` — but the default budget
+is **10,000** (5 slices of 2,000), because MT5's smallest trade is 0.01
+lots: 1,000 units of a currency pair, roughly £750–£1,000 of exposure, and
+more for gold. At £100 nothing would trade. Share CFDs trade in whole
+shares (one Apple share is about £170).
+
+**Scanner:** the same as the OANDA scanner. `PEPPERSTONE_POOL` overrides
+the pool, in Pepperstone's MT5 names (`US500`, `GER40`, `XAUUSD`,
+`SpotBrent`, `EURUSD`, ...).
+
+**EMA bot:** here the IG bot's original watchlist idea — US shares — works,
+since MT5 has price history for Pepperstone's share CFDs.
+`PEPPERSTONE_WATCHLIST` defaults to
+`AAPL.US,MSFT.US,AMZN.US,GOOGL.US,TSLA.US,NVDA.US,META.US` (the US-session
+symbols; Pepperstone also lists 24-hour versions such as `AAPL.US-24`). A
+name missing from the account, or matching several symbols, stops it at
+startup, listing what it found.
+
+**Both** accept a name that isn't exact if exactly one symbol starts with
+it (brokers add suffixes). They tag their positions with their own magic
+number and ignore all others, so they can share one account with each
+other and with your manual trades — on a hedging account, that is. The
+startup log shows the account type and warns if it isn't hedging.
+
 ## IG position sizing (both IG bots)
 
 Both IG bots trade **each market's minimum deal size** — the smallest trade
@@ -220,8 +331,8 @@ they work, but the scanner holding trades in many of its 15 markets at
 once could tie up several thousand in margin. On 100 or less, IG would
 reject trades for insufficient funds, or a single stop-loss could wipe the
 account out. **These bots can't be scaled down to small amounts** — IG's
-minimum trade size is the floor. For genuinely small trades, see
-`alpaca-ema-bot/`, which buys fractional shares.
+minimum trade size is the floor. For genuinely small trades, see the
+Alpaca bots (fractional shares) or the OANDA bots (single units).
 
 ## IG rate limits (both IG bots)
 
@@ -264,4 +375,5 @@ tiny (~0.05% a trade) and assumes stops fill exactly at their level.
 ## Repo layout
 
 Each bot is self-contained in its own folder with its own `requirements.txt`.
-Virtual environments (`*-bot-env/`) are gitignored — create your own per bot.
+Virtual environments (`*-bot-env/`) are gitignored — create your own per
+broker (both bots of a broker share the same requirements).
