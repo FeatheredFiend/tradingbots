@@ -1,15 +1,21 @@
 @echo off
-rem Starts one trading bot in its own console window:
+rem Starts one trading bot as a new tab in the "TradingBots" Windows Terminal
+rem window, which opens with the first bot (or in a console window of its
+rem own, if Windows Terminal isn't installed):
 rem
 rem     start_bot.bat oanda-momentum-scanner
+rem
+rem The tab gets this script's environment, so the bot sees the settings the
+rem TradingBots launcher passes it. Closing a tab stops that bot; closing the
+rem whole window stops them all.
 rem
 rem Each bot runs on its broker's Python environment. The defaults are the
 rem ones in your user folder; override them with TRADINGBOTS_ALPACA_ENV,
 rem TRADINGBOTS_OANDA_ENV, TRADINGBOTS_PEPPERSTONE_ENV, TRADINGBOTS_CAPITAL_ENV
 rem or TRADINGBOTS_IG_ENV (the TradingBots launcher sets these from its Paths tab).
 rem
-rem The window closes when the bot stops cleanly (Ctrl+C) and stays open
-rem on an error, so the message can be read.
+rem The tab closes when the bot stops cleanly (Ctrl+C) and stays open on an
+rem error, so the message can be read.
 setlocal
 
 set "REPO=%~dp0.."
@@ -46,4 +52,9 @@ if not exist "%VENV%\Scripts\python.exe" (
     exit /b 3
 )
 
+where wt.exe >nul 2>nul || goto :own_window
+wt.exe -w TradingBots new-tab --title "%BOT%" --suppressApplicationTitle cmd /c ""%VENV%\Scripts\python.exe" "%REPO%\%SCRIPT%" || pause"
+exit /b 0
+
+:own_window
 start "Trading bot: %BOT%" cmd /c ""%VENV%\Scripts\python.exe" "%REPO%\%SCRIPT%" || pause"

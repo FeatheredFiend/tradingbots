@@ -500,9 +500,9 @@ class BotsTab:
 
         ttk.Label(self.frame, style="Hint.TLabel", wraplength=px(900), justify="left", text=(
             "Tick the bots that \"Start all ticked\" starts - not an EMA bot and a scanner on the same OANDA or Alpaca "
-            "account, they'd close each other's trades. Bots started by hand show up here too. Stop presses Ctrl+C "
-            "in the bot's window, so it shuts down cleanly. Each bot's output is in its own console window; closing "
-            "this app leaves the bots running."
+            "account, they'd close each other's trades. Bots started by hand show up here too. Each bot opens as a tab "
+            "in the \"TradingBots\" terminal window, and Stop presses Ctrl+C in its tab, so it shuts down cleanly. "
+            "Closing that window stops every bot; closing this app leaves them running."
         )).pack(fill="x", pady=(px(12), 0))
 
     def start_all(self) -> None:

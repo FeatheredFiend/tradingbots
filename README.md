@@ -466,10 +466,14 @@ to 2,000 log lines to send later. What each broker can report:
 - **Bots:** every bot with its status - including ones started by hand -
   and Start / Stop / Restart per bot, "Start all ticked" and "Stop all",
   plus a link to each bot's dashboard page. Starting runs
-  `launcher/start_bot.bat`, which opens the bot in its own console window
-  on the right Python environment. Stopping presses Ctrl+C in that window,
-  so the bot shuts down cleanly and tells the dashboard it stopped (after
-  20 seconds without an answer it's force-stopped instead). Only the ticked
+  `launcher/start_bot.bat`, which opens the bot as a new tab in one
+  "TradingBots" Windows Terminal window (a console window of its own if
+  Windows Terminal isn't installed), on the right Python environment.
+  Stopping presses Ctrl+C in that tab, so the bot shuts down cleanly and
+  tells the dashboard it stopped (after 20 seconds without an answer it's
+  force-stopped instead). Closing a tab stops that bot, and closing the
+  whole window stops every bot at once - without the dashboard goodbye, so
+  they show as "not reporting" there. Only the ticked
   bots start with "Start all": by default the scanners, since an EMA
   bot and a scanner on the same OANDA or Alpaca account would close each
   other's trades. Closing the app leaves the bots running.
