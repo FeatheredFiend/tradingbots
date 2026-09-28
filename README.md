@@ -375,8 +375,38 @@ requests — stop the IG scanner first so the two don't overrun IG's
 did best, and a 0.5% take-profit was worst at every stop. The edge was
 tiny (~0.05% a trade) and assumes stops fill exactly at their level.
 
+## Dashboard (`shared/dashboard_reporter.py`)
+
+Every bot can report to the
+[trading dashboard](https://github.com/FeatheredFiend/tradingdashboard), a
+web app that shows whether each bot is running, its account, open
+positions, trades, profit/loss and console log - from any browser or phone.
+The bots push to it, so it works with them running at home; no broker key
+ever leaves this PC.
+
+It's off until both of these are set where the bots run (PowerShell, saved
+for new windows):
+
+```powershell
+[Environment]::SetEnvironmentVariable("DASHBOARD_URL", "https://your-dashboard-subdomain", "User")
+[Environment]::SetEnvironmentVariable("DASHBOARD_TOKEN", "the dashboard's INGEST_TOKEN", "User")
+```
+
+then restart the bots. Each sends a heartbeat with its new log lines every
+20 seconds and, about once a minute, its account, positions and recent
+trades. If the dashboard is down, the bot keeps trading and holds back up
+to 2,000 log lines to send later. What each broker can report:
+
+| Bots | Account, positions, trades | Extra broker calls |
+|---|---|---|
+| OANDA | yes - trades with why they closed (stop-loss, take-profit, reversal) | 3 a minute |
+| Pepperstone | yes - trades matched from MT5's deal history by the bot's magic number | none (local terminal) |
+| Alpaca | yes - trades as the bot closes them, priced at Alpaca's value just before the sell | 2 a minute |
+| IG | log and running status only - IG's request limits leave no room | none |
+
 ## Repo layout
 
-Each bot is self-contained in its own folder with its own `requirements.txt`.
+Each bot lives in its own folder with its own `requirements.txt`; the one
+shared piece is `shared/dashboard_reporter.py` (standard library only).
 Virtual environments (`*-bot-env/`) are gitignored — create your own per
 broker (both bots of a broker share the same requirements).

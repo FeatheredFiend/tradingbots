@@ -78,6 +78,9 @@ import time
 
 import MetaTrader5 as mt5
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
+from dashboard_reporter import DashboardReporter  # noqa: E402 - needs the path above
+
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
@@ -131,6 +134,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("pepperstone_momentum_bot")
+
+# Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
+dashboard = DashboardReporter("pepperstone-momentum-scanner", "Pepperstone momentum scanner", broker="Pepperstone", strategy="Momentum streak")
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +375,101 @@ def close_position(position, info, reason: str) -> bool:
     done, outcome = send(request)
     log.info(f"CLOSE submitted ({reason}) -> {position.symbol} {'long' if closing_long else 'short'} "
              f"{position.volume:g} lots result={outcome}")
+    if done:
+        CLOSE_REASONS[position.ticket] = reason
     return done
+
+
+# ---------------------------------------------------------------------------
+# DASHBOARD
+# ---------------------------------------------------------------------------
+DEAL_REASONS = {
+    mt5.DEAL_REASON_SL: "stop-loss",
+    mt5.DEAL_REASON_TP: "take-profit",
+    mt5.DEAL_REASON_EXPERT: "closed by the bot",
+    mt5.DEAL_REASON_CLIENT: "closed by hand",
+    mt5.DEAL_REASON_MOBILE: "closed by hand (phone)",
+    mt5.DEAL_REASON_WEB: "closed by hand (web)",
+    mt5.DEAL_REASON_SO: "stop-out",
+}
+_server_offset = None  # seconds MT5's server clock runs ahead of UTC, once known
+CLOSE_REASONS = {}  # position ticket -> why this bot closed it (MT5 only records "expert")
+
+
+def server_offset(symbols) -> int | None:
+    """How far the broker's server clock (which MT5 stamps everything with -
+    UTC+2/+3 at Pepperstone) is ahead of UTC, read off a tick from the last
+    two minutes. Stays unknown while every market is shut, e.g. at weekends."""
+    global _server_offset
+    now = time.time()
+    for symbol in symbols:
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            continue
+        ahead = tick.time - now
+        rounded = round(ahead / 1800) * 1800  # zones are whole or half hours
+        if abs(ahead - rounded) < 120 and abs(rounded) <= 14 * 3600:
+            _server_offset = rounded
+            break
+    return _server_offset
+
+
+def report_to_dashboard(markets) -> None:
+    """Account, this bot's open positions and its trades from the last week,
+    about once a minute. All local calls to the terminal; a failure just
+    skips it. Trades wait until the server's time offset is known, so their
+    times are right."""
+    try:
+        account = mt5.account_info()
+        positions = fetch_positions()
+        offset = server_offset(markets)
+        now = int(time.time())
+        deals = mt5.history_deals_get(now - 8 * 86400, now + 3 * 86400) or ()  # wide: the window is in server time
+    except Exception:
+        return
+    if account is None:
+        return
+    utc = (lambda server_time: server_time - offset) if offset is not None else (lambda server_time: None)
+
+    opened = {d.position_id: d for d in deals if d.entry == mt5.DEAL_ENTRY_IN and d.magic == MAGIC}
+    closing = {}
+    for deal in deals:
+        if deal.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY) and deal.position_id in opened:
+            closing.setdefault(deal.position_id, []).append(deal)
+
+    trades = []
+    for position_id, outs in closing.items():
+        entry = opened[position_id]
+        volume = sum(d.volume for d in outs)
+        trades.append({
+            "ref": position_id,
+            "symbol": entry.symbol,
+            "direction": "long" if entry.type == mt5.DEAL_TYPE_BUY else "short",
+            "size": entry.volume,
+            "entryPrice": entry.price,
+            "exitPrice": sum(d.price * d.volume for d in outs) / volume if volume else None,
+            "openedAt": utc(entry.time),
+            "closedAt": utc(outs[-1].time),
+            "pnl": sum(d.profit + d.swap + d.commission + d.fee for d in outs) + entry.commission + entry.fee,
+            "closeReason": (CLOSE_REASONS.get(position_id) if outs[-1].reason == mt5.DEAL_REASON_EXPERT else None)
+            or DEAL_REASONS.get(outs[-1].reason, "closed"),
+        })
+
+    dashboard.update(
+        account={"balance": account.balance, "equity": account.equity, "unrealizedPl": account.profit},
+        positions=[{
+            "symbol": p.symbol,
+            "direction": "long" if p.type == mt5.POSITION_TYPE_BUY else "short",
+            "size": p.volume,
+            "entryPrice": p.price_open,
+            "currentPrice": p.price_current,
+            "pnl": p.profit + p.swap,
+            "stopLoss": p.sl or None,
+            "takeProfit": p.tp or None,
+            "openedAt": utc(p.time),
+        } for p in positions.values()],
+        trades=trades if offset is not None else [],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -454,12 +554,20 @@ def run_bot() -> None:
         f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe=15Min"
     )
     log.info("=" * 78)
+    dashboard.describe(account=f"{account.login} on {account.server}", currency=currency, config={
+        "markets": list(pool), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
+        "streakLength": STREAK_LENGTH, "stopLossPercent": STOP_LOSS_PCT * 100,
+        "takeProfitPercent": TAKE_PROFIT_PCT * 100, "magicNumber": MAGIC,
+    })
 
     seen_bar = None  # symbol -> start time of the latest closed bar already dealt with
     consecutive_errors = 0
 
     while True:
         try:
+            if dashboard.due():
+                report_to_dashboard(pool)
+
             latest = {}
             for symbol in pool:
                 bars = fetch_closes(symbol, STREAK_LENGTH + 1)

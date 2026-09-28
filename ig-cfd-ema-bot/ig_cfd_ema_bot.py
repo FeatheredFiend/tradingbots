@@ -63,6 +63,9 @@ import pandas as pd
 from trading_ig import IGService
 from trading_ig.rest import IGException
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
+from dashboard_reporter import DashboardReporter  # noqa: E402 - needs the path above
+
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
@@ -113,6 +116,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("ig_cfd_bot")
+
+# Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
+dashboard = DashboardReporter("ig-ema-bot", "IG EMA crossover", broker="IG", strategy="EMA 9/21 crossover")
 
 
 class _RateLimiter:
@@ -552,6 +558,11 @@ def run_bot() -> None:
         f"Timeframe=15Min | EMA periods={EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}"
     )
     log.info("=" * 78)
+    # Log lines and a heartbeat only: IG's tight request limits leave no room for extra snapshot calls.
+    dashboard.describe(currency=CURRENCY_CODE, config={
+        "watchlist": [item["name"] for item in watchlist], "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}",
+        "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
+    })
 
     consecutive_errors = 0
 

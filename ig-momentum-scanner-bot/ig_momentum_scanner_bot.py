@@ -91,6 +91,9 @@ import pandas as pd
 from trading_ig import IGService
 from trading_ig.rest import IGException
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
+from dashboard_reporter import DashboardReporter  # noqa: E402 - needs the path above
+
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
@@ -160,6 +163,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("ig_momentum_bot")
+
+# Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
+dashboard = DashboardReporter("ig-momentum-scanner", "IG momentum scanner", broker="IG", strategy="Momentum streak")
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +615,11 @@ def run_bot() -> None:
         f"Stop-loss={STOP_LOSS_PCT * 100:g}% | Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe=15Min"
     )
     log.info("=" * 78)
+    # Log lines and a heartbeat only: IG's tight request limits leave no room for extra snapshot calls.
+    dashboard.describe(currency=CURRENCY_CODE, config={
+        "markets": [item["name"] for item in pool], "streakLength": STREAK_LENGTH,
+        "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
+    })
 
     consecutive_errors = 0
     pass_number = 0

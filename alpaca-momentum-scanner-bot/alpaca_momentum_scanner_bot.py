@@ -62,12 +62,16 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime, timezone
 
 import pandas as pd
 import requests
 
 import alpaca_trade_api as tradeapi
 from alpaca_trade_api.rest import APIError, TimeFrame, TimeFrameUnit
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
+from dashboard_reporter import DashboardReporter  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -131,6 +135,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("alpaca_momentum_bot")
+
+# Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
+dashboard = DashboardReporter("alpaca-momentum-scanner", "Alpaca momentum scanner", broker="Alpaca", strategy="Momentum streak (buys only)")
 
 
 # ---------------------------------------------------------------------------
@@ -245,10 +252,11 @@ def submit_buy(api: tradeapi.REST, symbol: str) -> bool:
         return False
 
 
-def close_open_position(api: tradeapi.REST, symbol: str, reason: str) -> bool:
+def close_open_position(api: tradeapi.REST, symbol: str, reason: str, position=None) -> bool:
     try:
         order = api.close_position(symbol)
         log.info(f"CLOSE submitted ({reason}) -> {symbol} order_id={order.id}")
+        report_closed_trade(order, position, reason)
         return True
     except (APIError, requests.exceptions.RequestException) as e:
         log.error(f"Error closing {symbol} ({reason}); will retry next loop: {e}")
@@ -259,6 +267,53 @@ def has_cash_for_a_slice(api: tradeapi.REST) -> bool:
     """Fractional buys can't use margin, so check settled-cash buying power."""
     account = api.get_account()
     return float(account.non_marginable_buying_power) >= TRADE_NOTIONAL_USD
+
+
+# ---------------------------------------------------------------------------
+# DASHBOARD
+# ---------------------------------------------------------------------------
+def report_to_dashboard(api: tradeapi.REST, symbols) -> None:
+    """Account and this bot's open positions, about once a minute (two
+    requests); a failure just skips it. Closed trades are reported by
+    close_open_position() as they happen. The stop/limit shown are the
+    levels this bot enforces itself."""
+    try:
+        account = api.get_account()
+        positions = api.list_positions()
+    except Exception:
+        return
+    unrealized = sum(float(p.unrealized_pl) for p in positions)
+    dashboard.update(
+        account={"balance": float(account.equity) - unrealized, "equity": float(account.equity), "unrealizedPl": unrealized},
+        positions=[{
+            "symbol": p.symbol,
+            "direction": "long",
+            "size": float(p.qty),
+            "entryPrice": float(p.avg_entry_price),
+            "currentPrice": float(p.current_price),
+            "pnl": float(p.unrealized_pl),
+            "stopLoss": round(float(p.avg_entry_price) * (1 - STOP_LOSS_PCT), 4),
+            "takeProfit": round(float(p.avg_entry_price) * (1 + TAKE_PROFIT_PCT), 4),
+        } for p in positions if p.symbol in symbols],
+    )
+
+
+def report_closed_trade(order, position, reason: str) -> None:
+    """The trade this close ends, priced as Alpaca valued the position just
+    before the sell - the fill can differ by a cent or two."""
+    if position is None:
+        return
+    dashboard.trade({
+        "ref": str(order.id),
+        "symbol": position.symbol,
+        "direction": "long",
+        "size": float(position.qty),
+        "entryPrice": float(position.avg_entry_price),
+        "exitPrice": float(position.current_price),
+        "closedAt": datetime.now(timezone.utc).isoformat(),
+        "pnl": float(position.unrealized_pl),
+        "closeReason": reason.split(",")[0],
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +349,7 @@ def scan_pool(api: tradeapi.REST, pool: list, positions: dict, closes_by_symbol:
     for symbol, position in list(held.items()):
         bar_time, closes = closes_by_symbol.get(symbol, (None, None))
         reason = exit_reason(position, closes)
-        if reason and close_open_position(api, symbol, reason):
+        if reason and close_open_position(api, symbol, reason, position):
             del held[symbol]
             acted_on_bar[symbol] = bar_time
 
@@ -373,6 +428,12 @@ def run_bot() -> None:
     except (APIError, requests.exceptions.RequestException) as e:
         log.error(f"Couldn't fetch account info at startup: {e}")
 
+    dashboard.describe(currency="USD", config={
+        "pool": pool, "budgetUsd": BUDGET_USD, "maxPositions": MAX_OPEN_POSITIONS,
+        "tradeUsd": TRADE_NOTIONAL_USD, "streakLength": STREAK_LENGTH,
+        "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
+    })
+
     closes_by_symbol = {}
     bars_as_of = None
     acted_on_bar = {}
@@ -380,6 +441,9 @@ def run_bot() -> None:
 
     while True:
         try:
+            if dashboard.due():
+                report_to_dashboard(api, pool)
+
             clock = api.get_clock()
             if not clock.is_open:
                 log.info(f"Market is closed. Next open at {clock.next_open}. "

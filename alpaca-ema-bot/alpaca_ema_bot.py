@@ -55,6 +55,7 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
@@ -62,6 +63,9 @@ import requests
 
 import alpaca_trade_api as tradeapi
 from alpaca_trade_api.rest import APIError, TimeFrame, TimeFrameUnit
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
+from dashboard_reporter import DashboardReporter  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -119,6 +123,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("ema_bot")
+
+# Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
+dashboard = DashboardReporter("alpaca-ema-bot", "Alpaca EMA crossover", broker="Alpaca", strategy="EMA 9/21 crossover")
 
 
 # ---------------------------------------------------------------------------
@@ -270,10 +277,11 @@ def submit_buy(api: tradeapi.REST, symbol: str) -> None:
         log.error(f"Unexpected error submitting BUY order for {symbol}: {e}")
 
 
-def close_open_position(api: tradeapi.REST, symbol: str, reason: str) -> None:
+def close_open_position(api: tradeapi.REST, symbol: str, reason: str, position=None) -> None:
     try:
         order = api.close_position(symbol)
         log.info(f"CLOSE position submitted ({reason}) -> {symbol} order_id={order.id}")
+        report_closed_trade(order, position, reason)
     except requests.exceptions.Timeout:
         log.error(f"Timeout closing position for {symbol} ({reason}); will retry next loop.")
     except requests.exceptions.ConnectionError:
@@ -282,6 +290,53 @@ def close_open_position(api: tradeapi.REST, symbol: str, reason: str) -> None:
         log.error(f"Alpaca API error closing position for {symbol} ({reason}): {e}")
     except Exception as e:
         log.error(f"Unexpected error closing position for {symbol} ({reason}): {e}")
+
+
+# ---------------------------------------------------------------------------
+# DASHBOARD
+# ---------------------------------------------------------------------------
+def report_to_dashboard(api: tradeapi.REST, symbols) -> None:
+    """Account and this bot's open positions, about once a minute (two
+    requests); a failure just skips it. Closed trades are reported by
+    close_open_position() as they happen. The stop/limit shown are the
+    levels this bot enforces itself."""
+    try:
+        account = api.get_account()
+        positions = api.list_positions()
+    except Exception:
+        return
+    unrealized = sum(float(p.unrealized_pl) for p in positions)
+    dashboard.update(
+        account={"balance": float(account.equity) - unrealized, "equity": float(account.equity), "unrealizedPl": unrealized},
+        positions=[{
+            "symbol": p.symbol,
+            "direction": "long",
+            "size": float(p.qty),
+            "entryPrice": float(p.avg_entry_price),
+            "currentPrice": float(p.current_price),
+            "pnl": float(p.unrealized_pl),
+            "stopLoss": round(float(p.avg_entry_price) * (1 - STOP_LOSS_PCT), 4),
+            "takeProfit": round(float(p.avg_entry_price) * (1 + TAKE_PROFIT_PCT), 4),
+        } for p in positions if p.symbol in symbols],
+    )
+
+
+def report_closed_trade(order, position, reason: str) -> None:
+    """The trade this close ends, priced as Alpaca valued the position just
+    before the sell - the fill can differ by a cent or two."""
+    if position is None:
+        return
+    dashboard.trade({
+        "ref": str(order.id),
+        "symbol": position.symbol,
+        "direction": "long",
+        "size": float(position.qty),
+        "entryPrice": float(position.avg_entry_price),
+        "exitPrice": float(position.current_price),
+        "closedAt": datetime.now(timezone.utc).isoformat(),
+        "pnl": float(position.unrealized_pl),
+        "closeReason": reason.split(",")[0],
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +360,7 @@ def check_risk_management(api: tradeapi.REST, symbol: str, position) -> bool:
             f"STOP-LOSS triggered on {symbol}: unrealized P/L "
             f"{unrealized_plpc:+.2%} <= -{STOP_LOSS_PCT:.0%}"
         )
-        close_open_position(api, symbol, "stop-loss")
+        close_open_position(api, symbol, "stop-loss", position)
         return True
 
     if unrealized_plpc >= TAKE_PROFIT_PCT:
@@ -313,7 +368,7 @@ def check_risk_management(api: tradeapi.REST, symbol: str, position) -> bool:
             f"TAKE-PROFIT triggered on {symbol}: unrealized P/L "
             f"{unrealized_plpc:+.2%} >= {TAKE_PROFIT_PCT:.0%}"
         )
-        close_open_position(api, symbol, "take-profit")
+        close_open_position(api, symbol, "take-profit", position)
         return True
 
     return False
@@ -362,7 +417,7 @@ def trading_cycle(api: tradeapi.REST, symbol: str) -> None:
             log.info(f"{symbol}: bullish crossover detected but already holding a position; skipping buy.")
     elif signal == "bearish":
         if position is not None:
-            close_open_position(api, symbol, "EMA bearish crossover")
+            close_open_position(api, symbol, "EMA bearish crossover", position)
         else:
             log.info(f"{symbol}: bearish crossover detected but no open position; nothing to sell.")
 
@@ -413,9 +468,18 @@ def run_bot() -> None:
     except APIError as e:
         log.error(f"Alpaca API error fetching account info at startup: {e}")
 
+    dashboard.describe(currency="USD", config={
+        "watchlist": WATCHLIST, "tradeUsd": TRADE_NOTIONAL_USD,
+        "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}",
+        "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
+    })
+
     consecutive_errors = 0
 
     while True:
+        if dashboard.due():
+            report_to_dashboard(api, WATCHLIST)
+
         market_open = True
         if HAS_EQUITY_SYMBOLS:
             try:

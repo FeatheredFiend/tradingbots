@@ -77,6 +77,9 @@ import time
 
 import requests
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
+from dashboard_reporter import DashboardReporter  # noqa: E402 - needs the path above
+
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
@@ -130,6 +133,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("oanda_momentum_bot")
+
+# Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
+dashboard = DashboardReporter("oanda-momentum-scanner", "OANDA momentum scanner", broker="OANDA", strategy="Momentum streak")
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +366,67 @@ def close_position(account_id: str, symbol: str, position: dict, reason: str) ->
         return False
     filled, outcome = fill_outcome(body, f"{side}Order")
     log.info(f"CLOSE submitted ({reason}) -> {symbol} {side} {position['units']:g} units result={outcome}")
+    for closed in (body.get(f"{side}OrderFillTransaction") or {}).get("tradesClosed", []):
+        CLOSE_REASONS[closed["tradeID"]] = reason
     return filled
+
+
+# ---------------------------------------------------------------------------
+# DASHBOARD
+# ---------------------------------------------------------------------------
+CLOSE_REASONS = {}  # trade ID -> why this bot closed it; stop-loss/take-profit come from OANDA
+
+
+def dashboard_trade(trade: dict) -> dict:
+    """An OANDA trade (open or closed) in the dashboard's shape."""
+    units = float(trade.get("initialUnits") or trade.get("currentUnits") or 0)
+    row = {
+        "ref": trade["id"],
+        "symbol": trade["instrument"],
+        "direction": "long" if units > 0 else "short",
+        "size": abs(units),
+        "entryPrice": float(trade["price"]),
+        "openedAt": trade.get("openTime"),
+    }
+    if trade.get("state") == "CLOSED":
+        if (trade.get("stopLossOrder") or {}).get("state") == "FILLED":
+            reason = "stop-loss"
+        elif (trade.get("takeProfitOrder") or {}).get("state") == "FILLED":
+            reason = "take-profit"
+        else:
+            reason = CLOSE_REASONS.get(trade["id"], "closed by the bot or by hand")
+        row.update(
+            exitPrice=float(trade["averageClosePrice"]) if trade.get("averageClosePrice") else None,
+            closedAt=trade.get("closeTime"),
+            pnl=float(trade.get("realizedPL") or 0) + float(trade.get("financing") or 0),
+            closeReason=reason,
+        )
+    else:
+        row.update(
+            size=abs(float(trade.get("currentUnits") or units)),
+            pnl=float(trade.get("unrealizedPL") or 0),
+            stopLoss=float(trade["stopLossOrder"]["price"]) if trade.get("stopLossOrder") else None,
+            takeProfit=float(trade["takeProfitOrder"]["price"]) if trade.get("takeProfitOrder") else None,
+        )
+    return row
+
+
+def report_to_dashboard(account_id: str, markets) -> None:
+    """Account, open trades and the last 50 closed trades in this bot's
+    markets. Three requests, about once a minute; a failure just skips it."""
+    try:
+        summary = oanda("GET", f"/v3/accounts/{account_id}/summary")["account"]
+        open_trades = oanda("GET", f"/v3/accounts/{account_id}/openTrades").get("trades", [])
+        closed_trades = oanda("GET", f"/v3/accounts/{account_id}/trades",
+                              params={"state": "CLOSED", "count": 50}).get("trades", [])
+    except (OandaError, requests.RequestException):
+        return
+    dashboard.update(
+        account={"balance": float(summary["balance"]), "equity": float(summary["NAV"]),
+                 "unrealizedPl": float(summary["unrealizedPL"])},
+        positions=[dashboard_trade(t) for t in open_trades if t["instrument"] in markets],
+        trades=[dashboard_trade(t) for t in closed_trades if t["instrument"] in markets],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -441,12 +507,20 @@ def run_bot() -> None:
         f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe=15Min"
     )
     log.info("=" * 78)
+    dashboard.describe(account=account_id, currency=currency, config={
+        "markets": list(pool), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
+        "streakLength": STREAK_LENGTH, "stopLossPercent": STOP_LOSS_PCT * 100,
+        "takeProfitPercent": TAKE_PROFIT_PCT * 100,
+    })
 
     seen_bar = None  # symbol -> start time of the latest closed bar already dealt with
     consecutive_errors = 0
 
     while True:
         try:
+            if dashboard.due():
+                report_to_dashboard(account_id, pool)
+
             latest = {}
             for symbol in pool:
                 bars = fetch_closes(symbol, STREAK_LENGTH + 1)
