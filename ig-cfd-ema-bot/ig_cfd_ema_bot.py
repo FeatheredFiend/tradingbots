@@ -87,9 +87,6 @@ WATCHLIST_SEARCH_TERMS = [
     if s.strip()
 ]
 
-TARGET_NOTIONAL = 2.00        # Best-effort target exposure; clamped up to
-                               # each market's minimum deal size (CFD minimums
-                               # are usually well above this on small markets).
 EMA_SHORT_PERIOD = 9
 EMA_LONG_PERIOD = 21
 BAR_RESOLUTION = "15Min"      # trading_ig's conv_resol() maps this to MINUTE_15.
@@ -106,8 +103,6 @@ REQUESTS_PER_MINUTE = int(os.environ.get("IG_REQUESTS_PER_MINUTE", "28"))
 # Retry waits for a name that fails to resolve at startup — nearly always a
 # rate-limit 403, which clears within a minute, not a missing market.
 RESOLVE_RETRY_WAITS = (20, 40, 60)
-
-assert TARGET_NOTIONAL > 0, "TARGET_NOTIONAL must be positive"
 
 # ---------------------------------------------------------------------------
 # LOGGING
@@ -392,18 +387,24 @@ def find_position(positions: Optional[pd.DataFrame], epic: str) -> Optional[dict
 # ---------------------------------------------------------------------------
 # ORDER EXECUTION
 # ---------------------------------------------------------------------------
-def compute_deal_size(target_notional: float, price: float, min_deal_size: float) -> float:
-    raw_size = max(target_notional / price, min_deal_size)
-    return round(raw_size, 2)
-
-
 def compute_point_distance(price: float, pct: float, scaling_factor: float) -> float:
     """Convert a percentage-of-price move into IG's points-distance unit."""
     return round((price * pct) * scaling_factor, 1)
 
 
+def deal_outcome(result) -> str:
+    """'ACCEPTED', or e.g. 'REJECTED (INSUFFICIENT_FUNDS)' — IG's deal
+    confirmation says why a deal failed, and the status alone doesn't."""
+    if not isinstance(result, dict):
+        return str(result)
+    status, reason = result.get("dealStatus", "?"), result.get("reason")
+    return status if status == "ACCEPTED" or not reason else f"{status} ({reason})"
+
+
 def submit_buy(ig_service: IGService, epic: str, name: str, details: dict, price: float) -> None:
-    size = compute_deal_size(TARGET_NOTIONAL, price, details["min_deal_size"])
+    # Always the market's minimum deal size — the smallest trade IG allows,
+    # and still thousands of pounds of exposure (README: "IG position sizing").
+    size = details["min_deal_size"]
     stop_distance = compute_point_distance(price, STOP_LOSS_PCT, details["scaling_factor"])
     limit_distance = compute_point_distance(price, TAKE_PROFIT_PCT, details["scaling_factor"])
 
@@ -428,7 +429,7 @@ def submit_buy(ig_service: IGService, epic: str, name: str, details: dict, price
         )
         log.info(
             f"BUY submitted -> {name} ({epic}) size={size} stop_dist={stop_distance} "
-            f"limit_dist={limit_distance} result={result.get('dealStatus', result)}"
+            f"limit_dist={limit_distance} result={deal_outcome(result)}"
         )
     except IGException as e:
         log.error(f"IG API error submitting BUY for {name} ({epic}): {e}")
@@ -439,17 +440,19 @@ def submit_buy(ig_service: IGService, epic: str, name: str, details: dict, price
 def close_open_position_ig(ig_service: IGService, epic: str, name: str, position: dict, details: dict, reason: str) -> None:
     close_direction = "SELL" if position["direction"] == "BUY" else "BUY"
     try:
+        # Close by deal ID alone: IG rejects a close that also names the epic
+        # and expiry ("validation.mutual-exclusive-value.request").
         result = ig_service.close_open_position(
             deal_id=position["deal_id"],
             direction=close_direction,
-            epic=epic,
-            expiry=details["expiry"],
+            epic=None,
+            expiry=None,
             level=None,
             order_type="MARKET",
             quote_id=None,
             size=position["size"],
         )
-        log.info(f"CLOSE submitted ({reason}) -> {name} ({epic}) result={result.get('dealStatus', result)}")
+        log.info(f"CLOSE submitted ({reason}) -> {name} ({epic}) result={deal_outcome(result)}")
     except IGException as e:
         log.error(f"IG API error closing position for {name} ({epic}) ({reason}): {e}")
     except Exception as e:
@@ -531,7 +534,7 @@ def run_bot() -> None:
     watchlist_desc = ", ".join(f"{w['name']} ({w['epic']})" for w in watchlist)
     log.info(f"Watchlist: {watchlist_desc}")
     log.info(
-        f"Target notional=${TARGET_NOTIONAL:.2f}/symbol (clamped to each market's minimum) | "
+        f"Size=each market's IG minimum | "
         f"Stop-loss={STOP_LOSS_PCT:.0%} | Take-profit={TAKE_PROFIT_PCT:.0%} | "
         f"Timeframe=15Min | EMA periods={EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}"
     )

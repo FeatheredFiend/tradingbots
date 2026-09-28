@@ -2,8 +2,8 @@
 
 Small, paper/demo-only trading bots against different brokers' APIs.
 **Nothing in this repo trades real money.** Only the Alpaca bots' trades are
-genuinely small ($2 and $20 each); the IG bots' trades are far bigger than
-their $2 setting suggests — see [IG position sizing](#ig-position-sizing-both-ig-bots).
+genuinely small ($2 and $20 each); the IG bots trade IG's minimum size,
+which is still big — see [IG position sizing](#ig-position-sizing-both-ig-bots).
 
 ## EMA crossover strategy (`alpaca-ema-bot/`, `ig-cfd-ema-bot/`)
 
@@ -65,9 +65,9 @@ python ig-cfd-ema-bot/ig_cfd_ema_bot.py
 API keys) — this is an IG platform requirement, not a choice made here. The
 bot itself is hardcoded to `ACCOUNT_TYPE = "DEMO"` and never trades live.
 
-**Trades are nowhere near $2.** The bot targets $2, but every IG market's
-minimum trade is far bigger, so every trade is IG's minimum — thousands of
-pounds of exposure. See [IG position sizing](#ig-position-sizing-both-ig-bots).
+**Every trade is IG's minimum size** for its market — the smallest trade IG
+allows, but still thousands of pounds of exposure. See
+[IG position sizing](#ig-position-sizing-both-ig-bots).
 
 **It can't trade its default watchlist.** IG's API gives no prices for
 shares at all — neither price history nor live prices (see the momentum
@@ -193,11 +193,12 @@ trade AAPL, MSFT and friends, and each would close the other's positions.
 
 ## IG position sizing (both IG bots)
 
-Both IG bots have a `TARGET_NOTIONAL` of $2, but **no IG trade is ever that
-small**. An IG CFD trade is a number of contracts, each gaining or losing a
-fixed amount per point the price moves, and every market has a minimum
-number of contracts. $2 of exposure is far below that minimum, so the bots
-always round up to it: every trade is the smallest one IG allows.
+Both IG bots trade **each market's minimum deal size** — the smallest trade
+IG allows. An IG CFD trade is a number of contracts, each gaining or losing
+a fixed amount per point the price moves, and every market has a minimum
+number of contracts. (They used to aim for $2 of exposure, but that's far
+below every minimum, and for currency pairs priced near 1 the formula
+actually came out *above* the minimum — so they now just use it.)
 
 That smallest trade is still big. For example, one £1-a-point FTSE 100
 contract, with the index around 10,700, is roughly:

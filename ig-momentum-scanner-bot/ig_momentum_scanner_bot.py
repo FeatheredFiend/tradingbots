@@ -120,7 +120,6 @@ POOL_ENTRIES = [
 
 STREAK_LENGTH = int(os.environ.get("STREAK_LENGTH", "3"))  # consecutive up/down bars to trigger
 
-TARGET_NOTIONAL = 2.00
 BAR_SECONDS = 15 * 60         # locally built bars — see "Bars are built locally" above
 BARS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "momentum_bars.json")
 # Saved bars older than this are dropped at startup and that market warms up
@@ -478,16 +477,23 @@ def find_position(positions: Optional[pd.DataFrame], epic: str) -> Optional[dict
     }
 
 
-def compute_deal_size(target_notional: float, price: float, min_deal_size: float) -> float:
-    return round(max(target_notional / price, min_deal_size), 2)
-
-
 def compute_point_distance(price: float, pct: float, scaling_factor: float) -> float:
     return round((price * pct) * scaling_factor, 1)
 
 
+def deal_outcome(result) -> str:
+    """'ACCEPTED', or e.g. 'REJECTED (INSUFFICIENT_FUNDS)' — IG's deal
+    confirmation says why a deal failed, and the status alone doesn't."""
+    if not isinstance(result, dict):
+        return str(result)
+    status, reason = result.get("dealStatus", "?"), result.get("reason")
+    return status if status == "ACCEPTED" or not reason else f"{status} ({reason})"
+
+
 def open_position(ig_service: IGService, epic: str, name: str, details: dict, price: float, direction: str) -> None:
-    size = compute_deal_size(TARGET_NOTIONAL, price, details["min_deal_size"])
+    # Always the market's minimum deal size — the smallest trade IG allows,
+    # and still thousands of pounds of exposure (README: "IG position sizing").
+    size = details["min_deal_size"]
     stop_distance = compute_point_distance(price, STOP_LOSS_PCT, details["scaling_factor"])
     limit_distance = compute_point_distance(price, TAKE_PROFIT_PCT, details["scaling_factor"])
     try:
@@ -498,7 +504,7 @@ def open_position(ig_service: IGService, epic: str, name: str, details: dict, pr
             stop_distance=stop_distance, stop_level=None, trailing_stop=False, trailing_stop_increment=None,
         )
         log.info(f"{direction} submitted -> {name} ({epic}) size={size} stop_dist={stop_distance} "
-                 f"limit_dist={limit_distance} result={result.get('dealStatus', result)}")
+                 f"limit_dist={limit_distance} result={deal_outcome(result)}")
     except Exception as e:
         log.error(f"Error submitting {direction} for {name} ({epic}): {e}")
 
@@ -506,11 +512,13 @@ def open_position(ig_service: IGService, epic: str, name: str, details: dict, pr
 def close_position(ig_service: IGService, epic: str, name: str, position: dict, details: dict, reason: str) -> None:
     close_direction = "SELL" if position["direction"] == "BUY" else "BUY"
     try:
+        # Close by deal ID alone: IG rejects a close that also names the epic
+        # and expiry ("validation.mutual-exclusive-value.request").
         result = ig_service.close_open_position(
-            deal_id=position["deal_id"], direction=close_direction, epic=epic, expiry=details["expiry"],
+            deal_id=position["deal_id"], direction=close_direction, epic=None, expiry=None,
             level=None, order_type="MARKET", quote_id=None, size=position["size"],
         )
-        log.info(f"CLOSE submitted ({reason}) -> {name} ({epic}) result={result.get('dealStatus', result)}")
+        log.info(f"CLOSE submitted ({reason}) -> {name} ({epic}) result={deal_outcome(result)}")
     except Exception as e:
         log.error(f"Error closing position for {name} ({epic}) ({reason}): {e}")
 
@@ -579,7 +587,7 @@ def run_bot() -> None:
     log.info("IG Momentum Streak Scanner starting — DEMO ACCOUNT ONLY — HIGH RISK / EXPERIMENTAL")
     log.info(f"Resolved {len(pool)}/{len(POOL_ENTRIES or DEFAULT_POOL)} pool entries")
     log.info(
-        f"Streak length={STREAK_LENGTH} bars | Target notional=${TARGET_NOTIONAL:.2f}/symbol | "
+        f"Streak length={STREAK_LENGTH} bars | Size=each market's IG minimum | "
         f"Stop-loss={STOP_LOSS_PCT:.0%} | Take-profit={TAKE_PROFIT_PCT:.0%} | Timeframe=15Min"
     )
     log.info("=" * 78)
