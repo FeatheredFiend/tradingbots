@@ -1,8 +1,11 @@
 # tradingbots
 
 Small, paper/demo-only trading bots against different brokers' APIs.
-**Nothing in this repo trades real money.** The same two strategies run on
-each broker; what differs is how small a trade can be:
+**Nothing in this repo trades real money.** The same strategies run on
+each broker - a momentum scanner and an EMA crossover bot, plus three CFD
+[strategy bots](#strategy-bots-strategy-bots) (forex session breakout,
+index mean reversion, commodity trend) - 24 bots in all. What differs
+between brokers is how small a trade can be:
 
 | Broker | API access | Smallest trade | Runs on |
 |---|---|---|---|
@@ -362,6 +365,236 @@ has no list of closed trades, so for the dashboard they're pieced together
 from the activity history (entry, exit, and whether a stop-loss or
 take-profit closed it) and the transaction history (the realised profit).
 
+## Strategy bots (`strategy-bots/`)
+
+Three CFD strategies, each on every broker - 14 bots, since Alpaca has no
+forex. Unlike the bots above, the strategies are written once
+(`strategy-bots/engine/strategies.py`), run by one loop
+(`engine/runner.py`) and reach each broker through a small adapter
+(`engine/brokers/`) built from that broker's existing bot. Each bot is a
+two-line script naming its broker and strategy:
+
+| | OANDA | Pepperstone | Capital.com | IG | Alpaca |
+|---|---|---|---|---|---|
+| Forex session breakout | `oanda_session_breakout_bot.py` | `pepperstone_…` | `capital_…` | `ig_…` | - (no forex) |
+| Index mean reversion | `oanda_index_reversion_bot.py` | `pepperstone_…` | `capital_…` | `ig_…` | SPY, QQQ, DIA, IWM |
+| Commodity trend (4H/15M) | `oanda_commodity_trend_bot.py` | `pepperstone_…` | `capital_…` | `ig_…` | GLD, SLV, USO |
+
+Run them from the launcher, or in the broker's Python environment (the same
+ones as the other bots - nothing new to install):
+
+```powershell
+python strategy-bots\oanda_session_breakout_bot.py        # ig-bot-env (OANDA, Capital.com and IG)
+python strategy-bots\pepperstone_commodity_trend_bot.py   # pepperstone-bot-env
+python strategy-bots\alpaca_index_reversion_bot.py        # alpaca-bot-env
+```
+
+They use the broker keys already set for the other bots. On the dashboard
+they appear as e.g. `oanda-session-breakout`. **Set `STRATEGY_DRY_RUN=1`**
+to have them log every trade they would make without sending it.
+
+All times below are UK (London) time unless said otherwise, with summer
+time handled; "ATR" is the 14-bar average true range, "R" the stop
+distance. Every number in brackets is a setting's default (see [Settings](#settings)).
+
+### 1. Forex session breakout (`BREAKOUT_*`)
+
+**Concept.** High-volatility currency pairs (GBP/USD, EUR/USD, GBP/JPY,
+EUR/JPY) tend to coil through the London morning and break out when New
+York arrives. The bot trades that break during the London / New York
+overlap only - never in the quiet Asian session - and is always flat
+before the daily rollover.
+
+**Indicators and setup.** 15-minute bars (`TIMEFRAME`, M15). Range = the
+highest high (RH) and lowest low (RL) of the bars from `RANGE_START` to
+`RANGE_END` (07:00-13:00); width W = RH - RL. ATR(14) on the same bars.
+Trend filter EMA(`TREND_EMA`, 50) of the closes (0 turns it off).
+
+**Entry and exit.**
+- Filter: W is `MIN_RANGE_PERCENT`-`MAX_RANGE_PERCENT` of the price
+  (0.15-1.0%); a long needs the close above the EMA, a short below it; at
+  most `MAX_TRADES_PER_DAY` (1) per pair.
+- Trigger: a bar that starts at or after 13:00 and closes by `ENTRY_END`
+  (16:00) closes above RH + `BUFFER_ATR` x ATR (0.2) -> **long**, or below
+  RL - 0.2 x ATR -> **short** - unless the close is already more than
+  `MAX_EXTENSION` x W (0.5) past the edge (no chasing).
+- Stop-loss: `STOP_RANGE_FRACTION` x W (0.5) back inside the range from
+  the broken edge - its midpoint by default.
+- Take-profit: `REWARD_RISK` (1.5) x the stop distance from the fill.
+- Time exit: everything closes at `FLAT_TIME` (20:00).
+
+**CFD risk controls.** Flat before the 17:00 New York rollover (22:00 UK,
+21:00 for the few weeks a year the UK and US clocks differ), so no swap is
+ever paid - the startup log shows each pair's rate anyway. Spread at most
+`MAX_SPREAD_PERCENT` (10%) of the stop distance. Sizing: see below.
+
+### 2. Index mean reversion (`REVERSION_*`)
+
+**Concept.** Major indices (S&P 500, FTSE 100, DAX) overshoot intraday and
+drift back to the day's volume-weighted mean. The bot fades stretched moves
+during each index's own cash session, and closes every trade the same day.
+
+**Indicators and setup.** 15-minute bars. Session VWAP from the cash open
+(New York 09:30-16:00, London 08:00-16:30, Frankfurt 09:00-17:30, Tokyo
+09:00-15:00, chosen from the market's name - or add `@us`, `@uk`, `@eu` or
+`@jp` to it in the market list): VWAP = sum(typical price x volume) /
+sum(volume), typical = (H + L + C) / 3, volume = the broker's tick count.
+Sigma = the volume-weighted standard deviation of typical price around it.
+Bands VWAP +/- `BAND_STDEV` (2) x sigma. RSI(`RSI_PERIOD`, 14), ADX(14),
+ATR(14).
+
+**Entry and exit.**
+- Filter: no entries in the first `SKIP_OPEN_MINUTES` (60) or the last
+  `LAST_ENTRY_MINUTES` (60) of the session; ADX at most `MAX_ADX` (25) -
+  a ranging day, not a trending one (0 = off); at most
+  `MAX_TRADES_PER_DAY` (2) per index.
+- Trigger: a bar closes at or below the lower band with RSI at or below
+  `RSI_OVERSOLD` (30) -> **long**; at or above the upper band with RSI at or
+  above `RSI_OVERBOUGHT` (70) -> **short**.
+- Stop-loss: `STOP_ATR` (1.5) x ATR from the close.
+- Take-profit: the VWAP at entry; skipped unless that's at least
+  `MIN_REWARD_RISK` (1) x the stop distance away.
+- Exits: a bar closing back through the (moving) VWAP; `MAX_HOLD_BARS` (8)
+  bars without reverting; and `FLAT_MINUTES` (15) before the cash close,
+  whatever happens.
+
+**CFD risk controls.** Never held overnight, so no swap. Spread at most 10%
+of the stop distance. Risk 0.5% of the budget per trade (`RISK_PERCENT`).
+
+### 3. Commodity multi-timeframe trend (`TREND_*`)
+
+**Concept.** Gold and Brent crude trend for days. The bot confirms the
+trend on 4-hour bars and enters on a 15-minute crossover in its direction,
+then trails it - and, since it holds overnight, watches the swap.
+
+**Indicators and setup.** Trend (`HIGHER_TIMEFRAME`, H4): EMA(`HTF_FAST_EMA`,
+50), EMA(`HTF_SLOW_EMA`, 200), ADX(14). Entry (`TIMEFRAME`, M15):
+EMA(`FAST_EMA`, 9), EMA(`SLOW_EMA`, 21), ATR(14).
+
+**Entry and exit.**
+- Filter: 4-hour uptrend = close above EMA 200, EMA 50 above EMA 200 and
+  ADX at least `MIN_ADX` (20; 0 = off); a downtrend is the mirror. At most
+  `MAX_TRADES_PER_DAY` (2) per market.
+- Trigger: EMA 9 crosses above EMA 21 on the latest closed 15-minute bar
+  in an uptrend -> **long**; below, in a downtrend -> **short**.
+- Stop-loss: `STOP_ATR` (2) x the 15-minute ATR from the close.
+- Take-profit: `REWARD_RISK` (3) x the stop distance (0 = none).
+- Exits: a 15-minute close more than `TRAIL_ATR` (3) x ATR back from the
+  best price since entry (a chandelier trailing stop; 0 = off); a 4-hour
+  close back through EMA 200; `MAX_HOLD_DAYS` (10) days held.
+
+**CFD risk controls.** An entry is skipped when that direction's overnight
+financing costs more than `MAX_SWAP_PERCENT` (0.05%) of the trade's value a
+night - read from the broker (OANDA's yearly rates, Capital.com's daily
+fee, MT5's swap settings; IG's isn't available). With `WEEKEND_FLAT` on
+(1, the default) there are no entries after Friday 16:00 and everything
+closes Friday 20:00 - no weekend swap or Monday gap. Spread at most 10% of
+the stop distance.
+
+### Risk rules for all three
+
+- **Sizing.** Each bot trades a budget (`<BROKER>_<STRATEGY>_BUDGET`) as if
+  it were its whole account. A trade risks `RISK_PERCENT` of it between the
+  fill and the stop: `size = budget x RISK_PERCENT / (stop distance x value
+  of one unit per point)`, capped so it's worth no more than `budget x
+  MAX_LEVERAGE / max positions` (leverage 5), then rounded **down** to a
+  size the broker accepts. A market whose smallest trade is over that cap
+  is skipped at startup; one where it would risk too much is skipped when
+  it signals, with the sums in the log. The defaults are sized so every
+  default market fits: OANDA 100 / 1,000 / 300 (breakout / index /
+  commodity - OANDA's UK 100 minimum is ~£1,100 of exposure), Pepperstone
+  1,000 / 2,000 / 2,000 (MT5's 0.01-lot minimum), Capital.com 100 / 200 /
+  100, Alpaca $100 each (no leverage - fractional buys can't use margin).
+  **IG always trades each market's minimum size**, as its other bots do.
+- **Rollover.** No new trades from 15 minutes before to 45 minutes after
+  the 17:00 New York rollover, when spreads blow out.
+- **Slots.** At most `<BROKER>_<STRATEGY>_MAX_POSITIONS` (2) open; when
+  several markets signal on the same bar, the strongest goes first.
+- **Only its own trades.** A bot manages only the trades it opened - it
+  remembers the broker's trade/deal ids (on MT5, its magic number:
+  928003 / 928004 / 928005). Any other position in one of its markets -
+  another bot's, or yours - is left alone, and the bot doesn't trade that
+  market while it's open, because OANDA, Capital.com (unless in hedging
+  mode) and Alpaca would net the two together. To run a strategy bot
+  alongside another bot in the same markets, give it a sub-account:
+  `OANDA_<STRATEGY>_ACCOUNT_ID` / `CAPITAL_<STRATEGY>_ACCOUNT_ID`.
+- **New bars only.** Nothing is traded on a bar that closed before the bot
+  started, so after a start nothing opens until the next bar closes.
+- **Notes survive restarts.** Each bot keeps its trade ids, the entry /
+  stop / best price of its open positions and the day's trade counts in
+  `strategy-bots/state/<bot>.json` (not in git). Delete a bot's file and it
+  forgets which open trades are its own - they still have their broker
+  stop-loss and take-profit.
+
+### Settings
+
+Strategy settings are shared by that strategy on every broker - the
+names in the sections above, prefixed `BREAKOUT_`, `REVERSION_` or
+`TREND_`, plus `RISK_PERCENT`, `MAX_LEVERAGE` and `MAX_SPREAD_PERCENT` for
+each. Each bot also has its own:
+
+| Setting | Meaning |
+|---|---|
+| `<BROKER>_<STRATEGY>_MARKETS` | Comma-separated, in the broker's names - `OANDA_BREAKOUT_MARKETS=GBP_USD,EUR_USD` |
+| `<BROKER>_<STRATEGY>_BUDGET` | The bot's money, in the account's currency (not IG) |
+| `<BROKER>_<STRATEGY>_MAX_POSITIONS` | Default 2 |
+| `<BROKER>_<STRATEGY>_ACCOUNT_ID` | OANDA and Capital.com: a sub-account of its own |
+
+`<BROKER>` is `OANDA`, `PEPPERSTONE`, `CAPITAL`, `IG` or `ALPACA`;
+`<STRATEGY>` is `BREAKOUT`, `REVERSION` or `TREND`. Every one of them is
+on the launcher's Settings tab, with its default. A setting that doesn't
+make sense (a letter in a number, times out of order) stops the bot at
+startup, naming it.
+
+### Broker notes
+
+- **OANDA / Capital.com:** trade sizes small enough for the default
+  budgets; give each bot its own sub-account if it shares markets with
+  another bot.
+- **Pepperstone:** needs the MT5 terminal, like the other Pepperstone bots;
+  its bars are MT5's (bid prices, converted from the server's clock - New
+  York time + 7 hours - to UTC).
+- **IG:** minimum-size trades, and **price history is rationed to 10,000
+  data points a week** for the whole account. A strategy bot uses ~120-450
+  points to start (per market: its history once) and then ~2 per market per
+  bar - about 2,000-4,000 a week each - so run one or two at a time, not all
+  three alongside the backtest. The bot warns in its log when fewer than
+  1,500 are left. (On 29 September 2026 only ~300 were left until 5 October.)
+  Untested beyond logging in and reading markets, prices and positions.
+- **Alpaca:** US-listed funds stand in for the indices and commodities;
+  buys only (a short signal is logged and skipped); stop-loss and
+  take-profit checked by the bot every 30 seconds, only while it runs and
+  the market is open; regular hours only, with "4-hour" bars built from the
+  day's 15-minute bars from the 09:30 open (09:30-13:30 and 13:30-16:00).
+
+### What to expect
+
+A replay of OANDA's last 5,000 15-minute bars (about ten weeks to 28
+September 2026) through the three strategies with their default settings,
+bar by bar, checking only whether the stop or the target was hit first -
+no spread, and none of the trailing, VWAP or trend exits:
+
+| Strategy | Trades | Result |
+|---|---|---|
+| Breakout: GBP/USD, EUR/USD, GBP/JPY, EUR/JPY | 89 (19-27 per pair) | -6.2R in all (-4.9R to +4.0R per pair), about -0.07R a trade |
+| Index reversion: S&P 500, FTSE 100, DAX | 34 (4-18 per index) | -4.0R in all (-5.3R to +2.3R per index) |
+| Commodity trend: gold, Brent | 101 (40 and 61) | -5.0R in all (0R and -5.0R) |
+
+In other words: they trade at sensible rates and do what they say, but
+there's no evidence of an edge yet - the same finding as the momentum
+scanner's backtest. Treat the demo accounts as the experiment.
+
+### Tests
+
+```powershell
+python -m unittest discover -s strategy-bots\tests
+```
+
+Clock and DST rules, indicators, each strategy's signals on made-up bars,
+and the runner's sizing, spread, rollover, slots, dry run and
+other-people's-positions rules against a fake broker. No broker is
+contacted.
+
 ## IG position sizing (both IG bots)
 
 Both IG bots trade **each market's minimum deal size** — the smallest trade
@@ -458,14 +691,16 @@ to 2,000 log lines to send later. What each broker can report:
 | Alpaca | yes - trades as the bot closes them, priced at Alpaca's value just before the sell | 2 a minute |
 | IG scanner | yes - but no profit per open position (IG's REST API doesn't give one; the account's unrealised total is exact); trades from the transaction history every 5 minutes | about 1.2 a minute, inside its pacing |
 | IG EMA bot | log and running status only | none |
+| Strategy bots | as their broker's bots above, but only the bot's own positions and trades; its Settings tab lists every setting it started with | as their broker's bots |
 
 ## Launcher (`launcher/`) - a Windows app for all of this
 
 `TradingBots.exe` starts and stops the bots and edits their settings:
 
-- **Bots:** every bot with its status - including ones started by hand -
-  and Start / Stop / Restart per bot, "Start all ticked" and "Stop all",
-  plus a link to each bot's dashboard page. Starting runs
+- **Bots:** all 24 bots with their status - including ones started by hand -
+  filtered by broker and strategy, and Start / Stop / Restart per bot,
+  "Start all ticked" and "Stop all", plus a link to each bot's dashboard
+  page. Starting runs
   `launcher/start_bot.bat`, which opens the bot as a new tab in one
   "TradingBots" Windows Terminal window (a console window of its own if
   Windows Terminal isn't installed), on the right Python environment.
@@ -478,7 +713,9 @@ to 2,000 log lines to send later. What each broker can report:
   bot and a scanner on the same OANDA or Alpaca account would close each
   other's trades. Closing the app leaves the bots running.
 - **Settings:** a form for every environment variable the bots read -
-  keys, budgets, market lists, stop-loss / take-profit, the dashboard -
+  keys, budgets, market lists, stop-loss / take-profit, each strategy's
+  parameters, the dashboard - in sections (General, the momentum scanners,
+  each strategy, then each broker with its bots' own markets and budgets),
   saved as Windows user environment variables (the same place
   `[Environment]::SetEnvironmentVariable(..., "User")` writes). Empty means
   the bot's default. It offers to restart running bots so they pick changes up.
@@ -500,7 +737,9 @@ e.g. `start_bot.bat oanda-momentum-scanner`.
 
 ## Repo layout
 
-Each bot lives in its own folder with its own `requirements.txt`; the one
-shared piece is `shared/dashboard_reporter.py` (standard library only).
+Each momentum scanner and EMA bot lives in its own folder with its own
+`requirements.txt`; the one shared piece is `shared/dashboard_reporter.py`
+(standard library only). The strategy bots share `strategy-bots/engine/`
+and need nothing beyond their broker's existing requirements.
 Virtual environments (`*-bot-env/`) are gitignored — create your own per
-broker (both bots of a broker share the same requirements).
+broker (all of a broker's bots share the same requirements).

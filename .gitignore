@@ -6,3 +6,4 @@ __pycache__/
 .env
 momentum_bars.json*
 backtest/data/
+strategy-bots/state/

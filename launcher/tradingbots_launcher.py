@@ -51,32 +51,75 @@ class Bot:
     broker: str       # alpaca / oanda / pepperstone / capital / ig - picks the Python environment
     strategy: str
     script: str       # relative to the repo
+    family: str       # which kind of bot, for the Bots tab's filter - a FAMILIES key
 
     @property
     def script_name(self) -> str:
         return self.script.rsplit("\\", 1)[-1]
 
 
-BOTS = [
-    Bot("oanda-momentum-scanner", "OANDA momentum scanner", "oanda", "Momentum streak",
-        r"oanda-momentum-scanner-bot\oanda_momentum_scanner_bot.py"),
-    Bot("oanda-ema-bot", "OANDA EMA crossover", "oanda", "EMA 9/21 crossover", r"oanda-ema-bot\oanda_ema_bot.py"),
-    Bot("pepperstone-momentum-scanner", "Pepperstone momentum scanner", "pepperstone", "Momentum streak",
-        r"pepperstone-momentum-scanner-bot\pepperstone_momentum_scanner_bot.py"),
-    Bot("pepperstone-ema-bot", "Pepperstone EMA crossover", "pepperstone", "EMA 9/21 crossover",
-        r"pepperstone-ema-bot\pepperstone_ema_bot.py"),
-    Bot("capital-momentum-scanner", "Capital.com momentum scanner", "capital", "Momentum streak",
-        r"capital-momentum-scanner-bot\capital_momentum_scanner_bot.py"),
-    Bot("capital-ema-bot", "Capital.com EMA crossover", "capital", "EMA 9/21 crossover",
-        r"capital-ema-bot\capital_ema_bot.py"),
-    Bot("alpaca-momentum-scanner", "Alpaca momentum scanner", "alpaca", "Momentum streak (buys only)",
-        r"alpaca-momentum-scanner-bot\alpaca_momentum_scanner_bot.py"),
-    Bot("alpaca-ema-bot", "Alpaca EMA crossover", "alpaca", "EMA 9/21 crossover", r"alpaca-ema-bot\alpaca_ema_bot.py"),
-    Bot("ig-momentum-scanner", "IG momentum scanner", "ig", "Momentum streak",
-        r"ig-momentum-scanner-bot\ig_momentum_scanner_bot.py"),
-    Bot("ig-ema-bot", "IG EMA crossover", "ig", "EMA 9/21 crossover", r"ig-cfd-ema-bot\ig_cfd_ema_bot.py"),
-]
 BROKERS = {"oanda": "OANDA", "pepperstone": "Pepperstone", "capital": "Capital.com", "alpaca": "Alpaca", "ig": "IG"}
+FAMILIES = {
+    "momentum": "Momentum scanner",
+    "ema": "EMA crossover",
+    "session-breakout": "Forex session breakout",
+    "index-reversion": "Index mean reversion",
+    "commodity-trend": "Commodity trend (4H/15M)",
+}
+# The strategy bots in strategy-bots/: each of these on every broker, except
+# forex on Alpaca, which has none. (key, env prefix, default markets per broker).
+STRATEGY_BOTS = {
+    "session-breakout": ("BREAKOUT", {
+        "oanda": "GBP_USD, EUR_USD, GBP_JPY, EUR_JPY", "pepperstone": "GBPUSD, EURUSD, GBPJPY, EURJPY",
+        "capital": "GBPUSD, EURUSD, GBPJPY, EURJPY", "ig": "GBP/USD, EUR/USD, GBP/JPY, EUR/JPY"}),
+    "index-reversion": ("REVERSION", {
+        "oanda": "SPX500_USD, UK100_GBP, DE30_EUR", "pepperstone": "US500, UK100, GER40",
+        "capital": "US500, UK100, DE40", "ig": "US 500, FTSE 100, Germany 40", "alpaca": "SPY, QQQ, DIA, IWM"}),
+    "commodity-trend": ("TREND", {
+        "oanda": "XAU_USD, BCO_USD", "pepperstone": "XAUUSD, SpotBrent", "capital": "GOLD, OIL_BRENT",
+        "ig": "Spot Gold, Oil - Brent Crude", "alpaca": "GLD, SLV, USO"}),
+}
+# Each strategy bot's own budget, when <BROKER>_<PREFIX>_BUDGET is empty (IG bots have none).
+STRATEGY_BOT_BUDGETS = {
+    ("oanda", "session-breakout"): 100, ("oanda", "index-reversion"): 1000, ("oanda", "commodity-trend"): 300,
+    ("pepperstone", "session-breakout"): 1000, ("pepperstone", "index-reversion"): 2000,
+    ("pepperstone", "commodity-trend"): 2000, ("capital", "session-breakout"): 100,
+    ("capital", "index-reversion"): 200, ("capital", "commodity-trend"): 100,
+    ("alpaca", "index-reversion"): 100, ("alpaca", "commodity-trend"): 100,
+}
+
+CLASSIC_BOTS = [
+    Bot("oanda-momentum-scanner", "OANDA momentum scanner", "oanda", "Momentum streak",
+        r"oanda-momentum-scanner-bot\oanda_momentum_scanner_bot.py", "momentum"),
+    Bot("oanda-ema-bot", "OANDA EMA crossover", "oanda", "EMA 9/21 crossover", r"oanda-ema-bot\oanda_ema_bot.py", "ema"),
+    Bot("pepperstone-momentum-scanner", "Pepperstone momentum scanner", "pepperstone", "Momentum streak",
+        r"pepperstone-momentum-scanner-bot\pepperstone_momentum_scanner_bot.py", "momentum"),
+    Bot("pepperstone-ema-bot", "Pepperstone EMA crossover", "pepperstone", "EMA 9/21 crossover",
+        r"pepperstone-ema-bot\pepperstone_ema_bot.py", "ema"),
+    Bot("capital-momentum-scanner", "Capital.com momentum scanner", "capital", "Momentum streak",
+        r"capital-momentum-scanner-bot\capital_momentum_scanner_bot.py", "momentum"),
+    Bot("capital-ema-bot", "Capital.com EMA crossover", "capital", "EMA 9/21 crossover",
+        r"capital-ema-bot\capital_ema_bot.py", "ema"),
+    Bot("alpaca-momentum-scanner", "Alpaca momentum scanner", "alpaca", "Momentum streak (buys only)",
+        r"alpaca-momentum-scanner-bot\alpaca_momentum_scanner_bot.py", "momentum"),
+    Bot("alpaca-ema-bot", "Alpaca EMA crossover", "alpaca", "EMA 9/21 crossover", r"alpaca-ema-bot\alpaca_ema_bot.py",
+        "ema"),
+    Bot("ig-momentum-scanner", "IG momentum scanner", "ig", "Momentum streak",
+        r"ig-momentum-scanner-bot\ig_momentum_scanner_bot.py", "momentum"),
+    Bot("ig-ema-bot", "IG EMA crossover", "ig", "EMA 9/21 crossover", r"ig-cfd-ema-bot\ig_cfd_ema_bot.py", "ema"),
+]
+
+
+def _strategy_bot(broker: str, family: str) -> Bot:
+    label = FAMILIES[family]
+    return Bot(f"{broker}-{family}", f"{BROKERS[broker]} {label.split(' (')[0].lower()}", broker, label,
+               rf"strategy-bots\{broker}_{family.replace('-', '_')}_bot.py", family)
+
+
+BOTS = [bot for broker in BROKERS for bot in (
+    [b for b in CLASSIC_BOTS if b.broker == broker]
+    + [_strategy_bot(broker, family) for family, (_, markets) in STRATEGY_BOTS.items() if broker in markets]
+)]
 
 
 def default_config() -> dict:
@@ -93,6 +136,7 @@ def default_config() -> dict:
         # What "Start all" starts. Not every bot at once: an EMA bot and a scanner on
         # the same OANDA or Alpaca account would close each other's trades.
         "start_all": [b.key for b in BOTS if "momentum" in b.key],
+        "filter": {"broker": "", "family": ""},  # the Bots tab's filter ("" = all)
     }
 
 
@@ -104,6 +148,8 @@ def load_config() -> dict:
         config["venvs"].update({k: v for k, v in (saved.get("venvs") or {}).items() if v})
         if isinstance(saved.get("start_all"), list):
             config["start_all"] = saved["start_all"]
+        if isinstance(saved.get("filter"), dict):
+            config["filter"].update({k: v for k, v in saved["filter"].items() if k in config["filter"]})
     except (OSError, ValueError):
         pass
     return config
@@ -247,63 +293,174 @@ class Setting:
     number: bool = False
 
 
+@dataclass(frozen=True)
+class Sub:
+    """A sub-heading inside a settings section."""
+    title: str
+
+
+def _strategy_bot_settings(broker: str) -> list:
+    """Each strategy bot's own settings, for its broker's section."""
+    rows = []
+    for family, (prefix, markets) in STRATEGY_BOTS.items():
+        if broker not in markets:
+            continue
+        p = f"{broker.upper()}_{prefix}_"
+        rows.append(Sub(f"{FAMILIES[family]} bot"))
+        rows.append(Setting(p + "MARKETS", "Markets", f"Comma-separated - empty for {markets[broker]}"))
+        if broker != "ig":  # IG's always trade the minimum size
+            rows.append(Setting(p + "BUDGET", "Budget", "Its own money, in the account's currency - default "
+                                f"{STRATEGY_BOT_BUDGETS[(broker, family)]:,}", number=True))
+        rows.append(Setting(p + "MAX_POSITIONS", "Max positions", "Open at once - default 2", number=True))
+        if broker in ("oanda", "capital"):
+            rows.append(Setting(p + "ACCOUNT_ID", "Account ID", f"Its own sub-account - empty for the "
+                                                                f"{broker.upper()}_ACCOUNT_ID one"))
+    return rows
+
+
+def _risk_settings(prefix: str, risk: str) -> list:
+    return [
+        Sub("Risk"),
+        Setting(prefix + "RISK_PERCENT", "Risk per trade %", f"Of the bot's budget, lost if the stop-loss is hit - default {risk}",
+                number=True),
+        Setting(prefix + "MAX_LEVERAGE", "Max leverage", "Open trades worth at most budget x this - default 5", number=True),
+        Setting(prefix + "MAX_SPREAD_PERCENT", "Max spread", "As a % of the stop distance - default 10", number=True),
+    ]
+
+
+TIMEFRAME_HINT = "M5, M15, M30, H1 or H4"
 SETTING_GROUPS = [
-    ("Dashboard", "Where every bot reports to. Leave empty to switch reporting off.", [
+    ("General", "Where every bot reports to (leave empty to switch reporting off), and a dry run for the strategy bots.", [
         Setting("DASHBOARD_URL", "Dashboard address", "e.g. https://tradingdashboard.proprietary-data.com"),
         Setting("DASHBOARD_TOKEN", "Dashboard token", "The dashboard's INGEST_TOKEN", secret=True),
+        Setting("STRATEGY_DRY_RUN", "Strategy bots: dry run", "1 = log the trades they'd make without sending them"),
     ]),
-    ("All momentum scanners", "Shared by the Alpaca, OANDA, Pepperstone, Capital.com and IG scanners.", [
+    ("Momentum scanners", "Shared by the Alpaca, OANDA, Pepperstone, Capital.com and IG scanners.", [
         Setting("STREAK_LENGTH", "Streak length", "Bars in a row that trigger a trade - default 3", number=True),
         Setting("STOP_LOSS_PERCENT", "Stop-loss %", "Of the entry price - default 2", number=True),
         Setting("TAKE_PROFIT_PERCENT", "Take-profit %", "Of the entry price - default 5", number=True),
     ]),
-    ("OANDA", "Practice account: hub > Tools > API > Generate.", [
+    ("Forex session breakout", "Shared by the breakout bot on every broker. Trades the break of the London "
+                               "morning's range in the London / New York overlap; always flat before the rollover. "
+                               "Times are UK (London) time.", [
+        Setting("BREAKOUT_TIMEFRAME", "Bar length", f"{TIMEFRAME_HINT} - default M15"),
+        Setting("BREAKOUT_RANGE_START", "Range starts", "Default 07:00"),
+        Setting("BREAKOUT_RANGE_END", "Range ends, entries start", "Default 13:00 - when New York arrives"),
+        Setting("BREAKOUT_ENTRY_END", "Last entry", "Default 16:00"),
+        Setting("BREAKOUT_FLAT_TIME", "Close everything at", "Default 20:00 - before the 22:00 rollover, so no swap"),
+        Sub("Entry"),
+        Setting("BREAKOUT_MIN_RANGE_PERCENT", "Narrowest range %", "Of the price - default 0.15", number=True),
+        Setting("BREAKOUT_MAX_RANGE_PERCENT", "Widest range %", "Of the price - default 1.0", number=True),
+        Setting("BREAKOUT_BUFFER_ATR", "Breakout buffer", "A close this many ATRs past the range - default 0.2", number=True),
+        Setting("BREAKOUT_MAX_EXTENSION", "Furthest to chase", "In range widths past the edge - default 0.5", number=True),
+        Setting("BREAKOUT_TREND_EMA", "Trend filter EMA", "Bars; 0 = off - default 50", number=True),
+        Setting("BREAKOUT_MAX_TRADES_PER_DAY", "Trades per pair per day", "Default 1", number=True),
+        Sub("Exits"),
+        Setting("BREAKOUT_STOP_RANGE_FRACTION", "Stop-loss", "Range widths back from the broken edge - default 0.5 "
+                                                            "(the middle)", number=True),
+        Setting("BREAKOUT_REWARD_RISK", "Take-profit", "Times the stop distance - default 1.5", number=True),
+        *_risk_settings("BREAKOUT_", "1"),
+    ]),
+    ("Index mean reversion", "Shared by the index bot on every broker. Fades moves stretched far from the day's "
+                             "VWAP, only in each index's cash session; always closed the same day.", [
+        Setting("REVERSION_TIMEFRAME", "Bar length", f"{TIMEFRAME_HINT} - default M15"),
+        Setting("REVERSION_BAND_STDEV", "Band width", "Standard deviations from the VWAP - default 2", number=True),
+        Setting("REVERSION_RSI_PERIOD", "RSI period", "Default 14", number=True),
+        Setting("REVERSION_RSI_OVERSOLD", "RSI oversold", "Buy at or below - default 30", number=True),
+        Setting("REVERSION_RSI_OVERBOUGHT", "RSI overbought", "Sell at or above - default 70", number=True),
+        Setting("REVERSION_MAX_ADX", "Max ADX", "Skip trending days above this; 0 = off - default 25", number=True),
+        Setting("REVERSION_SKIP_OPEN_MINUTES", "Quiet after the open", "Minutes - default 60", number=True),
+        Setting("REVERSION_LAST_ENTRY_MINUTES", "Quiet before the close", "Minutes - default 60", number=True),
+        Setting("REVERSION_MAX_TRADES_PER_DAY", "Trades per index per day", "Default 2", number=True),
+        Sub("Exits"),
+        Setting("REVERSION_STOP_ATR", "Stop-loss", "ATRs from the entry - default 1.5", number=True),
+        Setting("REVERSION_MIN_REWARD_RISK", "Min reward / risk", "The VWAP must be this many stop distances away - "
+                                                                  "default 1", number=True),
+        Setting("REVERSION_MAX_HOLD_BARS", "Time stop", "Bars without reverting; 0 = off - default 8", number=True),
+        Setting("REVERSION_FLAT_MINUTES", "Close before the close", "Minutes before the cash close - default 15",
+                number=True),
+        *_risk_settings("REVERSION_", "0.5"),
+    ]),
+    ("Commodity trend", "Shared by the commodity bot on every broker. Takes the 4-hour trend's side on a "
+                        "15-minute EMA crossover; holds overnight, so it watches the swap.", [
+        Setting("TREND_TIMEFRAME", "Entry bar length", f"{TIMEFRAME_HINT} - default M15"),
+        Setting("TREND_HIGHER_TIMEFRAME", "Trend bar length", f"{TIMEFRAME_HINT} - default H4"),
+        Setting("TREND_HTF_FAST_EMA", "Trend fast EMA", "Default 50", number=True),
+        Setting("TREND_HTF_SLOW_EMA", "Trend slow EMA", "Default 200", number=True),
+        Setting("TREND_MIN_ADX", "Min trend ADX", "0 = off - default 20", number=True),
+        Setting("TREND_FAST_EMA", "Entry fast EMA", "Default 9", number=True),
+        Setting("TREND_SLOW_EMA", "Entry slow EMA", "Default 21", number=True),
+        Setting("TREND_MAX_TRADES_PER_DAY", "Trades per market per day", "Default 2", number=True),
+        Sub("Exits"),
+        Setting("TREND_STOP_ATR", "Stop-loss", "Entry-bar ATRs from the entry - default 2", number=True),
+        Setting("TREND_REWARD_RISK", "Take-profit", "Times the stop distance; 0 = none - default 3", number=True),
+        Setting("TREND_TRAIL_ATR", "Trailing stop", "ATRs back from the best price; 0 = off - default 3", number=True),
+        Setting("TREND_MAX_HOLD_DAYS", "Max days held", "0 = no limit - default 10", number=True),
+        Setting("TREND_WEEKEND_FLAT", "Flat for the weekend", "1 = close Friday 20:00 UK (default), 0 = hold"),
+        Setting("TREND_MAX_SWAP_PERCENT", "Max swap", "% of the trade's value per night - default 0.05", number=True),
+        *_risk_settings("TREND_", "1"),
+    ]),
+    ("OANDA", "Practice account: hub > Tools > API > Generate. Give bots that trade the same markets "
+              "sub-accounts of their own - OANDA nets a market's trades together.", [
         Setting("OANDA_API_TOKEN", "API token", secret=True),
         Setting("OANDA_ACCOUNT_ID", "Account ID", "Only needed if the token sees several accounts"),
+        Sub("Scanner and EMA bot"),
         Setting("OANDA_BUDGET", "Budget", "Total exposure in the account currency - default 100", number=True),
         Setting("OANDA_MAX_POSITIONS", "Max positions", "Budget slices - default 5", number=True),
         Setting("OANDA_POOL", "Scanner markets", "Comma-separated, e.g. EUR_USD,GBP_USD - empty for the default 15"),
         Setting("OANDA_WATCHLIST", "EMA bot markets", "Comma-separated - empty for the default 8 currency pairs"),
+        *_strategy_bot_settings("oanda"),
     ]),
-    ("Pepperstone (MetaTrader 5)", "Only needed if MT5 isn't left logged in to the demo account.", [
+    ("Pepperstone (MetaTrader 5)", "Login only needed if MT5 isn't left logged in to the demo account. Each bot "
+                                   "tags its trades, so they can share one hedging account.", [
         Setting("PEPPERSTONE_LOGIN", "Login", "Demo account number"),
         Setting("PEPPERSTONE_PASSWORD", "Password", secret=True),
         Setting("PEPPERSTONE_SERVER", "Server", "e.g. PepperstoneUK-Demo"),
+        Setting("MT5_TERMINAL_PATH", "MT5 terminal", "Path to terminal64.exe, if it isn't found on its own"),
+        Sub("Scanner and EMA bot"),
         Setting("PEPPERSTONE_BUDGET", "Budget", "Total exposure in the account currency - default 10000", number=True),
         Setting("PEPPERSTONE_MAX_POSITIONS", "Max positions", "Budget slices - default 5", number=True),
         Setting("PEPPERSTONE_POOL", "Scanner markets", "Comma-separated MT5 symbols - empty for the default 15"),
         Setting("PEPPERSTONE_WATCHLIST", "EMA bot markets", "Comma-separated - empty for AAPL.US, MSFT.US and co."),
-        Setting("MT5_TERMINAL_PATH", "MT5 terminal", "Path to terminal64.exe, if it isn't found on its own"),
+        *_strategy_bot_settings("pepperstone"),
     ]),
     ("Capital.com", "Demo account: Settings > API integrations (needs two-factor login turned on).", [
         Setting("CAPITAL_API_KEY", "API key", secret=True),
         Setting("CAPITAL_EMAIL", "Login email"),
         Setting("CAPITAL_EMAIL_PASSWORD", "API key password", "The password set when the key was generated", secret=True),
         Setting("CAPITAL_ACCOUNT_ID", "Account ID", "Only needed to trade other than the preferred account"),
+        Sub("Scanner and EMA bot"),
         Setting("CAPITAL_BUDGET", "Budget", "Total exposure in the account currency - default 600", number=True),
         Setting("CAPITAL_MAX_POSITIONS", "Max positions", "Budget slices - default 5", number=True),
         Setting("CAPITAL_POOL", "Scanner markets", "Comma-separated epics, e.g. US500,GOLD - empty for the default 15"),
         Setting("CAPITAL_WATCHLIST", "EMA bot markets", "Comma-separated epics - empty for AAPL, MSFT and co."),
+        *_strategy_bot_settings("capital"),
     ]),
-    ("Alpaca", "Paper account keys.", [
+    ("Alpaca", "Paper account keys. The strategy bots here trade US funds (SPY, GLD, ...), buying only.", [
         Setting("APCA_API_KEY_ID", "API key ID"),
         Setting("APCA_API_SECRET_KEY", "API secret key", secret=True),
+        Sub("Scanner and EMA bot"),
         Setting("BOT_BUDGET_USD", "Scanner budget ($)", "Default 100", number=True),
         Setting("BOT_MAX_POSITIONS", "Scanner max positions", "Default 5", number=True),
         Setting("BOT_POOL", "Scanner shares", "Comma-separated tickers - empty for the default 30"),
         Setting("BOT_SYMBOLS", "EMA bot shares", "Comma-separated - default AAPL,MSFT,AMZN,GOOGL,TSLA"),
+        *_strategy_bot_settings("alpaca"),
     ]),
-    ("IG", "Demo account login and API key.", [
+    ("IG", "Demo account login and API key. The strategy bots trade each market's minimum size and share "
+           "IG's 10,000 price-history points a week.", [
         Setting("IG_USERNAME", "Username"),
         Setting("IG_PASSWORD", "Password", secret=True),
         Setting("IG_API_KEY", "API key", secret=True),
         Setting("IG_CURRENCY_CODE", "Currency", "Default GBP"),
+        Setting("IG_REQUESTS_PER_MINUTE", "Requests per minute", "Default 28 - split it between IG bots running at once",
+                number=True),
+        Sub("Scanner and EMA bot"),
         Setting("IG_POOL", "Scanner markets", "Comma-separated - empty for the default 15"),
         Setting("IG_WATCHLIST", "EMA bot markets", "Comma-separated names, or Name:EPIC"),
-        Setting("IG_REQUESTS_PER_MINUTE", "Requests per minute", "Default 28 - split it if both IG bots run", number=True),
+        *_strategy_bot_settings("ig"),
     ]),
 ]
-SETTINGS = [s for _, _, group in SETTING_GROUPS for s in group]
+SETTINGS = [s for _, _, group in SETTING_GROUPS for s in group if isinstance(s, Setting)]
 SETTING_NAMES = {s.name for s in SETTINGS}
 
 
@@ -359,6 +516,39 @@ def resource(name: str) -> Path:
     return Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / name
 
 
+class ScrollArea:
+    """A vertically scrolling area. Put widgets in `inner`, or build other
+    frames as children of `canvas` and switch between them with show()."""
+
+    def __init__(self, parent, background: str):
+        self.canvas = tk.Canvas(parent, highlightthickness=0, bd=0, background=background)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.inner = ttk.Frame(self.canvas)
+        self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self._window, width=e.width))
+        self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._wheel))
+        self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
+        scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.watch(self.inner)
+
+    def watch(self, frame) -> None:
+        frame.bind("<Configure>", lambda e: self._fit())
+
+    def show(self, frame) -> None:
+        self.canvas.itemconfigure(self._window, window=frame)
+        self.canvas.yview_moveto(0)
+        self.canvas.after_idle(self._fit)
+
+    def _fit(self) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _wheel(self, event) -> None:
+        if self.canvas.yview() != (0.0, 1.0):  # only when there's something to scroll
+            self.canvas.yview_scroll(int(-event.delta / 120), "units")
+
+
 class LauncherApp:
     def __init__(self, root: tk.Tk):
         global _scale
@@ -369,8 +559,12 @@ class LauncherApp:
         _scale = float(root.tk.call("tk", "scaling")) / (96 / 72)
 
         root.title(APP_NAME)
-        root.geometry(f"{px(980)}x{px(700)}")
-        root.minsize(px(800), px(520))
+        # As big as it's designed for, but never taller or wider than the
+        # screen - at 300% scaling 700 points is more than a 4K screen's height.
+        width = min(px(1040), root.winfo_screenwidth() - px(40))
+        height = min(px(700), root.winfo_screenheight() - px(100))
+        root.geometry(f"{width}x{height}")
+        root.minsize(min(px(800), width), min(px(480), height))
         try:
             root.iconbitmap(default=str(resource("icon.ico")))
         except tk.TclError:
@@ -475,42 +669,79 @@ class LauncherApp:
 
 
 class BotsTab:
+    ALL = "All"
+
     def __init__(self, notebook, app: LauncherApp):
         self.app = app
         self.frame = ttk.Frame(notebook, padding=px(16))
 
         toolbar = ttk.Frame(self.frame)
-        toolbar.pack(fill="x", pady=(0, px(10)))
-        self.summary = ttk.Label(toolbar, text="", style="Muted.TLabel")
-        self.summary.pack(side="left")
+        toolbar.pack(fill="x", pady=(0, px(6)))
+        ttk.Label(toolbar, text="Broker").pack(side="left")
+        self.broker_choice = ttk.Combobox(toolbar, state="readonly", width=13, values=[self.ALL, *BROKERS.values()])
+        self.broker_choice.pack(side="left", padx=(px(6), px(16)))
+        ttk.Label(toolbar, text="Strategy").pack(side="left")
+        self.family_choice = ttk.Combobox(toolbar, state="readonly", width=26, values=[self.ALL, *FAMILIES.values()])
+        self.family_choice.pack(side="left", padx=(px(6), 0))
+        saved = app.config["filter"]
+        self.broker_choice.set(BROKERS.get(saved.get("broker"), self.ALL))
+        self.family_choice.set(FAMILIES.get(saved.get("family"), self.ALL))
+        for choice in (self.broker_choice, self.family_choice):
+            choice.bind("<<ComboboxSelected>>", lambda e: self.apply_filter(save=True))
         ttk.Button(toolbar, text="Stop all", command=lambda: app.stop(BOTS)).pack(side="right")
         ttk.Button(toolbar, text="Start all ticked", style="Primary.TButton", command=self.start_all
                    ).pack(side="right", padx=(0, px(8)))
+        self.summary = ttk.Label(self.frame, text="", style="Muted.TLabel")
+        self.summary.pack(fill="x", pady=(0, px(8)))
 
-        self.rows = {}
-        list_frame = ttk.Frame(self.frame)
-        list_frame.pack(fill="both", expand=True)
+        hint = ttk.Label(self.frame, style="Hint.TLabel", wraplength=px(900), justify="left", text=(
+            "Tick the bots that \"Start all ticked\" starts (whatever the filter shows) - not an EMA bot and a scanner "
+            "on the same OANDA or Alpaca account, they'd close each other's trades. The strategy bots only manage their "
+            "own trades and keep out of markets where another position is open. Bots started by hand show up here too. "
+            "Each bot opens as a tab in the \"TradingBots\" terminal window, and Stop presses Ctrl+C in its tab, so it "
+            "shuts down cleanly. Closing that window stops every bot; closing this app leaves them running."
+        ))
+        hint.pack(side="bottom", fill="x", pady=(px(12), 0))
+
+        area = ScrollArea(self.frame, app.background)
+        list_frame = area.inner
         list_frame.columnconfigure(2, weight=1)
         for column, heading in ((0, "Start all"), (2, "Bot"), (3, "Status")):
             ttk.Label(list_frame, text=heading, style="Hint.TLabel").grid(row=0, column=column, sticky="w", pady=(0, px(4)))
         ttk.Separator(list_frame).grid(row=1, column=0, columnspan=5, sticky="ew")
-        for i, bot in enumerate(BOTS):
-            self.rows[bot.key] = BotRow(list_frame, 2 + i * 2, bot, app)
-            ttk.Separator(list_frame).grid(row=3 + i * 2, column=0, columnspan=5, sticky="ew")
+        self.rows = {bot.key: BotRow(list_frame, 2 + i * 2, bot, app) for i, bot in enumerate(BOTS)}
+        self.apply_filter()
 
-        ttk.Label(self.frame, style="Hint.TLabel", wraplength=px(900), justify="left", text=(
-            "Tick the bots that \"Start all ticked\" starts - not an EMA bot and a scanner on the same OANDA or Alpaca "
-            "account, they'd close each other's trades. Bots started by hand show up here too. Each bot opens as a tab "
-            "in the \"TradingBots\" terminal window, and Stop presses Ctrl+C in its tab, so it shuts down cleanly. "
-            "Closing that window stops every bot; closing this app leaves them running."
-        )).pack(fill="x", pady=(px(12), 0))
+    def chosen(self) -> tuple:
+        """(broker key, family key) of the filter, "" for all."""
+        broker = next((k for k, v in BROKERS.items() if v == self.broker_choice.get()), "")
+        family = next((k for k, v in FAMILIES.items() if v == self.family_choice.get()), "")
+        return broker, family
+
+    def shown(self) -> list:
+        broker, family = self.chosen()
+        return [b for b in BOTS if (not broker or b.broker == broker) and (not family or b.family == family)]
+
+    def apply_filter(self, save: bool = False) -> None:
+        shown = {b.key for b in self.shown()}
+        for key, row in self.rows.items():
+            row.show(key in shown)
+        if save:
+            broker, family = self.chosen()
+            self.app.config["filter"] = {"broker": broker, "family": family}
+            save_config(self.app.config)
+        self.update()
 
     def start_all(self) -> None:
         self.app.start([b for b in BOTS if b.key in self.app.config["start_all"]])
 
     def update(self) -> None:
         running = sum(1 for b in BOTS if b.key in self.app.running)
-        self.summary.configure(text=f"{running} of {len(BOTS)} bots running")
+        shown = self.shown()
+        text = f"{running} of {len(BOTS)} bots running"
+        if len(shown) != len(BOTS):
+            text += f" - showing {len(shown)} ({sum(1 for b in shown if b.key in self.app.running)} running)"
+        self.summary.configure(text=text)
         for bot in BOTS:
             self.rows[bot.key].update(self.app.running.get(bot.key), self.app.busy.get(bot.key))
 
@@ -518,10 +749,10 @@ class BotsTab:
 class BotRow:
     def __init__(self, parent, row: int, bot: Bot, app: LauncherApp):
         self.bot, self.app = bot, app
-        pad = {"pady": px(4)}  # 10 bots have to fit a 4K screen at 300%
+        pad = {"pady": px(4)}  # rows have to stay compact on a 4K screen at 300%
         self.in_start_all = tk.BooleanVar(value=bot.key in app.config["start_all"])
-        ttk.Checkbutton(parent, variable=self.in_start_all, command=self.on_start_all_changed
-                        ).grid(row=row, column=0, padx=(px(14), px(20)), **pad)
+        tick = ttk.Checkbutton(parent, variable=self.in_start_all, command=self.on_start_all_changed)
+        tick.grid(row=row, column=0, padx=(px(14), px(20)), **pad)
 
         size = px(12)
         self.dot = tk.Canvas(parent, width=size, height=size, highlightthickness=0, bd=0, background=app.background)
@@ -537,12 +768,20 @@ class BotRow:
         self.status.grid(row=row, column=3, sticky="w", padx=px(12), **pad)
 
         buttons = ttk.Frame(parent)
-        buttons.grid(row=row, column=4, sticky="e", **pad)
+        buttons.grid(row=row, column=4, sticky="e", padx=(0, px(8)), **pad)
         self.toggle = ttk.Button(buttons, text="Start", width=8, command=self.on_toggle)
         self.toggle.pack(side="left")
         self.restart = ttk.Button(buttons, text="Restart", width=8, command=lambda: app.restart([bot]))
         self.restart.pack(side="left", padx=px(6))
         ttk.Button(buttons, text="Dashboard ↗", command=lambda: app.open_dashboard(bot)).pack(side="left")
+
+        separator = ttk.Separator(parent)
+        separator.grid(row=row + 1, column=0, columnspan=5, sticky="ew")
+        self.widgets = [tick, self.dot, names, self.status, buttons, separator]
+
+    def show(self, visible: bool) -> None:
+        for widget in self.widgets:
+            widget.grid() if visible else widget.grid_remove()
 
     def on_start_all_changed(self) -> None:
         chosen = set(self.app.config["start_all"])
@@ -585,41 +824,26 @@ class SettingsTab:
         bar.pack(side="bottom", fill="x")
         ttk.Separator(self.frame).pack(side="bottom", fill="x")
 
-        # Scrollable form
-        canvas = tk.Canvas(self.frame, highlightthickness=0, bd=0, background=app.background)
-        scrollbar = ttk.Scrollbar(self.frame, orient="vertical", command=canvas.yview)
-        form = ttk.Frame(canvas, padding=(px(16), px(12), px(24), px(12)))
-        form.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        window = canvas.create_window((0, 0), window=form, anchor="nw")
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", lambda w: canvas.yview_scroll(int(-w.delta / 120), "units")))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
-        scrollbar.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        form.columnconfigure(1, weight=1)
-        row = 0
-        for title, blurb, group in SETTING_GROUPS:
-            ttk.Label(form, text=title, style="Group.TLabel").grid(row=row, column=0, columnspan=3, sticky="w",
-                                                                   pady=(px(16) if row else 0, 0))
-            ttk.Label(form, text=blurb, style="Muted.TLabel").grid(row=row + 1, column=0, columnspan=3, sticky="w", pady=(0, px(4)))
-            row += 2
-            for setting in group:
-                ttk.Label(form, text=setting.label).grid(row=row, column=0, sticky="w", padx=(0, px(16)), pady=(px(6), 0))
-                var = tk.StringVar()
-                entry = ttk.Entry(form, textvariable=var, show="•" if setting.secret else "")
-                entry.grid(row=row, column=1, sticky="ew", pady=(px(6), 0))
-                self.vars[setting.name] = var
-                if setting.secret:
-                    shown = tk.BooleanVar(value=False)
-                    ttk.Checkbutton(form, text="Show", variable=shown,
-                                    command=lambda e=entry, v=shown: e.configure(show="" if v.get() else "•")
-                                    ).grid(row=row, column=2, sticky="w", padx=(px(8), 0), pady=(px(6), 0))
-                    self.show_vars.append(shown)  # Tk forgets a variable nothing refers to
-                ttk.Label(form, text=f"{setting.name}    {setting.hint}".rstrip(), style="Hint.TLabel"
-                          ).grid(row=row + 1, column=1, sticky="w")
-                row += 2
+        # Sections down the left; the chosen one's form, scrolling, on the right.
+        body = ttk.Frame(self.frame)
+        body.pack(fill="both", expand=True)
+        ttk.Style().configure("Sections.Treeview", rowheight=px(30))
+        self.nav = ttk.Treeview(body, show="tree", selectmode="browse", style="Sections.Treeview")
+        self.nav.column("#0", width=px(220), stretch=False)
+        self.nav.pack(side="left", fill="y", padx=(px(12), 0), pady=px(12))
+        ttk.Separator(body, orient="vertical").pack(side="left", fill="y", padx=(px(12), 0))
+        self.area = ScrollArea(body, app.background)
+        self.forms = []
+        for index, (title, blurb, group) in enumerate(SETTING_GROUPS):
+            self.nav.insert("", "end", iid=str(index), text=title)
+            form = ttk.Frame(self.area.canvas, padding=(px(16), px(12), px(24), px(16)))
+            self.area.watch(form)
+            self.build_form(form, title, blurb, group)
+            self.forms.append(form)
+        self.area.show(self.forms[0])
+        self.area.inner.destroy()  # the sections' forms take its place
+        self.nav.selection_set("0")
+        self.nav.bind("<<TreeviewSelect>>", lambda e: self.area.show(self.forms[int(self.nav.selection()[0])]))
 
         ttk.Button(bar, text="Save", style="Primary.TButton", command=self.save).pack(side="right")
         ttk.Button(bar, text="Undo changes", command=self.load).pack(side="right", padx=px(8))
@@ -627,6 +851,33 @@ class SettingsTab:
             "Saved as your Windows user environment variables. Empty = the bot's default. "
             "Running bots keep their old values until restarted.")).pack(side="left")
         self.load()
+
+    def build_form(self, form, title: str, blurb: str, group: list) -> None:
+        form.columnconfigure(1, weight=1)
+        ttk.Label(form, text=title, style="Group.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(form, text=blurb, style="Muted.TLabel", wraplength=px(620), justify="left"
+                  ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, px(4)))
+        row = 2
+        for item in group:
+            if isinstance(item, Sub):
+                ttk.Label(form, text=item.title, style="Name.TLabel").grid(row=row, column=0, columnspan=3, sticky="w",
+                                                                          pady=(px(16), 0))
+                row += 1
+                continue
+            ttk.Label(form, text=item.label).grid(row=row, column=0, sticky="w", padx=(0, px(16)), pady=(px(6), 0))
+            var = tk.StringVar()
+            entry = ttk.Entry(form, textvariable=var, show="•" if item.secret else "")
+            entry.grid(row=row, column=1, sticky="ew", pady=(px(6), 0))
+            self.vars[item.name] = var
+            if item.secret:
+                shown = tk.BooleanVar(value=False)
+                ttk.Checkbutton(form, text="Show", variable=shown,
+                                command=lambda e=entry, v=shown: e.configure(show="" if v.get() else "•")
+                                ).grid(row=row, column=2, sticky="w", padx=(px(8), 0), pady=(px(6), 0))
+                self.show_vars.append(shown)  # Tk forgets a variable nothing refers to
+            ttk.Label(form, text=f"{item.name}    {item.hint}".rstrip(), style="Hint.TLabel", wraplength=px(560),
+                      justify="left").grid(row=row + 1, column=1, sticky="w")
+            row += 2
 
     def load(self) -> None:
         env = read_user_env()

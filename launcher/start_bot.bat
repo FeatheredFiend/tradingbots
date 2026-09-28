@@ -37,6 +37,21 @@ if /i "%BOT%"=="capital-momentum-scanner" (set "SCRIPT=capital-momentum-scanner-
 if /i "%BOT%"=="capital-ema-bot" (set "SCRIPT=capital-ema-bot\capital_ema_bot.py" & set "VENV=%TRADINGBOTS_CAPITAL_ENV%")
 if /i "%BOT%"=="ig-momentum-scanner" (set "SCRIPT=ig-momentum-scanner-bot\ig_momentum_scanner_bot.py" & set "VENV=%TRADINGBOTS_IG_ENV%")
 if /i "%BOT%"=="ig-ema-bot" (set "SCRIPT=ig-cfd-ema-bot\ig_cfd_ema_bot.py" & set "VENV=%TRADINGBOTS_IG_ENV%")
+rem The strategy bots (strategy-bots\): three CFD strategies per broker - no forex on Alpaca.
+if /i "%BOT%"=="oanda-session-breakout" (set "SCRIPT=strategy-bots\oanda_session_breakout_bot.py" & set "VENV=%TRADINGBOTS_OANDA_ENV%")
+if /i "%BOT%"=="oanda-index-reversion" (set "SCRIPT=strategy-bots\oanda_index_reversion_bot.py" & set "VENV=%TRADINGBOTS_OANDA_ENV%")
+if /i "%BOT%"=="oanda-commodity-trend" (set "SCRIPT=strategy-bots\oanda_commodity_trend_bot.py" & set "VENV=%TRADINGBOTS_OANDA_ENV%")
+if /i "%BOT%"=="pepperstone-session-breakout" (set "SCRIPT=strategy-bots\pepperstone_session_breakout_bot.py" & set "VENV=%TRADINGBOTS_PEPPERSTONE_ENV%")
+if /i "%BOT%"=="pepperstone-index-reversion" (set "SCRIPT=strategy-bots\pepperstone_index_reversion_bot.py" & set "VENV=%TRADINGBOTS_PEPPERSTONE_ENV%")
+if /i "%BOT%"=="pepperstone-commodity-trend" (set "SCRIPT=strategy-bots\pepperstone_commodity_trend_bot.py" & set "VENV=%TRADINGBOTS_PEPPERSTONE_ENV%")
+if /i "%BOT%"=="capital-session-breakout" (set "SCRIPT=strategy-bots\capital_session_breakout_bot.py" & set "VENV=%TRADINGBOTS_CAPITAL_ENV%")
+if /i "%BOT%"=="capital-index-reversion" (set "SCRIPT=strategy-bots\capital_index_reversion_bot.py" & set "VENV=%TRADINGBOTS_CAPITAL_ENV%")
+if /i "%BOT%"=="capital-commodity-trend" (set "SCRIPT=strategy-bots\capital_commodity_trend_bot.py" & set "VENV=%TRADINGBOTS_CAPITAL_ENV%")
+if /i "%BOT%"=="ig-session-breakout" (set "SCRIPT=strategy-bots\ig_session_breakout_bot.py" & set "VENV=%TRADINGBOTS_IG_ENV%")
+if /i "%BOT%"=="ig-index-reversion" (set "SCRIPT=strategy-bots\ig_index_reversion_bot.py" & set "VENV=%TRADINGBOTS_IG_ENV%")
+if /i "%BOT%"=="ig-commodity-trend" (set "SCRIPT=strategy-bots\ig_commodity_trend_bot.py" & set "VENV=%TRADINGBOTS_IG_ENV%")
+if /i "%BOT%"=="alpaca-index-reversion" (set "SCRIPT=strategy-bots\alpaca_index_reversion_bot.py" & set "VENV=%TRADINGBOTS_ALPACA_ENV%")
+if /i "%BOT%"=="alpaca-commodity-trend" (set "SCRIPT=strategy-bots\alpaca_commodity_trend_bot.py" & set "VENV=%TRADINGBOTS_ALPACA_ENV%")
 
 if not defined SCRIPT (
     echo Unknown bot "%BOT%". Choose one of:
@@ -45,6 +60,9 @@ if not defined SCRIPT (
     echo   pepperstone-momentum-scanner  pepperstone-ema-bot
     echo   capital-momentum-scanner  capital-ema-bot
     echo   ig-momentum-scanner      ig-ema-bot
+    echo or a strategy bot, ^<broker^>-^<strategy^>:
+    echo   brokers: oanda pepperstone capital ig alpaca
+    echo   strategies: session-breakout index-reversion commodity-trend ^(not on alpaca^)
     exit /b 2
 )
 if not exist "%VENV%\Scripts\python.exe" (
