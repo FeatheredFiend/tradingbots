@@ -404,6 +404,41 @@ to 2,000 log lines to send later. What each broker can report:
 | Alpaca | yes - trades as the bot closes them, priced at Alpaca's value just before the sell | 2 a minute |
 | IG | log and running status only - IG's request limits leave no room | none |
 
+## Launcher (`launcher/`) - a Windows app for all of this
+
+`TradingBots.exe` starts and stops the bots and edits their settings:
+
+- **Bots:** every bot with its status - including ones started by hand -
+  and Start / Stop / Restart per bot, "Start all ticked" and "Stop all",
+  plus a link to each bot's dashboard page. Starting runs
+  `launcher/start_bot.bat`, which opens the bot in its own console window
+  on the right Python environment. Stopping presses Ctrl+C in that window,
+  so the bot shuts down cleanly and tells the dashboard it stopped (after
+  20 seconds without an answer it's force-stopped instead). Only the ticked
+  bots start with "Start all": by default the four scanners, since an EMA
+  bot and a scanner on the same OANDA or Alpaca account would close each
+  other's trades. Closing the app leaves the bots running.
+- **Settings:** a form for every environment variable the bots read -
+  keys, budgets, market lists, stop-loss / take-profit, the dashboard -
+  saved as Windows user environment variables (the same place
+  `[Environment]::SetEnvironmentVariable(..., "User")` writes). Empty means
+  the bot's default. It offers to restart running bots so they pick changes up.
+- **Paths:** the repo folder and each broker's Python environment (kept in
+  `%APPDATA%\TradingBots\launcher.json`).
+
+Build or rebuild it (close the app first) by running, from PowerShell or a
+double-click:
+
+```powershell
+\\wsl.localhost\Ubuntu\home\martyn\projects\tradingbots\launcher\build.bat
+```
+
+It builds with PyInstaller in its own environment
+(`%LOCALAPPDATA%\TradingBots\build-env`), installs the app to
+`%LOCALAPPDATA%\Programs\TradingBots\TradingBots.exe` and puts a "Trading
+Bots" shortcut on the desktop. `start_bot.bat <bot>` also works on its own,
+e.g. `start_bot.bat oanda-momentum-scanner`.
+
 ## Repo layout
 
 Each bot lives in its own folder with its own `requirements.txt`; the one
