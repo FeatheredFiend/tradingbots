@@ -274,6 +274,18 @@ def resolve_watchlist_epics(ig_service: IGService) -> list:
     return resolved
 
 
+def deal_currency(instrument: dict) -> str:
+    """CURRENCY_CODE if the market offers it, else the market's own default.
+    IG's API restricts a deal's currency to the instrument's listed ones;
+    FX Minis such as AUD/USD are priced in their quote currency, and GBP
+    orders on them came back REJECTED (reason UNKNOWN)."""
+    currencies = instrument.get("currencies") or []
+    codes = [c.get("code") for c in currencies]
+    if not codes or CURRENCY_CODE in codes:
+        return CURRENCY_CODE
+    return next((c["code"] for c in currencies if c.get("isDefault")), codes[0])
+
+
 def fetch_market_details(ig_service: IGService, epic: str) -> Optional[dict]:
     try:
         _rate_limiter.wait()
@@ -291,6 +303,7 @@ def fetch_market_details(ig_service: IGService, epic: str) -> Optional[dict]:
         snapshot = market["snapshot"]
         return {
             "expiry": instrument.get("expiry", "-"),
+            "currency": deal_currency(instrument),
             "min_deal_size": float(dealing_rules["minDealSize"]["value"]),
             "scaling_factor": float(snapshot.get("scalingFactor", 1)),
             "market_status": snapshot.get("marketStatus", "UNKNOWN"),
@@ -410,7 +423,7 @@ def submit_buy(ig_service: IGService, epic: str, name: str, details: dict, price
 
     try:
         result = ig_service.create_open_position(
-            currency_code=CURRENCY_CODE,
+            currency_code=details["currency"],
             direction="BUY",
             epic=epic,
             expiry=details["expiry"],
@@ -428,7 +441,7 @@ def submit_buy(ig_service: IGService, epic: str, name: str, details: dict, price
             trailing_stop_increment=None,
         )
         log.info(
-            f"BUY submitted -> {name} ({epic}) size={size} stop_dist={stop_distance} "
+            f"BUY submitted -> {name} ({epic}) size={size} {details['currency']} stop_dist={stop_distance} "
             f"limit_dist={limit_distance} result={deal_outcome(result)}"
         )
     except IGException as e:
