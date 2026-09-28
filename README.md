@@ -102,8 +102,12 @@ equity prices over the API) and caps everything else at 10,000 data points a
 week, which a scanner polling ~15 markets would burn through in about half
 an hour. So the bot samples each market's live bid/offer from the market
 details it already reads every pass, and buckets those into 15-minute
-closes. The cost is a **~45-minute warm-up after every start** (logged as
-`warming up (n/4 bars)`) before anything can signal.
+closes. The cost is a **~45-minute warm-up** (logged as
+`warming up (n/4 bars)`) before a market can signal. Bars are saved to
+`ig-momentum-scanner-bot/momentum_bars.json` as they change and reloaded at
+startup, so a restart picks up where it left off — only the first start,
+or one after a stop of more than 16 hours, has to warm up again. Delete
+that file to force a fresh warm-up.
 
 ```bash
 pip install -r ig-momentum-scanner-bot/requirements.txt

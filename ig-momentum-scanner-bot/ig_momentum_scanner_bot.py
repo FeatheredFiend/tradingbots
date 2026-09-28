@@ -34,8 +34,10 @@ IG's price-history endpoint (/prices) is no use for a broad scanner:
 So the bot never calls it. Each pass already fetches every market's details
 for its status; the snapshot there carries the live bid/offer, and the mid
 is recorded into 15-minute buckets (the last sample in a bucket is its
-close). The catch: after every start there's a warm-up of STREAK_LENGTH + 1
-buckets (~45 minutes at the default 3) before a symbol can signal.
+close). The catch: a symbol needs STREAK_LENGTH + 1 buckets (~45 minutes
+at the default 3) before it can signal. Bars are saved to BARS_FILE as they
+change and reloaded at startup, so only a first start (or one after a long
+stop — see SAVED_BARS_MAX_AGE_HOURS) sits through that warm-up.
 
 Why this is riskier than the other two bots, on purpose:
 - No trend confirmation (no EMA smoothing) — a streak of 3 candles is a much
@@ -72,6 +74,7 @@ Setup
        python ig_momentum_scanner_bot.py
 """
 
+import json
 import logging
 import os
 import re
@@ -127,6 +130,12 @@ STREAK_LENGTH = int(os.environ.get("STREAK_LENGTH", "3"))  # consecutive up/down
 
 TARGET_NOTIONAL = 2.00
 BAR_SECONDS = 15 * 60         # locally built bars — see "Bars are built locally" above
+BARS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "momentum_bars.json")
+# Saved bars older than this are dropped at startup and that market warms up
+# again. Long enough to survive an overnight stop (the gap then matches the
+# closed-market gap IG's own bars have); stopping for hours while a market is
+# open means the bars either side of the gap are treated as consecutive.
+SAVED_BARS_MAX_AGE_HOURS = 16
 
 STOP_LOSS_PCT = 0.02
 TAKE_PROFIT_PCT = 0.05
@@ -406,11 +415,42 @@ class _BarBuilder:
     """15-minute closes per epic, built from the live price sampled each pass
     instead of fetched from /prices (see "Bars are built locally" above).
     The newest bar is the one still forming, as IG's own last bar would be.
-    Only the last STREAK_LENGTH + 1 bars are kept — all a streak needs."""
+    Only the last STREAK_LENGTH + 1 bars are kept — all a streak needs.
+    Every change is saved to `path`, and saved bars are reloaded at startup
+    so a restart doesn't repeat the warm-up."""
 
-    def __init__(self, keep: int):
+    def __init__(self, keep: int, path: str):
         self._keep = keep
-        self._bars = {}  # epic -> [[bucket, close], ...], oldest first
+        self._path = path
+        self._bars = self._load()  # epic -> [[bucket, close], ...], oldest first
+
+    def _load(self) -> dict:
+        try:
+            with open(self._path) as f:
+                saved = json.load(f)
+            oldest_allowed = int((time.time() - SAVED_BARS_MAX_AGE_HOURS * 3600) // BAR_SECONDS)
+            bars = {
+                epic: [[int(bucket), float(close)] for bucket, close in epic_bars[-self._keep:]]
+                for epic, epic_bars in saved.items()
+                if epic_bars and epic_bars[-1][0] >= oldest_allowed
+            }
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            log.warning(f"Couldn't read saved bars from {self._path} ({e}); every market warms up from scratch.")
+            return {}
+        log.info(f"Restored saved bars for {len(bars)} market(s) from {self._path}")
+        return bars
+
+    def _save(self) -> None:
+        # Write-then-rename, so a crash mid-write can't leave a truncated file.
+        tmp_path = self._path + ".tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(self._bars, f)
+            os.replace(tmp_path, self._path)
+        except OSError as e:
+            log.warning(f"Couldn't save bars to {self._path}: {e}")
 
     def record(self, epic: str, price: float) -> list:
         """Record a price sample; returns this epic's closes, oldest first."""
@@ -421,10 +461,11 @@ class _BarBuilder:
         else:
             bars.append([bucket, price])
             del bars[:-self._keep]
+        self._save()
         return [close for _, close in bars]
 
 
-_bar_builder = _BarBuilder(STREAK_LENGTH + 1)
+_bar_builder = _BarBuilder(STREAK_LENGTH + 1, BARS_FILE)
 
 
 def detect_streak(closes: list) -> Optional[str]:
