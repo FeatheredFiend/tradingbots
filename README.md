@@ -80,9 +80,10 @@ Class C shares as separate markets).
 ### `ig-momentum-scanner-bot/` — high-risk / experimental
 
 A deliberately riskier third bot. Instead of a small named watchlist, it
-scans a broad ~35-instrument pool (US/UK shares, indices, commodities, FX
-majors) every cycle and trades whichever ones show a raw momentum streak —
-no symbol is chosen in advance, the bot decides purely from the data:
+scans a broad ~15-instrument pool (indices, commodities, FX majors — no
+shares, see below) every cycle and trades whichever ones show a raw momentum
+streak — no symbol is chosen in advance, the bot decides purely from the
+data:
 
 - Buy (open **long**): 3 consecutive higher closes in a row
 - Sell (open **short**): 3 consecutive lower closes in a row
@@ -102,7 +103,9 @@ equity prices over the API) and caps everything else at 10,000 data points a
 week, which a scanner polling ~15 markets would burn through in about half
 an hour. So the bot samples each market's live bid/offer from the market
 details it already reads every pass, and buckets those into 15-minute
-closes. The cost is a **~45-minute warm-up** (logged as
+closes. **Shares are left out entirely:** IG's market details carry no
+bid/offer for them either, so the API gives no way to price a share at all.
+The cost is a **~45-minute warm-up** (logged as
 `warming up (n/4 bars)`) before a market can signal. Bars are saved to
 `ig-momentum-scanner-bot/momentum_bars.json` as they change and reloaded at
 startup, so a restart picks up where it left off — only the first start,
@@ -131,10 +134,8 @@ name has several plausible matches it prefers, in order: an exact name match
 (so `GBP/EUR` doesn't become the inverse `EUR/GBP`), an undated market over
 dated futures, the plainest name (`BP PLC` over `BP PLC - Pfd`), and the
 **smallest contract size** — e.g. US 500 at £1 a point rather than $250, and
-FX "Mini" contracts. A share must be named after its search term, or it's
-skipped rather than guessed: a plain "JPMorgan" search on IG returned only
-JPMorgan-branded investment trusts. It logs every candidate, so if a pick is
-wrong, change that `DEFAULT_POOL` entry to `Name:EPIC`.
+FX "Mini" contracts. It logs every candidate, so if a pick is wrong, change
+that `DEFAULT_POOL` entry to `Name:EPIC`.
 
 ## IG rate limits (both IG bots)
 
@@ -145,7 +146,7 @@ doesn't catch, so an unpaced burst makes every later call fail too. Both IG
 bots pace every non-trading call to stay under it, which means:
 
 - The momentum bot takes about a minute to resolve its pool at startup, and
-  a full pass over it takes a minute or two (fine for 15-minute bars).
+  a full pass over it takes well under a minute (fine for 15-minute bars).
 - A startup lookup that fails is retried (after 20s, 40s, then 60s) rather
   than dropped, since it's nearly always a temporary 403 — e.g. from a bot
   you stopped less than a minute ago.

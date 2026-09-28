@@ -4,9 +4,10 @@ IG Markets Demo (Paper) Momentum Streak Scanner — HIGH-RISK / EXPERIMENTAL
 =============================================================================
 
 A third, deliberately riskier bot: instead of a small named watchlist, it
-scans a broad, curated POOL of ~35 liquid CFDs (shares, indices, commodities,
-FX) every cycle and trades whichever ones show a raw momentum streak — no
+scans a broad, curated POOL of ~15 liquid CFDs (indices, commodities, FX)
+every cycle and trades whichever ones show a raw momentum streak — no
 named symbol is chosen in advance, the bot decides purely from the data.
+No shares: IG's API gives no share prices at all (see below).
 
 Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
 -----------------------------------------------------------------------
@@ -34,7 +35,9 @@ IG's price-history endpoint (/prices) is no use for a broad scanner:
 So the bot never calls it. Each pass already fetches every market's details
 for its status; the snapshot there carries the live bid/offer, and the mid
 is recorded into 15-minute buckets (the last sample in a bucket is its
-close). The catch: a symbol needs STREAK_LENGTH + 1 buckets (~45 minutes
+close). Shares get no bid/offer in that snapshot either — the same
+licensing block — so there's no way to price them and they're left out of
+the pool. The catch: a symbol needs STREAK_LENGTH + 1 buckets (~45 minutes
 at the default 3) before it can signal. Bars are saved to BARS_FILE as they
 change and reloaded at startup, so only a first start (or one after a long
 stop — see SAVED_BARS_MAX_AGE_HOURS) sits through that warm-up.
@@ -97,21 +100,10 @@ ACCOUNT_TYPE = "DEMO"  # Hardcoded — this script never trades a LIVE account.
 CURRENCY_CODE = os.environ.get("IG_CURRENCY_CODE", "GBP")
 
 # (search term or "term:EPIC" override, expected IG instrumentType)
-# ~35 liquid instruments across categories, deliberately broader than a
-# hand-picked watchlist — this is the "random CFD" scanning pool.
+# ~15 liquid instruments across categories, deliberately broader than a
+# hand-picked watchlist — this is the "random CFD" scanning pool. No shares:
+# IG's API never gives a price for them (see "Bars are built locally").
 DEFAULT_POOL = [
-    # US mega-cap shares
-    ("Apple", "SHARES"), ("Microsoft", "SHARES"), ("Amazon", "SHARES"),
-    ("Google:UB.D.GOOGL.CASH.IP", "SHARES"), ("Tesla", "SHARES"),
-    ("Meta Platforms", "SHARES"), ("Netflix", "SHARES"), ("Nvidia", "SHARES"),
-    ("JPMorgan Chase", "SHARES"), ("Walmart", "SHARES"),
-    # UK shares
-    ("BP", "SHARES"), ("HSBC", "SHARES"), ("Tesco", "SHARES"),
-    ("Vodafone", "SHARES"), ("AstraZeneca", "SHARES"), ("GSK", "SHARES"),
-    # Unilever pinned to its London listing — a plain search also finds the
-    # pre-2020 Dutch "Unilever NV" entity and picks that first.
-    ("Barclays", "SHARES"), ("Lloyds Banking", "SHARES"), ("Unilever:KA.D.ULVR.CASH.IP", "SHARES"),
-    ("Rolls-Royce", "SHARES"),
     # Indices
     ("FTSE 100", "INDICES"), ("US 500", "INDICES"), ("Wall Street", "INDICES"),
     ("US Tech 100", "INDICES"), ("Germany 40", "INDICES"), ("Japan 225", "INDICES"),
@@ -124,7 +116,7 @@ DEFAULT_POOL = [
 ]
 POOL_ENTRIES = [
     p.strip() for p in os.environ.get("IG_POOL", "").split(",") if p.strip()
-] or None  # env override replaces the whole pool (as "term" or "term:EPIC", one type: SHARES)
+] or None  # env override replaces the whole pool (as "term" or "term:EPIC", no type filter)
 
 STREAK_LENGTH = int(os.environ.get("STREAK_LENGTH", "3"))  # consecutive up/down bars to trigger
 
@@ -141,9 +133,9 @@ STOP_LOSS_PCT = 0.02
 TAKE_PROFIT_PCT = 0.05
 
 # No fixed loop interval: the rate limiter below paces every request, so a
-# full pass over ~27-35 symbols naturally takes ~1-2 minutes — each symbol
-# gets sampled several times per 15-minute bar, so a bar's close is never
-# more than one pass stale.
+# full pass over ~15 symbols naturally takes well under a minute — each
+# symbol gets sampled many times per 15-minute bar, so a bar's close is
+# never more than one pass stale.
 # IG's limit is ~30/min for the whole account. Bots don't coordinate, so if
 # two run at once on the same account, give each a share (e.g. 18 and 10).
 REQUESTS_PER_MINUTE = int(os.environ.get("IG_REQUESTS_PER_MINUTE", "28"))
@@ -172,7 +164,7 @@ log = logging.getLogger("ig_momentum_bot")
 class _RateLimiter:
     """IG allows only ~30 non-trading requests/minute, account-wide, shared
     across every non-trading endpoint (search, market details, bars,
-    positions). A burst of unpaced calls (e.g. resolving a ~35-symbol pool)
+    positions). A burst of unpaced calls (e.g. resolving the whole pool)
     blows through that almost immediately and gets 403'd — including calls
     for symbols that had just succeeded moments earlier. trading-ig's own
     built-in pacing does not catch this (it reacts to 429s, IG returns 403
@@ -225,10 +217,6 @@ NOT_THE_MARKET_MARKERS = [
     "Leverage", "GraniteShares", "IncomeShares", "ETP", "ETF",
     "Rights Issue", "NOT IN USE", "Weekend",
 ]
-
-# Foreign cross-listings of UK/US shares — shares only, since indices and
-# commodities use parentheses for contract size instead, e.g. "(£10)".
-FOREIGN_LISTING_PATTERN = r"\((?:DE|FR|ES|IT|CH|NL|SE|BE|PT|AT|IE|DK|FI|NO)\)"
 
 # Per-point contract value in IG's market names: "(£10)", "($250)", "(E25)",
 # "(GBP1)", "(500oz)", "(£1 Contract)" — but not "(24 Hours)".
@@ -312,7 +300,7 @@ def fetch_market_details(ig_service: IGService, epic: str) -> Optional[dict]:
 
 def resolve_pool_epics(ig_service: IGService) -> list:
     """Best-effort resolution: SKIP (don't exit) any entry that fails to
-    resolve cleanly, logging why, so one bad search term out of ~35 doesn't
+    resolve cleanly, logging why, so one bad search term in the pool doesn't
     take the whole bot down. See module docstring for why this differs from
     ig_cfd_ema_bot.py's strict, hard-exit resolution."""
     pool = [(p, None) for p in POOL_ENTRIES] if POOL_ENTRIES else DEFAULT_POOL
@@ -348,32 +336,12 @@ def resolve_pool_epics(ig_service: IGService) -> list:
         if "instrumentName" in candidates:
             names = candidates["instrumentName"]
             noise = "|".join(re.escape(m) for m in NOT_THE_MARKET_MARKERS)
-            keep = ~names.str.contains(noise, case=False, regex=True)
-            if expected_type == "SHARES":
-                keep &= ~names.str.contains(FOREIGN_LISTING_PATTERN, regex=True)
-            candidates = _narrow(candidates, keep)
+            candidates = _narrow(candidates, ~names.str.contains(noise, case=False, regex=True))
 
             # Exact name first — a "GBP/EUR" search lists the inverse EUR/GBP first.
             candidates = _narrow(
                 candidates, candidates["instrumentName"].map(_normalized_name) == _normalized_name(term)
             )
-
-            if expected_type == "SHARES":
-                # A share must be named after the search term. If none is, the
-                # search only found products that mention it — a plain "JPMorgan"
-                # search returned only JPMorgan-branded investment trusts — so any
-                # pick would be wrong. Skip instead of trading the wrong thing.
-                term_pattern = rf"{re.escape(_normalized_name(term))}\b"
-                named = candidates["instrumentName"].map(
-                    lambda n: re.match(term_pattern, _normalized_name(n)) is not None
-                )
-                if not named.any():
-                    log.warning(
-                        f"Skipping '{term}': no share is named after it — pin one with "
-                        f"'{term}:EPIC' if it's there. Candidates: {_describe(candidates)}"
-                    )
-                    continue
-                candidates = candidates[named]
 
         # Undated (rolling) markets over dated futures — no expiry to roll.
         if "expiry" in candidates:
