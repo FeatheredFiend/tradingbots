@@ -23,8 +23,9 @@ The same as oanda_momentum_scanner_bot.py: OANDA_BUDGET (default 100, in the
 account's currency) split into OANDA_MAX_POSITIONS (default 5) slices, and
 each buy is worth one slice. The budget is exposure, not margin, so the
 default uses no leverage. A watchlist market whose smallest trade is worth
-more than a slice (one unit of an index or of gold is worth thousands) is
-skipped at startup with the reason logged — raise OANDA_BUDGET to include it.
+more than a slice (about £60 for the US 500, up to £1,100 for the UK 100)
+is skipped at startup with the reason logged — raise OANDA_BUDGET to
+include it.
 
 Watchlist
 ---------

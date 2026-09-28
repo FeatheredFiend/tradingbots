@@ -29,10 +29,12 @@ OANDA_MAX_POSITIONS (default 5) slices, and each trade is worth one slice —
 is exposure (what the positions are worth), not margin, so the default uses
 no leverage; set it above the balance to use some. A market whose smallest
 trade is worth more than a slice is skipped at startup with the reason
-logged: one unit of an index or of gold is worth thousands, so at the
-default budget only the currency pairs trade. Once OANDA_MAX_POSITIONS
-positions are open, further signals are skipped; when several markets
-signal at once, the biggest move across its streak gets the slot first.
+logged. OANDA sells fractions of a unit of indices and gold, but their
+smallest trades still range from about £60 (US 500) to £1,100 (UK 100),
+so at the default budget only the currency pairs trade; a budget of 5,500
+takes in the whole pool. Once OANDA_MAX_POSITIONS positions are open,
+further signals are skipped; when several markets signal at once, the
+biggest move across its streak gets the slot first.
 Sizes come from the budget, not the balance, so the bot trades the same on
 OANDA's 100,000 practice balance as on a real £100 one.
 

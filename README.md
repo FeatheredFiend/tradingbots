@@ -231,8 +231,11 @@ some. Each bot has its own budget. Sizes come from the budget, not the
 balance, so the bots trade the same on OANDA's 100,000 practice balance as
 on a real £100. A market whose smallest trade is worth more than a slice is
 skipped at startup, with the reason logged: **at the default £100 only
-currency pairs trade** — one unit of silver or oil is worth about £35–50,
-and one unit of an index or of gold is worth thousands.
+currency pairs trade.** OANDA sells fractions of a unit of indices and gold,
+but even their smallest trades are bigger than a £20 slice — in September
+2026 about £60 for the US 500, £45–80 for silver and oil, £200–500 for the
+other indices and gold, and £1,100 for the UK 100. An `OANDA_BUDGET` of
+`5500` (slices of £1,100) takes in the scanner's whole pool.
 
 **Scanner:** the IG scanner's rules (3-bar streak, long and short, a reversal
 closes) and the same `STREAK_LENGTH` / `STOP_LOSS_PERCENT` /
@@ -277,7 +280,7 @@ python pepperstone-ema-bot/pepperstone_ema_bot.py
 The bots attach to whichever account the terminal is logged into (starting
 the terminal if it's closed), or log in themselves when
 `PEPPERSTONE_LOGIN`, `PEPPERSTONE_PASSWORD` and `PEPPERSTONE_SERVER` (the
-server name in the login dialog, e.g. `Pepperstone-Demo`) are set. Set
+server name in the login dialog, e.g. `PepperstoneUK-Demo`) are set. Set
 `MT5_TERMINAL_PATH` to `terminal64.exe` if the package can't find the
 terminal. **They exit unless the account is a demo account.**
 

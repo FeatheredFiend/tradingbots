@@ -55,7 +55,7 @@ Setup
 2. pip install -r requirements.txt   (MetaTrader5 — Windows only)
 3. Either leave the terminal logged in, or set PEPPERSTONE_LOGIN,
    PEPPERSTONE_PASSWORD and PEPPERSTONE_SERVER (the server name shown at
-   login, e.g. "Pepperstone-Demo"). MT5_TERMINAL_PATH points at
+   login, e.g. "PepperstoneUK-Demo"). MT5_TERMINAL_PATH points at
    terminal64.exe if the package can't find the terminal on its own.
 4. (Optional) PEPPERSTONE_WATCHLIST="AAPL.US,MSFT.US,EURUSD"
 5. Run:
