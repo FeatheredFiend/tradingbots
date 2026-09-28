@@ -1,7 +1,9 @@
 # tradingbots
 
-Small, paper/demo-only trading bots against different brokers' APIs, sized
-for a small-capital account. **Nothing in this repo trades real money.**
+Small, paper/demo-only trading bots against different brokers' APIs.
+**Nothing in this repo trades real money.** Only the Alpaca bot's trades are
+genuinely small ($2 each); the IG bots' trades are far bigger than their $2
+setting suggests — see [IG position sizing](#ig-position-sizing-both-ig-bots).
 
 ## EMA crossover strategy (`alpaca-ema-bot/`, `ig-cfd-ema-bot/`)
 
@@ -63,9 +65,14 @@ python ig-cfd-ema-bot/ig_cfd_ema_bot.py
 API keys) — this is an IG platform requirement, not a choice made here. The
 bot itself is hardcoded to `ACCOUNT_TYPE = "DEMO"` and never trades live.
 
-CFD minimum deal sizes are usually well above a $2-equivalent position, so
-the bot targets $2 exposure but clamps up to whatever each market's real
-minimum size is — expect demo positions sized larger than $2 in practice.
+**Trades are nowhere near $2.** The bot targets $2, but every IG market's
+minimum trade is far bigger, so every trade is IG's minimum — thousands of
+pounds of exposure. See [IG position sizing](#ig-position-sizing-both-ig-bots).
+
+**It can't trade its default watchlist.** IG's API gives no prices for
+shares at all — neither price history nor live prices (see the momentum
+scanner below) — so every share in the watchlist fails. It would need a
+watchlist of indices, commodities or FX instead.
 
 **`IG_WATCHLIST` is a fixed list, not a screener** — the bot only ever
 trades exactly what's named here (comma-separated company names, UK and US
@@ -94,7 +101,8 @@ Unlike the other two bots, this one can go **short** — CFDs support it, and
 that's a genuinely higher-risk capability than the long-only bots. It also
 has no trend-confirmation smoothing (no EMA), so expect more false signals
 and more round-trips hitting the stop-loss than the EMA bots. Same native
-stop-loss/take-profit (2%/5%) and $2 target notional as `ig-cfd-ema-bot/`.
+stop-loss/take-profit (2%/5%) as `ig-cfd-ema-bot/`, and the same catch on
+trade size — see [IG position sizing](#ig-position-sizing-both-ig-bots).
 
 **It builds its own 15-minute bars instead of fetching them.** IG's
 price-history endpoint refuses every share with a 403
@@ -136,6 +144,33 @@ dated futures, the plainest name (`BP PLC` over `BP PLC - Pfd`), and the
 **smallest contract size** — e.g. US 500 at £1 a point rather than $250, and
 FX "Mini" contracts. It logs every candidate, so if a pick is wrong, change
 that `DEFAULT_POOL` entry to `Name:EPIC`.
+
+## IG position sizing (both IG bots)
+
+Both IG bots have a `TARGET_NOTIONAL` of $2, but **no IG trade is ever that
+small**. An IG CFD trade is a number of contracts, each gaining or losing a
+fixed amount per point the price moves, and every market has a minimum
+number of contracts. $2 of exposure is far below that minimum, so the bots
+always round up to it: every trade is the smallest one IG allows.
+
+That smallest trade is still big. For example, one £1-a-point FTSE 100
+contract, with the index around 10,700, is roughly:
+
+- **£10,700 of exposure** (10,700 points × £1)
+- **£540 of margin** held while it's open (IG's 5% rate for major indices)
+- **£215 lost** if the 2% stop-loss is hit (about 215 points × £1)
+
+IG's minimum is typically in the region of one such contract; other
+markets land in the same ballpark. Check a market's deal ticket on IG for
+its exact minimum and margin.
+
+**The bots never look at the account balance.** On a 10,000 demo balance
+they work, but the scanner holding trades in many of its 15 markets at
+once could tie up several thousand in margin. On 100 or less, IG would
+reject trades for insufficient funds, or a single stop-loss could wipe the
+account out. **These bots can't be scaled down to small amounts** — IG's
+minimum trade size is the floor. For genuinely small trades, see
+`alpaca-ema-bot/`, which buys fractional shares.
 
 ## IG rate limits (both IG bots)
 
