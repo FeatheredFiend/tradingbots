@@ -23,6 +23,20 @@ Unlike ig_cfd_ema_bot.py, this bot can go SHORT (CFDs support it) — a
 genuinely different, higher-risk capability than the long-only Alpaca and
 named-watchlist IG bots.
 
+Bars are built locally, not fetched
+-----------------------------------
+IG's price-history endpoint (/prices) is no use for a broad scanner:
+- It refuses every share with a 403 "unauthorised.access.to.equity.exception"
+  — IG's data vendors don't license equity prices over the API.
+- It allows only 10,000 data points per week. Polling even 50 bars for
+  ~15 markets every pass burns through that in about half an hour, after
+  which every /prices call fails until the allowance resets.
+So the bot never calls it. Each pass already fetches every market's details
+for its status; the snapshot there carries the live bid/offer, and the mid
+is recorded into 15-minute buckets (the last sample in a bucket is its
+close). The catch: after every start there's a warm-up of STREAK_LENGTH + 1
+buckets (~45 minutes at the default 3) before a symbol can signal.
+
 Why this is riskier than the other two bots, on purpose:
 - No trend confirmation (no EMA smoothing) — a streak of 3 candles is a much
   weaker, noisier signal than a moving-average crossover, so expect more
@@ -43,10 +57,11 @@ changing that DEFAULT_POOL entry to "Name:EPIC".
 Rate limiting
 -------------
 IG allows only ~30 non-trading requests per minute, account-wide. Every
-search, market-details, bars and positions call here is paced to stay under
+search, market-details and positions call here is paced to stay under
 that, so startup resolution takes about a minute and a full pass over the
-pool takes a few minutes. Running this alongside ig_cfd_ema_bot.py on the
-same IG account shares that one budget between them.
+pool (one market-details call per symbol) takes a minute or two. Running
+this alongside ig_cfd_ema_bot.py on the same IG account shares that one
+budget between them.
 
 Setup
 -----
@@ -111,15 +126,15 @@ POOL_ENTRIES = [
 STREAK_LENGTH = int(os.environ.get("STREAK_LENGTH", "3"))  # consecutive up/down bars to trigger
 
 TARGET_NOTIONAL = 2.00
-BAR_RESOLUTION = "15Min"
-BARS_LOOKBACK = 50            # streak detection only needs recent bars, unlike a 21-EMA warm-up
+BAR_SECONDS = 15 * 60         # locally built bars — see "Bars are built locally" above
 
 STOP_LOSS_PCT = 0.02
 TAKE_PROFIT_PCT = 0.05
 
 # No fixed loop interval: the rate limiter below paces every request, so a
-# full pass over ~27-35 symbols naturally takes ~3-4 minutes — still far more
-# often than a 15-minute bar can change.
+# full pass over ~27-35 symbols naturally takes ~1-2 minutes — each symbol
+# gets sampled several times per 15-minute bar, so a bar's close is never
+# more than one pass stale.
 # IG's limit is ~30/min for the whole account. Bots don't coordinate, so if
 # two run at once on the same account, give each a share (e.g. 18 and 10).
 REQUESTS_PER_MINUTE = int(os.environ.get("IG_REQUESTS_PER_MINUTE", "28"))
@@ -278,6 +293,8 @@ def fetch_market_details(ig_service: IGService, epic: str) -> Optional[dict]:
             "min_deal_size": float(dealing_rules["minDealSize"]["value"]),
             "scaling_factor": float(snapshot.get("scalingFactor", 1)),
             "market_status": snapshot.get("marketStatus", "UNKNOWN"),
+            "bid": snapshot.get("bid"),
+            "offer": snapshot.get("offer"),
         }
     except (KeyError, TypeError) as e:
         log.warning(f"Unexpected market-details shape for {epic}: {e}")
@@ -385,32 +402,40 @@ def resolve_pool_epics(ig_service: IGService) -> list:
 # ---------------------------------------------------------------------------
 # MARKET DATA / SIGNAL
 # ---------------------------------------------------------------------------
-def fetch_bars(ig_service: IGService, epic: str) -> Optional[pd.DataFrame]:
-    _rate_limiter.wait()
-    try:
-        data = ig_service.fetch_historical_prices_by_epic_and_num_points(epic, BAR_RESOLUTION, BARS_LOOKBACK)
-    except Exception as e:
-        log.error(f"Error fetching bars for {epic}: {e}")
-        return None
+class _BarBuilder:
+    """15-minute closes per epic, built from the live price sampled each pass
+    instead of fetched from /prices (see "Bars are built locally" above).
+    The newest bar is the one still forming, as IG's own last bar would be.
+    Only the last STREAK_LENGTH + 1 bars are kept — all a streak needs."""
 
-    raw = data.get("prices")
-    if raw is None or raw.empty:
-        return None
+    def __init__(self, keep: int):
+        self._keep = keep
+        self._bars = {}  # epic -> [[bucket, close], ...], oldest first
 
-    df = pd.DataFrame(index=raw.index)
-    df["Close"] = (raw["bid"]["Close"] + raw["ask"]["Close"]) / 2.0
-    return df
+    def record(self, epic: str, price: float) -> list:
+        """Record a price sample; returns this epic's closes, oldest first."""
+        bucket = int(time.time() // BAR_SECONDS)
+        bars = self._bars.setdefault(epic, [])
+        if bars and bars[-1][0] == bucket:
+            bars[-1][1] = price
+        else:
+            bars.append([bucket, price])
+            del bars[:-self._keep]
+        return [close for _, close in bars]
 
 
-def detect_streak(df: pd.DataFrame) -> Optional[str]:
+_bar_builder = _BarBuilder(STREAK_LENGTH + 1)
+
+
+def detect_streak(closes: list) -> Optional[str]:
     """STREAK_LENGTH consecutive higher (or lower) closes in a row."""
-    if len(df) < STREAK_LENGTH + 1:
+    if len(closes) < STREAK_LENGTH + 1:
         return None
-    closes = df["Close"].iloc[-(STREAK_LENGTH + 1):]
-    diffs = closes.diff().dropna()
-    if (diffs > 0).all():
+    recent = closes[-(STREAK_LENGTH + 1):]
+    diffs = [b - a for a, b in zip(recent, recent[1:])]
+    if all(d > 0 for d in diffs):
         return "bullish"
-    if (diffs < 0).all():
+    if all(d < 0 for d in diffs):
         return "bearish"
     return None
 
@@ -492,17 +517,22 @@ def trading_cycle(ig_service: IGService, item: dict, positions: Optional[pd.Data
         log.info(f"{name} ({epic}) | market_status={details['market_status']} — skipping this pass.")
         return
 
-    position = find_position(positions, epic)
-
-    df = fetch_bars(ig_service, epic)
-    if df is None or len(df) < STREAK_LENGTH + 1:
-        log.warning(f"Not enough bars for {name} ({epic}) yet; skipping.")
+    if details["bid"] is None or details["offer"] is None:
+        log.warning(f"{name} ({epic}) | no live bid/offer in its snapshot — skipping this pass.")
         return
 
-    signal = detect_streak(df)
-    price = float(df["Close"].iloc[-1])
+    position = find_position(positions, epic)
+
+    price = (float(details["bid"]) + float(details["offer"])) / 2.0
+    closes = _bar_builder.record(epic, price)
     position_desc = f"{position['direction']} size={position['size']}" if position else "FLAT"
 
+    if len(closes) < STREAK_LENGTH + 1:
+        log.info(f"{name} ({epic}) | price={price:.2f} | warming up "
+                 f"({len(closes)}/{STREAK_LENGTH + 1} bars) | position={position_desc}")
+        return
+
+    signal = detect_streak(closes)
     log.info(f"{name} ({epic}) | price={price:.2f} | streak={signal or 'none'} | position={position_desc}")
 
     if signal == "bullish":

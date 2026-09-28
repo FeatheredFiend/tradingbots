@@ -95,6 +95,16 @@ has no trend-confirmation smoothing (no EMA), so expect more false signals
 and more round-trips hitting the stop-loss than the EMA bots. Same native
 stop-loss/take-profit (2%/5%) and $2 target notional as `ig-cfd-ema-bot/`.
 
+**It builds its own 15-minute bars instead of fetching them.** IG's
+price-history endpoint refuses every share with a 403
+(`unauthorised.access.to.equity.exception` — IG's data vendors don't license
+equity prices over the API) and caps everything else at 10,000 data points a
+week, which a scanner polling ~15 markets would burn through in about half
+an hour. So the bot samples each market's live bid/offer from the market
+details it already reads every pass, and buckets those into 15-minute
+closes. The cost is a **~45-minute warm-up after every start** (logged as
+`warming up (n/4 bars)`) before anything can signal.
+
 ```bash
 pip install -r ig-momentum-scanner-bot/requirements.txt
 export IG_USERNAME="your_ig_username"
@@ -131,7 +141,7 @@ doesn't catch, so an unpaced burst makes every later call fail too. Both IG
 bots pace every non-trading call to stay under it, which means:
 
 - The momentum bot takes about a minute to resolve its pool at startup, and
-  a full pass over it takes a few minutes (fine for 15-minute bars).
+  a full pass over it takes a minute or two (fine for 15-minute bars).
 - A startup lookup that fails is retried (after 20s, 40s, then 60s) rather
   than dropped, since it's nearly always a temporary 403 — e.g. from a bot
   you stopped less than a minute ago.
