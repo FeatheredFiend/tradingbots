@@ -129,9 +129,12 @@ python ig-momentum-scanner-bot/ig_momentum_scanner_bot.py
 ```
 
 Requires the same live-IG-account-for-an-API-key step as `ig-cfd-ema-bot/`,
-and is hardcoded to the demo account. `STREAK_LENGTH` (default `3`) and
-`IG_POOL` (comma-separated override of the whole scanning pool) are
-optional env vars.
+and is hardcoded to the demo account. Optional env vars: `STREAK_LENGTH`
+(default `3`), `IG_POOL` (comma-separated override of the whole scanning
+pool), and `STOP_LOSS_PERCENT` / `TAKE_PROFIT_PERCENT` (defaults `2` and
+`5`, in percent of the entry price — e.g. `0.5` for 0.5%). IG has a minimum
+stop/limit distance per market, so a very tight value can get a trade
+rejected; the reason is logged.
 
 **Resolution is intentionally looser here than `ig-cfd-ema-bot/`:** that bot
 hard-exits on any ambiguous or unresolved name, because getting one specific
@@ -155,7 +158,8 @@ hours (9:30–16:00 New York, 14:30–21:00 UK):
 
 - Buy: 3 consecutive higher closes in a row
 - Sell (close): 3 consecutive lower closes in a row, a 2% stop-loss or a 5%
-  take-profit
+  take-profit (adjustable with `STOP_LOSS_PERCENT` / `TAKE_PROFIT_PERCENT`,
+  in percent — e.g. `0.5` for 0.5%)
 
 **Buys only.** Fractional shares can't be sold short on Alpaca, and short
 selling needs a $2,000+ margin account, so a falling streak only ever closes
@@ -237,6 +241,25 @@ bots pace every non-trading call to stay under it, which means:
   them with `IG_REQUESTS_PER_MINUTE` (default `28`), set in each bot's own
   window, keeping the total under 30 — e.g. `18` for the scanner and `10`
   for the EMA bot.
+
+## Backtest (`backtest/streak_backtest.py`)
+
+Replays the scanners' 3-bar streak rule over past 15-minute bars for a grid
+of stop-loss / take-profit percentages, to pick `STOP_LOSS_PERCENT` /
+`TAKE_PROFIT_PERCENT` on evidence rather than guesswork:
+
+```bash
+python backtest/streak_backtest.py alpaca   # in alpaca-bot-env: ~90 days of the Alpaca scanner's US shares
+python backtest/streak_backtest.py ig       # in ig-bot-env: last 500 bars of the IG scanner's 15 markets
+```
+
+Bars are cached in `backtest/data/` (gitignored), so reruns are free. The IG
+run uses 7,500 of IG's 10,000-points-a-week price-history allowance and ~16
+requests — stop the IG scanner first so the two don't overrun IG's
+30-a-minute limit. First Alpaca run (30 Jun – 25 Sep 2026): the default 2% /
+5% roughly broke even per trade; a 0.25–0.5% stop with a 2.5–5% take-profit
+did best, and a 0.5% take-profit was worst at every stop. The edge was
+tiny (~0.05% a trade) and assumes stops fill exactly at their level.
 
 ## Repo layout
 

@@ -16,9 +16,10 @@ Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
 - Sell      : STREAK_LENGTH consecutive LOWER closes in a row   -> open SHORT
 - A reversal streak closes an opposing open position; the same-direction
   streak while already positioned is a no-op (no pyramiding).
-- Risk mgmt : 2% stop-loss / 5% take-profit, attached natively to the order
-  (same mechanism as ig_cfd_ema_bot.py — IG's CFD orders support this
-  directly, no manual polling needed).
+- Risk mgmt : 2% stop-loss / 5% take-profit by default (STOP_LOSS_PERCENT /
+  TAKE_PROFIT_PERCENT env vars), attached natively to the order (same
+  mechanism as ig_cfd_ema_bot.py — IG's CFD orders support this directly,
+  no manual polling needed).
 
 Unlike ig_cfd_ema_bot.py, this bot can go SHORT (CFDs support it) — a
 genuinely different, higher-risk capability than the long-only Alpaca and
@@ -128,8 +129,11 @@ BARS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "momentum_b
 # open means the bars either side of the gap are treated as consecutive.
 SAVED_BARS_MAX_AGE_HOURS = 16
 
-STOP_LOSS_PCT = 0.02
-TAKE_PROFIT_PCT = 0.05
+# Percent of the entry price, e.g. STOP_LOSS_PERCENT=0.5 for 0.5%. IG sets a
+# minimum stop/limit distance per market, so a very tight value can get a
+# trade rejected (the rejection reason is logged).
+STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PERCENT", "2")) / 100
+TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PERCENT", "5")) / 100
 
 # No fixed loop interval: the rate limiter below paces every request, so a
 # full pass over ~15 symbols naturally takes well under a minute — each
@@ -145,6 +149,7 @@ ERROR_BACKOFF_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
 
 assert STREAK_LENGTH >= 2, "STREAK_LENGTH must be at least 2 to mean anything"
+assert STOP_LOSS_PCT > 0 and TAKE_PROFIT_PCT > 0, "STOP_LOSS_PERCENT and TAKE_PROFIT_PERCENT must be positive"
 
 # ---------------------------------------------------------------------------
 # LOGGING
@@ -601,7 +606,7 @@ def run_bot() -> None:
     log.info(f"Resolved {len(pool)}/{len(POOL_ENTRIES or DEFAULT_POOL)} pool entries")
     log.info(
         f"Streak length={STREAK_LENGTH} bars | Size=each market's IG minimum | "
-        f"Stop-loss={STOP_LOSS_PCT:.0%} | Take-profit={TAKE_PROFIT_PCT:.0%} | Timeframe=15Min"
+        f"Stop-loss={STOP_LOSS_PCT * 100:g}% | Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe=15Min"
     )
     log.info("=" * 78)
 

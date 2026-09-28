@@ -13,7 +13,8 @@ Strategy — momentum streak, buys only
 - Timeframe : 15-minute bars, regular US market hours (9:30-16:00 ET)
 - Buy       : STREAK_LENGTH consecutive HIGHER closes -> buy one slice
 - Sell      : STREAK_LENGTH consecutive LOWER closes  -> close the position
-- Risk mgmt : 2% stop-loss / 5% take-profit on the position's average entry
+- Risk mgmt : 2% stop-loss / 5% take-profit by default (STOP_LOSS_PERCENT /
+  TAKE_PROFIT_PERCENT env vars) on the position's average entry
   price, checked by the bot every loop. Alpaca can't attach stop/limit legs
   to fractional orders, so these only work WHILE THE BOT IS RUNNING, and
   only during market hours — an overnight gap can blow straight past them.
@@ -104,8 +105,9 @@ BAR_SETTLE = pd.Timedelta(seconds=15)
 DATA_FEED = "iex"             # Free-tier Alpaca data plans only permit the IEX feed.
 MARKET_TZ = "America/New_York"
 
-STOP_LOSS_PCT = 0.02          # 2% hard stop-loss on average entry price.
-TAKE_PROFIT_PCT = 0.05        # 5% take-profit target on average entry price.
+# Percent of the average entry price, e.g. STOP_LOSS_PERCENT=0.5 for 0.5%.
+STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PERCENT", "2")) / 100
+TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PERCENT", "5")) / 100
 
 LOOP_INTERVAL_SECONDS = 60          # Risk checks run this often; bars refresh once per bar.
 CLOSED_MARKET_SLEEP_SECONDS = 300
@@ -113,6 +115,7 @@ MAX_CONSECUTIVE_ERRORS = 10         # Safety cutoff to avoid an unattended error
 
 assert STREAK_LENGTH >= 2, "STREAK_LENGTH must be at least 2 to mean anything"
 assert MAX_OPEN_POSITIONS >= 1, "BOT_MAX_POSITIONS must be at least 1"
+assert STOP_LOSS_PCT > 0 and TAKE_PROFIT_PCT > 0, "STOP_LOSS_PERCENT and TAKE_PROFIT_PERCENT must be positive"
 assert TRADE_NOTIONAL_USD >= 1.00, (
     "Alpaca requires a minimum notional order of $1.00 — raise BOT_BUDGET_USD "
     "or lower BOT_MAX_POSITIONS"
@@ -356,8 +359,8 @@ def run_bot() -> None:
     log.info(f"Pool: {len(pool)}/{len(POOL)} symbols usable")
     log.info(
         f"Budget=${BUDGET_USD:.2f} in {MAX_OPEN_POSITIONS} slices of ${TRADE_NOTIONAL_USD:.2f} | "
-        f"Streak length={STREAK_LENGTH} bars | Stop-loss={STOP_LOSS_PCT:.0%} | "
-        f"Take-profit={TAKE_PROFIT_PCT:.0%} | Timeframe=15Min"
+        f"Streak length={STREAK_LENGTH} bars | Stop-loss={STOP_LOSS_PCT * 100:g}% | "
+        f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe=15Min"
     )
     log.info("=" * 78)
 
