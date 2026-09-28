@@ -1,9 +1,9 @@
 # tradingbots
 
 Small, paper/demo-only trading bots against different brokers' APIs.
-**Nothing in this repo trades real money.** Only the Alpaca bot's trades are
-genuinely small ($2 each); the IG bots' trades are far bigger than their $2
-setting suggests — see [IG position sizing](#ig-position-sizing-both-ig-bots).
+**Nothing in this repo trades real money.** Only the Alpaca bots' trades are
+genuinely small ($2 and $20 each); the IG bots' trades are far bigger than
+their $2 setting suggests — see [IG position sizing](#ig-position-sizing-both-ig-bots).
 
 ## EMA crossover strategy (`alpaca-ema-bot/`, `ig-cfd-ema-bot/`)
 
@@ -12,8 +12,8 @@ setting suggests — see [IG position sizing](#ig-position-sizing-both-ig-bots).
 - Sell / close: 9-period EMA crosses **below** the 21-period EMA
 - Risk management: 2% stop-loss / 5% take-profit from the position's entry price
 
-`ig-momentum-scanner-bot/` runs a different, higher-risk momentum strategy —
-see its own section below.
+`ig-momentum-scanner-bot/` and `alpaca-momentum-scanner-bot/` run a
+different, higher-risk momentum strategy — see their own sections below.
 
 ## Bots
 
@@ -144,6 +144,52 @@ dated futures, the plainest name (`BP PLC` over `BP PLC - Pfd`), and the
 **smallest contract size** — e.g. US 500 at £1 a point rather than $250, and
 FX "Mini" contracts. It logs every candidate, so if a pick is wrong, change
 that `DEFAULT_POOL` entry to `Name:EPIC`.
+
+### `alpaca-momentum-scanner-bot/` — built for a $100 account, buys only
+
+The IG momentum scanner's signal, moved to Alpaca so it can trade small
+amounts: IG's smallest trade is thousands of pounds of exposure, while
+Alpaca sells fractions of a US share from $1. It scans ~30 liquid US large
+caps (override with `BOT_POOL`) on 15-minute bars during regular market
+hours (9:30–16:00 New York, 14:30–21:00 UK):
+
+- Buy: 3 consecutive higher closes in a row
+- Sell (close): 3 consecutive lower closes in a row, a 2% stop-loss or a 5%
+  take-profit
+
+**Buys only.** Fractional shares can't be sold short on Alpaca, and short
+selling needs a $2,000+ margin account, so a falling streak only ever closes
+a position.
+
+**Sizing:** a $100 budget (`BOT_BUDGET_USD`) split into 5 slices
+(`BOT_MAX_POSITIONS`), so each buy is $20 and a stop-loss costs about $0.40.
+Once 5 positions are open, further buy signals are skipped; when several
+shares signal at once, the strongest rise gets the slot first. It sizes
+from the budget, not the account, so it trades the same on Alpaca's default
+$100,000 paper account as on a real $100 one — but there, losses don't
+shrink the budget the way real ones would.
+
+```bash
+pip install -r alpaca-momentum-scanner-bot/requirements.txt   # same deps as alpaca-ema-bot/
+export APCA_API_KEY_ID="your_paper_key_id"
+export APCA_API_SECRET_KEY="your_paper_secret_key"
+python alpaca-momentum-scanner-bot/alpaca_momentum_scanner_bot.py
+```
+
+Differences from the IG scanner worth knowing:
+
+- **Real price history, no warm-up.** Alpaca's free IEX feed gives the
+  whole pool's 15-minute bars in one request, and shares work.
+- **Closed bars only.** The signal is judged on completed bars, so it can't
+  flicker on and off within a bar, and a share is bought at most once per
+  bar — a stop-loss doesn't immediately re-buy on the same streak.
+- **Stop-loss and take-profit are checked by the bot** (every minute), not
+  the broker: Alpaca can't attach them to fractional orders. They only work
+  while the bot is running and the market is open, and positions are held
+  overnight, so a gap at the next open can go well past 2%.
+
+Don't run it alongside `alpaca-ema-bot/` on the same paper account — both
+trade AAPL, MSFT and friends, and each would close the other's positions.
 
 ## IG position sizing (both IG bots)
 
