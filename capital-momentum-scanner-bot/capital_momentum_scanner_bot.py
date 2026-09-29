@@ -583,12 +583,12 @@ def closed_trades(markets, open_ids: set, quotes_rates: dict) -> list:
     ]
 
     trades = []
-    for deal_id, history in deals.items():
+    for deal_id, steps in deals.items():
         if deal_id in open_ids:
             continue
-        history.sort(key=lambda a: a["dateUTC"])
-        close = history[-1]
-        opening = history[0]["details"] if len(history) > 1 else _seen_open.get(deal_id)
+        steps.sort(key=lambda a: a["dateUTC"])
+        close = steps[-1]
+        opening = steps[0]["details"] if len(steps) > 1 else _seen_open.get(deal_id)
         if opening is None or opening["direction"] == close["details"]["direction"]:
             continue  # only its opening is in the last day's history
         epic, closed_at = close["epic"], utc_seconds(close["dateUTC"])
@@ -618,7 +618,7 @@ def closed_trades(markets, open_ids: set, quotes_rates: dict) -> list:
             "size": size,
             "entryPrice": entry,
             "exitPrice": exit_price,
-            "openedAt": utc_seconds(history[0]["dateUTC"]) if len(history) > 1 else opening.get("openedAt"),
+            "openedAt": utc_seconds(steps[0]["dateUTC"]) if len(steps) > 1 else opening.get("openedAt"),
             "closedAt": closed_at,
             "pnl": pnl,
             "closeReason": reason,
