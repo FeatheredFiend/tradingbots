@@ -70,12 +70,13 @@ This script only ever talks to Capital.com's demo endpoint
 (https://demo-api-capital.backend-capital.com). It never places live-money orders.
 """
 
+import json
 import logging
 import math
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -513,6 +514,10 @@ CLOSE_SOURCES = {"SL": "stop-loss", "TP": "take-profit", "CLOSE_OUT": "margin cl
                  "DEALER": "closed by Capital.com", "SYSTEM": "closed by Capital.com"}
 _seen_open = {}  # deal ID -> the position as last seen open, for trades opened over a day ago
 _last_report_problem = None
+# The first dashboard report after a start looks back this far, so trades that
+# closed while the bot was stopped still reach the dashboard; later ones a day.
+HISTORY_BACKFILL_DAYS = 7
+_backfilled = False
 
 
 def dashboard_position(item: dict) -> dict:
@@ -533,23 +538,48 @@ def dashboard_position(item: dict) -> dict:
     }
 
 
+def history(path: str, key: str, **params) -> list:
+    """Capital.com's activity or transaction history for the last day - or,
+    on the first report, the last HISTORY_BACKFILL_DAYS days, a day per
+    request (the most the activity history takes in one)."""
+    if _backfilled:
+        return capital("GET", path, params={**params, "lastPeriod": 86400}).get(key, [])
+    items, seen = [], set()
+    end = datetime.now(timezone.utc)
+    for day in range(HISTORY_BACKFILL_DAYS):
+        window = {"from": (end - timedelta(days=day + 1)).strftime("%Y-%m-%dT%H:%M:%S"),
+                  "to": (end - timedelta(days=day)).strftime("%Y-%m-%dT%H:%M:%S")}
+        for item in capital("GET", path, params={**params, **window}).get(key, []):
+            identity = json.dumps(item, sort_keys=True)  # one on a day boundary comes twice
+            if identity not in seen:
+                seen.add(identity)
+                items.append(item)
+    return items
+
+
 def closed_trades(markets, open_ids: set, quotes_rates: dict) -> list:
-    """The last day's closed trades in this bot's markets. Capital.com has no
-    list of closed trades, so they're pieced together: the opening and
-    closing deal from the activity history (the source says whether a
-    stop-loss or take-profit did it), and the realised profit from the
-    transaction history closed at the same moment."""
-    activities = capital("GET", "/history/activity",
-                         params={"lastPeriod": 86400, "detailed": "true", "filter": "type==POSITION"})
-    transactions = capital("GET", "/history/transactions", params={"lastPeriod": 86400, "type": "TRADE"})
+    """Recent closed trades in this bot's markets. Capital.com has no list of
+    closed trades, so they're pieced together: the opening and closing deal
+    from the activity history (the source says whether a stop-loss or
+    take-profit did it), and the realised profit from the transaction
+    history - by deal ID, or for a transaction without one, the one in the
+    same market closed at the same moment."""
+    global _backfilled
+    activities = history("/history/activity", "activities", detailed="true", filter="type==POSITION")
+    transactions = history("/history/transactions", "transactions", type="TRADE")
+    _backfilled = True
 
     deals = {}
-    for a in activities.get("activities", []):
+    for a in activities:
         if a.get("epic") in markets and a.get("status") != "REJECTED" and a.get("details"):
             deals.setdefault(a["dealId"], []).append(a)
+    by_deal = {}
+    for t in transactions:
+        if t.get("dealId"):
+            by_deal[t["dealId"]] = by_deal.get(t["dealId"], 0.0) + float(t["size"])
     profits = [
         {"at": utc_seconds(t["dateUtc"]), "market": str(t.get("instrumentName", "")).upper(), "pnl": float(t["size"])}
-        for t in transactions.get("transactions", []) if t.get("dateUtc")
+        for t in transactions if t.get("dateUtc") and not t.get("dealId")
     ]
 
     trades = []
@@ -566,9 +596,12 @@ def closed_trades(markets, open_ids: set, quotes_rates: dict) -> list:
         sign = 1 if opening["direction"] == "BUY" else -1
 
         names = {epic.upper(), str(close["details"].get("marketName", "")).upper()}
-        match = min((p for p in profits if p["market"] in names and abs(p["at"] - closed_at) <= 120),
-                    key=lambda p: abs(p["at"] - closed_at), default=None)
-        if match is not None:
+        match = None if deal_id in by_deal else min(
+            (p for p in profits if p["market"] in names and abs(p["at"] - closed_at) <= 120),
+            key=lambda p: abs(p["at"] - closed_at), default=None)
+        if deal_id in by_deal:
+            pnl = round(by_deal[deal_id], 2)
+        elif match is not None:
             profits.remove(match)
             pnl = match["pnl"]
         else:  # estimated at today's exchange rate, without costs

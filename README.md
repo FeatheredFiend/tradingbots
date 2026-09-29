@@ -804,7 +804,7 @@ to 2,000 log lines to send later. What each broker can report:
 | Pepperstone | yes - trades matched from MT5's deal history by the bot's magic number | none (local terminal) |
 | Capital.com | yes - trades pieced together from the activity and transaction history, with why they closed | 16 a minute |
 | Alpaca | yes - trades as the bot closes them, priced at Alpaca's value just before the sell | 8 a minute |
-| IG scanner | yes - but no profit per open position (IG's REST API doesn't give one; the account's unrealised total is exact); trades from the transaction history every 5 minutes | about 1.2 a minute, inside its pacing |
+| IG scanner | yes - each open position's profit is worked out by the bot (IG's REST API doesn't give one: move x size x contract size, converted at IG's own rate); trades from the transaction history every 5 minutes | about 1.2 a minute, inside its pacing |
 | IG EMA bot | log and running status only | none |
 | Strategy bots | as their broker's bots above, but only the bot's own positions and trades; its Settings tab lists every setting it started with | as their broker's bots |
 

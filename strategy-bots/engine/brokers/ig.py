@@ -76,6 +76,12 @@ def _utc_seconds(value):
         return None
 
 
+def _history_market_name(name) -> str:
+    """A transaction in a market dealt in another currency names it e.g.
+    'GBP/EUR Mini converted at 0.864586683820944'."""
+    return re.sub(r"\s+converted at [\d.]+$", "", str(name or ""))
+
+
 def _mid(price: dict):
     bid, ask = _number(price.get("bid")), _number(price.get("ask"))
     if bid is None or ask is None:
@@ -264,6 +270,22 @@ class IGBroker(Broker):
     def _open_positions(self):
         return self._call("open positions", IGService.fetch_open_positions)
 
+    def _pnl(self, row, market: Market):
+        """An open deal's profit in the account's currency - IG's REST API
+        doesn't give it. The move x size x contract size, in the deal's
+        currency, converted at the rate IG gave when the market was resolved
+        (its market details list each currency's "baseExchangeRate")."""
+        is_long = row["direction"] == "BUY"
+        close, level = _number(row["bid"] if is_long else row["offer"]), _number(row["level"])
+        size, contract_size = _number(row["size"]), _number(row.get("contractSize"))
+        currency = row.get("currency")
+        rate = 1.0 if currency == self.currency_code else next(
+            (_number(c.get("baseExchangeRate")) for c in (market.raw.get("instrument") or {}).get("currencies") or ()
+             if c.get("code") == currency), None)
+        if None in (close, level, size, contract_size) or not rate:
+            return None
+        return round((close - level) * (1 if is_long else -1) * size * contract_size / rate, 2)
+
     def positions(self, markets: dict) -> dict:
         frame = self._open_positions()
         own, others = {}, {}
@@ -280,11 +302,13 @@ class IGBroker(Broker):
             if held is None:
                 held = book[epic] = Position(
                     epic, "long" if row["direction"] == "BUY" else "short", 0.0, 0.0,
-                    opened_at=_utc_seconds(row.get("createdDateUTC")),
+                    opened_at=_utc_seconds(row.get("createdDateUTC")), pnl=0.0,
                     stop=_number(row.get("stopLevel")), take_profit=_number(row.get("limitLevel")), raw=[],
                     own=is_own)
             held.entry = (held.entry * held.size + level * size) / (held.size + size)
             held.size += size
+            pnl = self._pnl(row, markets[epic])
+            held.pnl = None if pnl is None or held.pnl is None else held.pnl + pnl
             held.raw.append((row["dealId"], row["direction"], size))
         return {**others, **own}
 
@@ -379,7 +403,7 @@ class IGBroker(Broker):
                 report["positions"].append({
                     "ref": p["dealId"], "symbol": markets[p["epic"]].name, "direction": "long" if is_long else "short",
                     "size": _number(p["size"]), "entryPrice": _number(p["level"]),
-                    "currentPrice": _number(p["bid"] if is_long else p["offer"]),
+                    "currentPrice": _number(p["bid"] if is_long else p["offer"]), "pnl": self._pnl(p, markets[p["epic"]]),
                     "stopLoss": _number(p.get("stopLevel")), "takeProfit": _number(p.get("limitLevel")),
                     "openedAt": _utc_seconds(p.get("createdDateUTC")),
                 })
@@ -399,11 +423,12 @@ class IGBroker(Broker):
         for _, t in history.iterrows():
             size = _number(str(t.get("size", "")).replace("+", ""))
             closed_at = _utc_seconds(t.get("dateUtc"))
-            if t.get("instrumentName") not in names or not t.get("reference") or not size or closed_at is None:
+            name = _history_market_name(t.get("instrumentName"))
+            if name not in names or not t.get("reference") or not size or closed_at is None:
                 continue
             profit = t.get("profitAndLoss")
             trades.append({
-                "ref": str(t["reference"]), "symbol": t["instrumentName"], "direction": "short" if size < 0 else "long",
+                "ref": str(t["reference"]), "symbol": name, "direction": "short" if size < 0 else "long",
                 "size": abs(size), "entryPrice": _number(t.get("openLevel")), "exitPrice": _number(t.get("closeLevel")),
                 "openedAt": _utc_seconds(t.get("openDateUtc")), "closedAt": closed_at,
                 "pnl": _number(re.sub(r"[^\d.\-]", "", profit)) if isinstance(profit, str) else _number(profit),

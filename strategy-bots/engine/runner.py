@@ -71,6 +71,10 @@ MAX_CONSECUTIVE_ERRORS = 10
 ROLLOVER_QUIET = (15, 45)        # minutes before / after the rollover without new trades
 PRICE_CLOSE_RETRY_SECONDS = 20   # the scalper holds for minutes, so a failed close is retried sooner
 STATUS_EVERY_SECONDS = 300       # the scalper logs each market's state this often (it reads every few seconds)
+# After a trade opens or closes, report to the dashboard this many seconds
+# later, not at the next 15-second snapshot: soon, then again once the
+# broker's history lists the close with its profit.
+TRADE_REPORT_DELAYS = (1, 8)
 
 
 def make_broker(key: str, settings, dashboard, log):
@@ -418,6 +422,7 @@ class StrategyBot:
                 changed = True
                 self.log.info(f"{symbol}: the bot's {notes.get('direction', '')} position has closed - by its "
                               f"stop-loss or take-profit at {self.broker.name}, or by hand.")
+                self.dashboard.report_soon(*TRADE_REPORT_DELAYS)
         for symbol, position in own.items():
             notes = self.state.positions.get(symbol)
             if notes is None or notes.get("direction") != position.direction:  # e.g. the notes file was lost
@@ -479,6 +484,7 @@ class StrategyBot:
             self.state.positions.pop(market.symbol, None)
             self.state.save()
             self.close_retry_at.pop(market.symbol, None)
+            self.dashboard.report_soon(*TRADE_REPORT_DELAYS)
             return True
         self.close_retry_at[market.symbol] = now + retry
         self.log.warning(f"{market.symbol}: will try closing again in {retry}s.")
@@ -635,6 +641,7 @@ class StrategyBot:
             self.state.own_ids = sorted(self.broker.own_ids)
             self.state.count_trade(symbol, day)
             self.state.save()
+            self.dashboard.report_soon(TRADE_REPORT_DELAYS[0])
 
     def broker_levels(self, market, quote, sign: int, entry: float, stop: float, take_profit) -> tuple:
         """The stop-loss / take-profit to put on the order. The scalper's are

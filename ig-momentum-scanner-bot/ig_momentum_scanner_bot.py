@@ -309,6 +309,21 @@ def deal_currency(instrument: dict) -> str:
     return next((c["code"] for c in currencies if c.get("isDefault")), codes[0])
 
 
+# currency -> how much of it one unit of the account's currency buys (USD:
+# 1.32 on a GBP account), as IG's market details last gave it. For putting
+# open positions' profit in the account's currency on the dashboard.
+_exchange_rates = {}
+
+
+def note_exchange_rates(instrument: dict) -> None:
+    """Every market's details list the currencies it deals in, each with
+    IG's rate against the account's currency ("baseExchangeRate")."""
+    for currency in instrument.get("currencies") or ():
+        rate = _number(currency.get("baseExchangeRate"))
+        if currency.get("code") and rate:
+            _exchange_rates[currency["code"]] = rate
+
+
 def fetch_market_details(ig_service: IGService, epic: str) -> Optional[dict]:
     _rate_limiter.wait()
     try:
@@ -324,6 +339,7 @@ def fetch_market_details(ig_service: IGService, epic: str) -> Optional[dict]:
         instrument = market["instrument"]
         dealing_rules = market["dealingRules"]
         snapshot = market["snapshot"]
+        note_exchange_rates(instrument)
         return {
             "expiry": instrument.get("expiry", "-"),
             "currency": deal_currency(instrument),
@@ -648,10 +664,25 @@ def _utc_seconds(value) -> Optional[float]:
         return None
 
 
+def position_pnl(p) -> Optional[float]:
+    """An open position's profit in the account's currency. IG's REST API
+    doesn't give it, so it's worked out the way IG books it: the move since
+    opening x size x contract size, in the position's currency, converted
+    at IG's rate. Checked against IG's account total and its closed-trade
+    history. None until a rate for a foreign-currency position is known
+    (the first pass fetches them)."""
+    is_long = p["direction"] == "BUY"
+    close, level = _number(p["bid"] if is_long else p["offer"]), _number(p["level"])
+    size, contract_size = _number(p["size"]), _number(p.get("contractSize"))
+    currency = p.get("currency")
+    rate = 1.0 if currency == CURRENCY_CODE else _exchange_rates.get(currency)
+    if None in (close, level, size, contract_size) or not rate:
+        return None
+    return round((close - level) * (1 if is_long else -1) * size * contract_size / rate, 2)
+
+
 def dashboard_positions(positions: Optional[pd.DataFrame], pool: list) -> list:
-    """This bot's open positions in the dashboard's shape. IG's REST API
-    gives no per-position profit, so that's left out — the account's
-    unrealised total, sent with the balance, is exact."""
+    """This bot's open positions in the dashboard's shape."""
     names = {item["epic"]: item["name"] for item in pool}
     rows = []
     if positions is None or len(positions) == 0:
@@ -667,6 +698,7 @@ def dashboard_positions(positions: Optional[pd.DataFrame], pool: list) -> list:
             "size": _number(p["size"]),
             "entryPrice": _number(p["level"]),
             "currentPrice": _number(p["bid"] if is_long else p["offer"]),
+            "pnl": position_pnl(p),
             "stopLoss": _number(p.get("stopLevel")),
             "takeProfit": _number(p.get("limitLevel")),
             "openedAt": _utc_seconds(p.get("createdDateUTC")),
@@ -688,6 +720,12 @@ def fetch_account(ig_service: IGService) -> Optional[dict]:
     return {"balance": balance, "equity": balance + (unrealized or 0.0), "unrealizedPl": unrealized}
 
 
+def history_market_name(name) -> str:
+    """The market's name as a transaction gives it. A market dealt in another
+    currency comes as e.g. 'GBP/EUR Mini converted at 0.864586683820944'."""
+    return re.sub(r"\s+converted at [\d.]+$", "", str(name or ""))
+
+
 def fetch_closed_trades(ig_service: IGService, pool: list) -> list:
     """Closed trades in this bot's markets over the last week, from IG's
     transaction history (which has the realised profit, costs included)."""
@@ -701,11 +739,12 @@ def fetch_closed_trades(ig_service: IGService, pool: list) -> list:
     for _, t in history.iterrows():
         size = _number(str(t.get("size", "")).replace("+", ""))
         closed_at = _utc_seconds(t.get("dateUtc"))
-        if t.get("instrumentName") not in names or not t.get("reference") or not size or closed_at is None:
+        name = history_market_name(t.get("instrumentName"))
+        if name not in names or not t.get("reference") or not size or closed_at is None:
             continue
         trades.append({
             "ref": str(t["reference"]),
-            "symbol": t["instrumentName"],
+            "symbol": name,
             "direction": "short" if size < 0 else "long",
             "size": abs(size),
             "entryPrice": _number(t.get("openLevel")),

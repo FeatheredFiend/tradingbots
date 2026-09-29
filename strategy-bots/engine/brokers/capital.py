@@ -9,9 +9,10 @@ markets side by side, give each its own demo account
 (<BROKER>_<STRATEGY>_ACCOUNT_ID, falling back to CAPITAL_ACCOUNT_ID).
 """
 
+import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -25,6 +26,9 @@ RESOLUTION = {"M5": "MINUTE_5", "M15": "MINUTE_15", "M30": "MINUTE_30", "H1": "H
 TIMEFRAME_SECONDS = {"M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400}
 CLOSE_SOURCES = {"SL": "stop-loss", "TP": "take-profit", "CLOSE_OUT": "margin close-out",
                  "DEALER": "closed by Capital.com", "SYSTEM": "closed by Capital.com"}
+# The first dashboard report after a start looks back this far, so trades that
+# closed while the bot was stopped still reach the dashboard; later ones a day.
+HISTORY_BACKFILL_DAYS = 7
 
 
 def utc_seconds(text: str) -> float:
@@ -61,6 +65,7 @@ class CapitalBroker(Broker):
         self._http = requests.Session()
         self._last_request = 0.0
         self._seen_open = {}         # deal ID -> the position as last seen open, for trades opened over a day ago
+        self._backfilled = False     # whether a report has looked back HISTORY_BACKFILL_DAYS yet
         self._last_report_problem = None
 
     # -- client -------------------------------------------------------------------
@@ -347,20 +352,43 @@ class CapitalBroker(Broker):
             trades=trades,
         )
 
+    def _history(self, path: str, key: str, **params) -> list:
+        """Capital.com's activity or transaction history for the last day - or,
+        on the first report, the last HISTORY_BACKFILL_DAYS days, a day per
+        request (the most the activity history takes in one)."""
+        if self._backfilled:
+            return self._call("GET", path, params={**params, "lastPeriod": 86400}).get(key, [])
+        items, seen = [], set()
+        end = datetime.now(timezone.utc)
+        for day in range(HISTORY_BACKFILL_DAYS):
+            window = {"from": (end - timedelta(days=day + 1)).strftime("%Y-%m-%dT%H:%M:%S"),
+                      "to": (end - timedelta(days=day)).strftime("%Y-%m-%dT%H:%M:%S")}
+            for item in self._call("GET", path, params={**params, **window}).get(key, []):
+                identity = json.dumps(item, sort_keys=True)  # one on a day boundary comes twice
+                if identity not in seen:
+                    seen.add(identity)
+                    items.append(item)
+        return items
+
     def _closed_trades(self, markets, open_ids: set) -> list:
-        """The last day's closed trades in the bot's markets, pieced together as
+        """Recent closed trades in the bot's markets, pieced together as
         capital-momentum-scanner-bot/ does: opening and closing deals from the
-        activity history, realised profit from the transaction history."""
-        activities = self._call("GET", "/history/activity",
-                                params={"lastPeriod": 86400, "detailed": "true", "filter": "type==POSITION"})
-        transactions = self._call("GET", "/history/transactions", params={"lastPeriod": 86400, "type": "TRADE"})
+        activity history, realised profit from the transaction history (by
+        deal ID; by market and time for a transaction without one)."""
+        activities = self._history("/history/activity", "activities", detailed="true", filter="type==POSITION")
+        transactions = self._history("/history/transactions", "transactions", type="TRADE")
+        self._backfilled = True
         deals = {}
-        for a in activities.get("activities", []):
+        for a in activities:
             if (a.get("epic") in markets and a.get("dealId") in self.own_ids and a.get("status") != "REJECTED"
                     and a.get("details")):
                 deals.setdefault(a["dealId"], []).append(a)
+        by_deal = {}
+        for t in transactions:
+            if t.get("dealId"):
+                by_deal[t["dealId"]] = by_deal.get(t["dealId"], 0.0) + float(t["size"])
         profits = [{"at": utc_seconds(t["dateUtc"]), "market": str(t.get("instrumentName", "")).upper(),
-                    "pnl": float(t["size"])} for t in transactions.get("transactions", []) if t.get("dateUtc")]
+                    "pnl": float(t["size"])} for t in transactions if t.get("dateUtc") and not t.get("dealId")]
         trades = []
         for deal_id, history in deals.items():
             if deal_id in open_ids:
@@ -372,11 +400,14 @@ class CapitalBroker(Broker):
                 continue
             epic, closed_at = close["epic"], utc_seconds(close["dateUTC"])
             entry, exit_price, size = float(opening["level"]), float(close["details"]["level"]), float(opening["size"])
-            names = {epic.upper(), str(close["details"].get("marketName", "")).upper()}
-            match = min((p for p in profits if p["market"] in names and abs(p["at"] - closed_at) <= 120),
-                        key=lambda p: abs(p["at"] - closed_at), default=None)
-            if match is not None:
-                profits.remove(match)
+            pnl = by_deal.get(deal_id)
+            if pnl is None:
+                names = {epic.upper(), str(close["details"].get("marketName", "")).upper()}
+                match = min((p for p in profits if p["market"] in names and abs(p["at"] - closed_at) <= 120),
+                            key=lambda p: abs(p["at"] - closed_at), default=None)
+                if match is not None:
+                    profits.remove(match)
+                    pnl = match["pnl"]
             source = close.get("source")
             reason = self.close_reasons.get(deal_id, "closed by the bot or by hand") if source == "USER" \
                 else CLOSE_SOURCES.get(source, source)
@@ -384,6 +415,6 @@ class CapitalBroker(Broker):
                 "ref": deal_id, "symbol": epic, "direction": "long" if opening["direction"] == "BUY" else "short",
                 "size": size, "entryPrice": entry, "exitPrice": exit_price,
                 "openedAt": utc_seconds(history[0]["dateUTC"]) if len(history) > 1 else opening.get("openedAt"),
-                "closedAt": closed_at, "pnl": match["pnl"] if match else None, "closeReason": reason,
+                "closedAt": closed_at, "pnl": None if pnl is None else round(pnl, 2), "closeReason": reason,
             })
         return trades

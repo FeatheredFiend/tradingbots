@@ -81,6 +81,8 @@ class DashboardReporter:
         self._sent_trades = {}        # ref -> trade, as the dashboard last received it
         self._status = "running"
         self._last_snapshot = 0.0
+        self._soon = []               # monotonic times due() comes round early - see report_soon()
+        self._send_now = False        # the next update() goes out straight away, not with the next report
         self._last_complaint = 0.0
         self._stop = threading.Event()
         self._thread = None
@@ -162,13 +164,30 @@ class DashboardReporter:
             self._last_snapshot = 0.0
         return ran
 
+    def report_soon(self, *delays: float) -> None:
+        """Make due() come round after each of these delays in seconds
+        (straight away with none), besides its usual beat, and send what it
+        gathers at once - after the bot trades, so the dashboard shows it in
+        seconds. A second, later delay catches a broker whose history takes
+        a moment to list a trade that just closed."""
+        if self.enabled:
+            now = time.monotonic()
+            self._soon.extend(now + delay for delay in delays or (0,))
+
     def due(self, every: float = None) -> bool:
         """True every SNAPSHOT_EVERY_SECONDS (or `every`, for a broker that
-        rations requests) - time to gather a snapshot for update(). Always
-        False when reporting is off, so the bot makes no extra calls."""
-        if not self.enabled or time.monotonic() - self._last_snapshot < (every or SNAPSHOT_EVERY_SECONDS):
+        rations requests), or when report_soon() asked - time to gather a
+        snapshot for update(). Always False when reporting is off, so the bot
+        makes no extra calls."""
+        if not self.enabled:
             return False
-        self._last_snapshot = time.monotonic()
+        now = time.monotonic()
+        if any(at <= now for at in self._soon):
+            self._soon = [at for at in self._soon if at > now]
+            self._send_now = True
+        elif now - self._last_snapshot < (every or SNAPSHOT_EVERY_SECONDS):
+            return False
+        self._last_snapshot = now
         return True
 
     def sleep(self, seconds: float, report, every: float = None) -> None:
@@ -203,8 +222,9 @@ class DashboardReporter:
                 self._positions = positions
             for trade in trades or ():
                 self._trades[str(trade["ref"])] = trade
-            if self._answers:
-                self._wake.set()  # a command's answer goes out now, not in up to 10 s
+            if self._answers or self._send_now:
+                self._send_now = False
+                self._wake.set()  # a command's answer, or a trade, goes out now, not in up to 10 s
 
     def trade(self, trade: dict) -> None:
         """Record one trade as it happens (e.g. a close the bot made itself)."""
