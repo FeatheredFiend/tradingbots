@@ -22,6 +22,11 @@ Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
 - Risk mgmt : 2% stop-loss / 5% take-profit by default (STOP_LOSS_PERCENT /
   TAKE_PROFIT_PERCENT env vars, shared with the other scanners), attached
   to the order, so OANDA enforces them even while the bot isn't running.
+- Overnight : the trades it opened are closed 15 minutes before the daily
+  rollover (22:00 UK), so no overnight financing is paid, and nothing new
+  opens from an hour before it to 45 minutes after (SCANNER_FLAT_MINUTES /
+  SCANNER_LAST_ENTRY_MINUTES, 0 = off; see shared/rollover.py). It knows
+  its own trades by the IDs saved in own_trades.json beside it.
 
 Sizing
 ------
@@ -82,6 +87,7 @@ import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
+import rollover  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -123,6 +129,7 @@ LOOP_INTERVAL_SECONDS = min(30, BAR_SECONDS // 4)  # how often to look for newly
 REQUEST_TIMEOUT_SECONDS = 20
 ERROR_BACKOFF_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
+OWN_TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "own_trades.json")
 
 assert STREAK_LENGTH >= 2, "STREAK_LENGTH must be at least 2 to mean anything"
 assert MAX_OPEN_POSITIONS >= 1, "OANDA_MAX_POSITIONS must be at least 1"
@@ -142,6 +149,7 @@ log = logging.getLogger("oanda_momentum_bot")
 
 # Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
 dashboard = DashboardReporter("oanda-momentum-scanner", "OANDA momentum scanner", broker="OANDA", strategy="Momentum streak")
+own_trades = rollover.OwnTrades(OWN_TRADES_FILE)  # the trades this bot opened - only these close before the rollover
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +340,9 @@ def fill_outcome(body: dict, prefix: str) -> tuple:
 def open_position(account_id: str, symbol: str, instrument: dict, price: dict, direction: str,
                   currency: str) -> bool:
     """Market order with the stop-loss and take-profit attached. True if it filled."""
+    if rollover.entries_paused():
+        log.info(f"{symbol}: {direction} signal, but it's too near the daily rollover to open a trade; skipping.")
+        return False
     units = units_for_slice(instrument, price["unit_value"])
     if units == 0:
         log.info(f"{symbol}: {direction} signal, but its smallest trade is now worth more than a slice; skipping.")
@@ -354,6 +365,7 @@ def open_position(account_id: str, symbol: str, instrument: dict, price: dict, d
         log.error(f"Error submitting {direction} for {symbol}: {e}")
         return False
     filled, outcome = fill_outcome(body, "order")
+    own_trades.add(((body.get("orderFillTransaction") or {}).get("tradeOpened") or {}).get("tradeID"))
     log.info(
         f"{direction} submitted -> {symbol} units={order['units']} "
         f"(~{units * price['unit_value']:,.2f} {currency}) stop={order['stopLossOnFill']['price']} "
@@ -375,6 +387,26 @@ def close_position(account_id: str, symbol: str, position: dict, reason: str) ->
     for closed in (body.get(f"{side}OrderFillTransaction") or {}).get("tradesClosed", []):
         CLOSE_REASONS[closed["tradeID"]] = reason
     return filled
+
+
+def close_before_rollover(account_id: str) -> None:
+    """Close every trade this bot opened, so none is charged a night's
+    financing. Other bots' and hand-made trades are left alone."""
+    trades = oanda("GET", f"/v3/accounts/{account_id}/openTrades").get("trades", [])
+    own_trades.keep_open(t["id"] for t in trades)
+    for trade in trades:
+        if trade["id"] not in own_trades:
+            continue
+        try:
+            body = oanda("PUT", f"/v3/accounts/{account_id}/trades/{trade['id']}/close")
+        except (OandaError, requests.RequestException) as e:
+            log.error(f"Error closing {trade['instrument']} trade {trade['id']} ({rollover.REASON}): {e}")
+            continue
+        filled, outcome = fill_outcome(body, "order")
+        log.info(f"CLOSE submitted ({rollover.REASON}) -> {trade['instrument']} trade {trade['id']} "
+                 f"{float(trade['currentUnits']):+g} units result={outcome}")
+        if filled:
+            CLOSE_REASONS[trade["id"]] = rollover.REASON
 
 
 def close_from_dashboard(account_id: str, markets: dict, symbol: str, ref, direction: str, size) -> str:
@@ -552,6 +584,7 @@ def run_bot() -> None:
         f"Streak length={STREAK_LENGTH} bars | Stop-loss={STOP_LOSS_PCT * 100:g}% | "
         f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe={TIMEFRAME}"
     )
+    log.info(rollover.describe())
     log.info("=" * 78)
     dashboard.describe(account=account_id, currency=currency, config={
         "markets": list(pool), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
@@ -567,6 +600,8 @@ def run_bot() -> None:
         try:
             if dashboard.due():
                 report_to_dashboard(account_id, pool)
+            if rollover.flat_due():
+                close_before_rollover(account_id)
 
             latest = {}
             for symbol in pool:

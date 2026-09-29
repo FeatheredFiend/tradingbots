@@ -375,6 +375,34 @@ has no list of closed trades, so for the dashboard they're pieced together
 from the activity history (entry, exit, and whether a stop-loss or
 take-profit closed it) and the transaction history (the realised profit).
 
+### Overnight: the CFD scanners close before the rollover (`shared/rollover.py`)
+
+A CFD position still open at the daily rollover (17:00 New York: 22:00 UK
+most of the year, 21:00 in the weeks the UK and US change their clocks on
+different dates) is charged a night's financing. In September 2026 an index
+long cost about £1.70-£2.20 a night per £10,000 of exposure, and a Brent
+short at OANDA over £13. That's about one or two spreads, and a 3-bar streak
+is long over by then. So by default the OANDA, Pepperstone, Capital.com and
+IG scanners:
+
+- **close the trades they opened 15 minutes before the rollover**
+  (`SCANNER_FLAT_MINUTES`, default `15`: 21:45 UK), and
+- **open nothing from an hour before it until 45 minutes after**
+  (`SCANNER_LAST_ENTRY_MINUTES`, default `60`: 21:00-22:45 UK), when spreads are at their widest.
+
+`0` switches either part off; both `0` holds overnight as before. The
+startup log shows tonight's times. The Alpaca scanner buys shares with
+cash, which carries no overnight charge, so it isn't affected.
+
+**Only the scanner's own trades are closed.** Accounts are shared with other
+bots (the commodity-trend bot holds overnight on purpose) and with trades
+made by hand. Pepperstone's scanner knows its trades by magic number. The
+OANDA, Capital.com and IG scanners save the broker's ID for each trade they
+open to `own_trades.json` in their folder (gitignored). A trade opened
+before that file existed, or with the file deleted, is left to its
+stop-loss / take-profit as before. Reversal closes still treat every
+position in the scanner's markets as its own, as described above.
+
 ## Strategy bots (`strategy-bots/`)
 
 Four strategies, each on every broker - 19 bots, since Alpaca has no
@@ -682,8 +710,9 @@ python -m unittest discover -s strategy-bots\tests
 
 Clock and DST rules, indicators, each strategy's signals on made-up bars,
 and the runner's sizing, spread, rollover, slots, dry run and
-other-people's-positions rules against a fake broker. No broker is
-contacted.
+other-people's-positions rules against a fake broker. `test_rollover.py`
+covers the CFD scanners' close before the rollover: its timing, and that
+each closes only its own trades. No broker is contacted.
 
 ## IG position sizing (both IG bots)
 
@@ -874,8 +903,9 @@ e.g. `start_bot.bat oanda-momentum-scanner`.
 ## Repo layout
 
 Each momentum scanner and EMA bot lives in its own folder with its own
-`requirements.txt`; the one shared piece is `shared/dashboard_reporter.py`
-(standard library only). The strategy bots share `strategy-bots/engine/`
+`requirements.txt`; the shared pieces are `shared/dashboard_reporter.py`
+and `shared/rollover.py` (standard library only; the latter uses the
+strategy engine's `clock.py`). The strategy bots share `strategy-bots/engine/`
 and need nothing beyond their broker's existing requirements.
 Virtual environments (`*-bot-env/`) are gitignored — create your own per
 broker (all of a broker's bots share the same requirements).

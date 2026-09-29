@@ -21,6 +21,12 @@ Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
   TAKE_PROFIT_PERCENT env vars), attached natively to the order (same
   mechanism as ig_cfd_ema_bot.py — IG's CFD orders support this directly,
   no manual polling needed).
+- Overnight : the positions it opened are closed 15 minutes before the
+  daily rollover (22:00 UK), so no overnight funding is paid, and nothing
+  new opens from an hour before it to 45 minutes after
+  (SCANNER_FLAT_MINUTES / SCANNER_LAST_ENTRY_MINUTES, 0 = off; see
+  shared/rollover.py). It knows its own positions by the deal IDs saved
+  in own_trades.json beside it.
 
 Unlike ig_cfd_ema_bot.py, this bot can go SHORT (CFDs support it) — a
 genuinely different, higher-risk capability than the long-only Alpaca and
@@ -102,6 +108,7 @@ from trading_ig.rest import IGException
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
+import rollover  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -143,6 +150,7 @@ BARS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "momentum_b
 # closed-market gap IG's own bars have); stopping for hours while a market is
 # open means the bars either side of the gap are treated as consecutive.
 SAVED_BARS_MAX_AGE_HOURS = 16
+OWN_TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "own_trades.json")
 
 # Percent of the entry price, e.g. STOP_LOSS_PERCENT=0.5 for 0.5%. IG sets a
 # minimum stop/limit distance per market, so a very tight value can get a
@@ -178,6 +186,7 @@ log = logging.getLogger("ig_momentum_bot")
 
 # Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
 dashboard = DashboardReporter("ig-momentum-scanner", "IG momentum scanner", broker="IG", strategy="Momentum streak")
+own_trades = rollover.OwnTrades(OWN_TRADES_FILE)  # the positions this bot opened - only these close before the rollover
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +564,9 @@ def deal_outcome(result) -> str:
 
 
 def open_position(ig_service: IGService, epic: str, name: str, details: dict, price: float, direction: str) -> None:
+    if rollover.entries_paused():
+        log.info(f"{name} ({epic}): {direction} signal, but it's too near the daily rollover to open a trade; skipping.")
+        return
     # Always the market's minimum deal size — the smallest trade IG allows,
     # and still thousands of pounds of exposure (README: "IG position sizing").
     size = details["min_deal_size"]
@@ -567,13 +579,16 @@ def open_position(ig_service: IGService, epic: str, name: str, details: dict, pr
             limit_level=None, order_type="MARKET", quote_id=None, size=size,
             stop_distance=stop_distance, stop_level=None, trailing_stop=False, trailing_stop_increment=None,
         )
+        if isinstance(result, dict) and result.get("dealStatus") == "ACCEPTED":
+            own_trades.add(result.get("dealId"), *(d.get("dealId") for d in result.get("affectedDeals") or ()))
         log.info(f"{direction} submitted -> {name} ({epic}) size={size} {details['currency']} stop_dist={stop_distance} "
                  f"limit_dist={limit_distance} result={deal_outcome(result)}")
     except Exception as e:
         log.error(f"Error submitting {direction} for {name} ({epic}): {e}")
 
 
-def close_position(ig_service: IGService, epic: str, name: str, position: dict, details: dict, reason: str) -> None:
+def close_position(ig_service: IGService, epic: str, name: str, position: dict, details: dict, reason: str) -> bool:
+    """True if IG accepted the close."""
     close_direction = "SELL" if position["direction"] == "BUY" else "BUY"
     try:
         # Close by deal ID alone: IG rejects a close that also names the epic
@@ -582,9 +597,31 @@ def close_position(ig_service: IGService, epic: str, name: str, position: dict, 
             deal_id=position["deal_id"], direction=close_direction, epic=None, expiry=None,
             level=None, order_type="MARKET", quote_id=None, size=position["size"],
         )
-        log.info(f"CLOSE submitted ({reason}) -> {name} ({epic}) result={deal_outcome(result)}")
+        outcome = deal_outcome(result)
+        log.info(f"CLOSE submitted ({reason}) -> {name} ({epic}) result={outcome}")
+        return outcome == "ACCEPTED"
     except Exception as e:
         log.error(f"Error closing position for {name} ({epic}) ({reason}): {e}")
+        return False
+
+
+def close_before_rollover(ig_service: IGService, positions: Optional[pd.DataFrame], pool: list):
+    """Close every position this bot opened, so none is charged a night's
+    funding. Other bots' and hand-made positions are left alone. Returns
+    `positions` without the ones it closed."""
+    if positions is None or len(positions) == 0:
+        own_trades.keep_open(())
+        return positions
+    own_trades.keep_open(positions["dealId"])
+    names = {item["epic"]: item["name"] for item in pool}
+    closed = []
+    for _, row in positions.iterrows():
+        if row["dealId"] not in own_trades:
+            continue
+        position = {"deal_id": row["dealId"], "direction": row["direction"], "size": float(row["size"])}
+        if close_position(ig_service, row["epic"], names.get(row["epic"], row["epic"]), position, None, rollover.REASON):
+            closed.append(row["dealId"])
+    return positions[~positions["dealId"].isin(closed)]
 
 
 def close_from_dashboard(ig_service: IGService, pool: list, symbol: str, ref, direction: str, size) -> str:
@@ -846,6 +883,7 @@ def run_bot() -> None:
         log.warning(f"A pass over {len(pool)} markets takes about {pass_seconds:.0f}s at IG's pace, so each "
                     f"{BAR_SECONDS // 60}-minute bar gets only a sample or two per market; 5 minutes or longer "
                     f"suits this scanner.")
+    log.info(rollover.describe())
     log.info("=" * 78)
     dashboard.describe(account=_account_id, currency=CURRENCY_CODE, config={
         "markets": [item["name"] for item in pool], "timeframe": TIMEFRAME, "streakLength": STREAK_LENGTH,
@@ -867,6 +905,12 @@ def run_bot() -> None:
             consecutive_errors += 1
             sleep_after_error(consecutive_errors)
             continue
+        if rollover.flat_due():
+            try:
+                positions = close_before_rollover(ig_service, positions, pool)
+            except Exception as e:
+                pass_had_error = True
+                log.error(f"Error closing positions {rollover.REASON}: {e or 'empty response - likely rate limited'}")
         report_to_dashboard(ig_service, positions, pool)
 
         for item in pool:

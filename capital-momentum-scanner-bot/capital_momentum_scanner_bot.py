@@ -22,6 +22,11 @@ Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
 - Risk mgmt : 2% stop-loss / 5% take-profit by default (STOP_LOSS_PERCENT /
   TAKE_PROFIT_PERCENT env vars, shared with the other scanners), attached
   to the order, so Capital.com enforces them even while the bot isn't running.
+- Overnight : the positions it opened are closed 15 minutes before the
+  daily rollover (22:00 UK), so no overnight fee is paid, and nothing new
+  opens from an hour before it to 45 minutes after (SCANNER_FLAT_MINUTES /
+  SCANNER_LAST_ENTRY_MINUTES, 0 = off; see shared/rollover.py). It knows
+  its own positions by the deal IDs saved in own_trades.json beside it.
 
 Sizing
 ------
@@ -82,6 +87,7 @@ import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
+import rollover  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -126,6 +132,7 @@ REQUEST_TIMEOUT_SECONDS = 20
 MIN_REQUEST_INTERVAL = 0.15    # Capital.com allows 10 requests a second
 ERROR_BACKOFF_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
+OWN_TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "own_trades.json")
 
 assert STREAK_LENGTH >= 2, "STREAK_LENGTH must be at least 2 to mean anything"
 assert MAX_OPEN_POSITIONS >= 1, "CAPITAL_MAX_POSITIONS must be at least 1"
@@ -146,6 +153,7 @@ log = logging.getLogger("capital_momentum_bot")
 # Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
 dashboard = DashboardReporter("capital-momentum-scanner", "Capital.com momentum scanner", broker="Capital.com",
                               strategy="Momentum streak")
+own_trades = rollover.OwnTrades(OWN_TRADES_FILE)  # the positions this bot opened - only these close before the rollover
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +441,9 @@ def deal_outcome(confirmation: dict) -> tuple:
 
 def open_position(epic: str, market: dict, unit_value: float, direction: str, currency: str) -> bool:
     """Market order with the stop-loss and take-profit attached. True if accepted."""
+    if rollover.entries_paused():
+        log.info(f"{epic}: {direction} signal, but it's too near the daily rollover to open a trade; skipping.")
+        return False
     size = size_for_slice(market, unit_value)
     if size == 0:
         log.info(f"{epic}: {direction} signal, but its smallest trade is now worth more than a slice; skipping.")
@@ -450,10 +461,15 @@ def open_position(epic: str, market: dict, unit_value: float, direction: str, cu
         "profitLevel": round(entry * (1 + sign * TAKE_PROFIT_PCT), digits),
     }
     try:
-        accepted, outcome = deal_outcome(confirm(capital("POST", "/positions", json=order)["dealReference"]))
+        confirmation = confirm(capital("POST", "/positions", json=order)["dealReference"])
     except (CapitalError, requests.RequestException) as e:
         log.error(f"Error submitting {direction} for {epic}: {e}")
         return False
+    accepted, outcome = deal_outcome(confirmation)
+    if accepted:
+        # The position's deal ID is one of these (as the strategy bots' Capital.com adapter records them).
+        own_trades.add(confirmation.get("dealId"),
+                       *(d.get("dealId") for d in confirmation.get("affectedDeals") or ()))
     log.info(
         f"{direction} submitted -> {epic} size={size:g} (~{size * unit_value:,.2f} {currency}) "
         f"stop={order['stopLevel']} limit={order['profitLevel']} result={outcome}"
@@ -476,6 +492,26 @@ def close_position(epic: str, position: dict, reason: str) -> bool:
             CLOSE_REASONS[deal_id] = reason
         all_closed = all_closed and closed
     return all_closed
+
+
+def close_before_rollover() -> None:
+    """Close every position this bot opened, so none is charged an
+    overnight fee. Other bots' and hand-made positions are left alone."""
+    items = capital("GET", "/positions").get("positions", [])
+    own_trades.keep_open(i["position"]["dealId"] for i in items)
+    for item in items:
+        p, epic = item["position"], item["market"]["epic"]
+        if p["dealId"] not in own_trades:
+            continue
+        side = "long" if p["direction"] == "BUY" else "short"
+        try:
+            closed, outcome = deal_outcome(confirm(capital("DELETE", f"/positions/{p['dealId']}")["dealReference"]))
+        except (CapitalError, requests.RequestException) as e:
+            log.error(f"Error closing {epic} ({rollover.REASON}): {e}")
+            continue
+        log.info(f"CLOSE submitted ({rollover.REASON}) -> {epic} {side} {float(p['size']):g} result={outcome}")
+        if closed:
+            CLOSE_REASONS[p["dealId"]] = rollover.REASON
 
 
 def close_from_dashboard(markets: dict, symbol: str, ref, direction: str, size) -> str:
@@ -736,6 +772,7 @@ def run_bot() -> None:
         f"Streak length={STREAK_LENGTH} bars | Stop-loss={STOP_LOSS_PCT * 100:g}% | "
         f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe={TIMEFRAME}"
     )
+    log.info(rollover.describe())
     log.info("=" * 78)
     dashboard.describe(account=account["id"], currency=currency, config={
         "markets": list(pool), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
@@ -751,6 +788,8 @@ def run_bot() -> None:
         try:
             if dashboard.due():
                 report_to_dashboard(pool, rates)
+            if rollover.flat_due():
+                close_before_rollover()
 
             latest = {}
             for epic in pool:

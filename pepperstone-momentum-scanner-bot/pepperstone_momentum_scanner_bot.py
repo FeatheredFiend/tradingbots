@@ -26,6 +26,11 @@ Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
 - Risk mgmt : 2% stop-loss / 5% take-profit by default (STOP_LOSS_PERCENT /
   TAKE_PROFIT_PERCENT env vars, shared with the other scanners), attached
   to the order, so Pepperstone enforces them even while the bot is stopped.
+- Overnight : its positions are closed 15 minutes before the daily
+  rollover (22:00 UK), so no swap is paid, and nothing new opens from an
+  hour before it to 45 minutes after (SCANNER_FLAT_MINUTES /
+  SCANNER_LAST_ENTRY_MINUTES, 0 = off; see shared/rollover.py). Only
+  positions with its magic number are closed.
 
 Sizing
 ------
@@ -82,6 +87,7 @@ import MetaTrader5 as mt5
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
+import rollover  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -326,6 +332,9 @@ def send(request: dict) -> tuple:
 
 def open_position(symbol: str, info, direction: str, currency: str) -> bool:
     """Market order with the stop-loss and take-profit attached. True if it filled."""
+    if rollover.entries_paused():
+        log.info(f"{symbol}: {direction} signal, but it's too near the daily rollover to open a trade; skipping.")
+        return False
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         log.error(f"No live price for {symbol}; can't {direction}.")
@@ -385,6 +394,17 @@ def close_position(position, info, reason: str, volume: float = None) -> bool:
     if done and volume >= position.volume:
         CLOSE_REASONS[position.ticket] = reason
     return done
+
+
+def close_before_rollover(pool: dict) -> None:
+    """Close every position with this bot's magic number, so none is
+    charged a night's swap. Other bots' and hand-made positions are left alone."""
+    positions = mt5.positions_get()
+    if positions is None:
+        raise RuntimeError(f"couldn't read positions: {mt5.last_error()}")
+    for position in positions:
+        if position.magic == MAGIC:
+            close_position(position, pool.get(position.symbol) or mt5.symbol_info(position.symbol), rollover.REASON)
 
 
 def close_from_dashboard(markets: dict, symbol: str, ref, direction: str, size) -> str:
@@ -587,6 +607,7 @@ def run_bot() -> None:
         f"Streak length={STREAK_LENGTH} bars | Stop-loss={STOP_LOSS_PCT * 100:g}% | "
         f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe={TIMEFRAME}"
     )
+    log.info(rollover.describe())
     log.info("=" * 78)
     dashboard.describe(account=f"{account.login} on {account.server}", currency=currency, config={
         "markets": list(pool), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
@@ -602,6 +623,8 @@ def run_bot() -> None:
         try:
             if dashboard.due():
                 report_to_dashboard(pool)
+            if rollover.flat_due():
+                close_before_rollover(pool)
 
             latest = {}
             for symbol in pool:

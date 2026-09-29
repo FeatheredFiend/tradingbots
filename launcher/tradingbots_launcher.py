@@ -348,6 +348,12 @@ SETTING_GROUPS = [
         Setting("STREAK_LENGTH", "Streak length", "Bars in a row that trigger a trade - default 3", number=True),
         Setting("STOP_LOSS_PERCENT", "Stop-loss %", "Of the entry price - default 2", number=True),
         Setting("TAKE_PROFIT_PERCENT", "Take-profit %", "Of the entry price - default 5", number=True),
+        Setting("SCANNER_FLAT_MINUTES", "Close before rollover", "CFD scanners close their trades this many minutes "
+                                                                "before the 22:00 UK rollover, so no overnight fee - "
+                                                                "default 15; 0 = hold overnight", number=True),
+        Setting("SCANNER_LAST_ENTRY_MINUTES", "No entries before rollover", "No new CFD trades from this many "
+                                                                           "minutes before it to 45 after - "
+                                                                           "default 60; 0 = off", number=True),
     ]),
     ("EMA crossover bots", "Shared by the Alpaca, OANDA, Pepperstone, Capital.com and IG EMA bots.", [
         Setting("EMA_TIMEFRAME", "Bar length", "M1, M5, M15 or M30 - default M15"),
