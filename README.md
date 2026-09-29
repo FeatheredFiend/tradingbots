@@ -805,6 +805,39 @@ minutes and widens or narrows every price by the difference, printing it.
 **Fetch while the markets are open**, or the history is used as it is.
 Results: [What to expect](#what-to-expect).
 
+## Market movers backtest (`backtest/movers_backtest.py`)
+
+Tests the idea behind a "whole market" scanner before any bot is built:
+every 5 minutes, rank every liquid US share by how far it has just moved,
+buy the fastest risers and short the fastest fallers at the next bar's open,
+and hold for a set time. It replays that over months of consolidated (SIP)
+5-minute bars from Alpaca, for look-backs of 5-60 minutes, two ways of
+scoring a move (plain % or against the share's usual movement), three
+thresholds each and holds of 15 minutes to the close:
+
+```powershell
+python backtest\movers_backtest.py        # alpaca-bot-env; --months 6 by default
+```
+
+Options: `--months`, `--min-price 5`, `--min-dollar-volume 20` (median
+$ millions a day over the 20 sessions before - the universe is picked afresh
+each day, from past data only), `--top 3` (new trades per side per 5-minute
+step), `--entry-spread-samples 200`. Costs are each share's real bid/ask
+spread from sampled SIP quotes, with the entry half scaled by how much wider
+spreads were at the moment of the sampled entries (fast moves widen them).
+Each result is also shown for the period's first and second half. The first
+6-month run takes about an hour (Alpaca pages multi-share bars ~2,200 at a
+time and allows 200 requests a minute); everything is cached in `backtest/data/`,
+batch by batch, so a stopped run picks up where it left off.
+
+First run (30 Mar - 28 Sep 2026, ~2,500 shares a day, 126 sessions): before
+costs, every version made about nothing - within 0.02% a trade either way on
+the settings with tens of thousands of trades - so neither chasing the fast
+movers nor fading them has an edge. After the spread (0.2-0.45% a round trip
+on the shares that move fast, and 1.29x wider than usual at the moment of
+entry) all but 1 of the 192 settings lost, and that one (249 trades, good in
+one half only) is what chance alone would throw up.
+
 ## Dashboard (`shared/dashboard_reporter.py`)
 
 Every bot can report to the
