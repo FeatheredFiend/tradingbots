@@ -9,6 +9,11 @@ set "BASE=%LOCALAPPDATA%\TradingBots"
 set "BUILD_ENV=%BASE%\build-env"
 set "DEST=%LOCALAPPDATA%\Programs\TradingBots"
 
+rem Build from a local folder: started from the WSL share (a double-click
+rem there), cmd can't use the \\wsl.localhost path and falls back to
+rem C:\Windows, where PyInstaller refuses to run.
+cd /d "%LOCALAPPDATA%"
+
 if not exist "%BUILD_ENV%\Scripts\python.exe" (
     echo Creating the build environment in %BUILD_ENV% ...
     py -3 -m venv "%BUILD_ENV%" 2>nul || python -m venv "%BUILD_ENV%" || goto :failed
