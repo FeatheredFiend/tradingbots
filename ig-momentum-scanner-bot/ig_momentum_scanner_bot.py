@@ -11,7 +11,8 @@ No shares: IG's API gives no share prices at all (see below).
 
 Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
 -----------------------------------------------------------------------
-- Timeframe : 15-minute bars
+- Timeframe : 15-minute bars by default (SCANNER_TIMEFRAME env var: M1, M5,
+  M15 or M30, shared with the other scanners)
 - Buy       : STREAK_LENGTH consecutive HIGHER closes in a row  -> open LONG
 - Sell      : STREAK_LENGTH consecutive LOWER closes in a row   -> open SHORT
 - A reversal streak closes an opposing open position; the same-direction
@@ -35,13 +36,17 @@ IG's price-history endpoint (/prices) is no use for a broad scanner:
   which every /prices call fails until the allowance resets.
 So the bot never calls it. Each pass already fetches every market's details
 for its status; the snapshot there carries the live bid/offer, and the mid
-is recorded into 15-minute buckets (the last sample in a bucket is its
+is recorded into buckets one bar long (the last sample in a bucket is its
 close). Shares get no bid/offer in that snapshot either — the same
 licensing block — so there's no way to price them and they're left out of
-the pool. The catch: a symbol needs STREAK_LENGTH + 1 buckets (~45 minutes
-at the default 3) before it can signal. Bars are saved to BARS_FILE as they
-change and reloaded at startup, so only a first start (or one after a long
-stop — see SAVED_BARS_MAX_AGE_HOURS) sits through that warm-up.
+the pool. The catch: a symbol needs STREAK_LENGTH + 1 buckets (45 minutes
+on 15-minute bars at the default 3) before it can signal. Bars are saved to
+BARS_FILE as they change and reloaded at startup, so only a first start (or
+one after a long stop — see SAVED_BARS_MAX_AGE_HOURS — or a change of bar
+length) sits through that warm-up. Each pass samples a market once, and
+IG's request limit stretches a pass to about 35 seconds for the default
+pool, so a 1-minute bar gets a sample or two, and one a slow pass misses is
+skipped: 5 minutes or longer suits this scanner.
 
 Why this is riskier than the other two bots, on purpose:
 - No trend confirmation (no EMA smoothing) — a streak of 3 candles is a much
@@ -128,7 +133,10 @@ POOL_ENTRIES = [
 
 STREAK_LENGTH = int(os.environ.get("STREAK_LENGTH", "3"))  # consecutive up/down bars to trigger
 
-BAR_SECONDS = 15 * 60         # locally built bars — see "Bars are built locally" above
+BAR_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30}
+TIMEFRAME = os.environ.get("SCANNER_TIMEFRAME", "").strip().upper() or "M15"  # bar length
+assert TIMEFRAME in BAR_MINUTES, "SCANNER_TIMEFRAME must be M1, M5, M15 or M30"
+BAR_SECONDS = BAR_MINUTES[TIMEFRAME] * 60  # locally built bars — see "Bars are built locally" above
 BARS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "momentum_bars.json")
 # Saved bars older than this are dropped at startup and that market warms up
 # again. Long enough to survive an overnight stop (the gap then matches the
@@ -145,7 +153,7 @@ TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PERCENT", "5")) / 100
 # No fixed loop interval: the rate limiter below paces every request, so a
 # full pass over ~15 symbols naturally takes well under a minute — each
 # symbol gets sampled many times per 15-minute bar, so a bar's close is
-# never more than one pass stale.
+# never more than one pass stale (a big part of a 1-minute bar, though).
 # IG's limit is ~30/min for the whole account. Bots don't coordinate, so if
 # two run at once on the same account, give each a share (e.g. 18 and 10).
 REQUESTS_PER_MINUTE = int(os.environ.get("IG_REQUESTS_PER_MINUTE", "28"))
@@ -412,8 +420,9 @@ def resolve_pool_epics(ig_service: IGService) -> list:
 # MARKET DATA / SIGNAL
 # ---------------------------------------------------------------------------
 class _BarBuilder:
-    """15-minute closes per epic, built from the live price sampled each pass
-    instead of fetched from /prices (see "Bars are built locally" above).
+    """Closes per epic, one per BAR_SECONDS, built from the live price
+    sampled each pass instead of fetched from /prices (see "Bars are built
+    locally" above).
     The newest bar is the one still forming, as IG's own last bar would be.
     Only the last STREAK_LENGTH + 1 bars are kept — all a streak needs.
     Every change is saved to `path`, and saved bars are reloaded at startup
@@ -428,10 +437,16 @@ class _BarBuilder:
         try:
             with open(self._path) as f:
                 saved = json.load(f)
+            if "bars" not in saved:  # saved before the bar length could change, so 15-minute bars
+                saved = {"barSeconds": 900, "bars": saved}
+            if saved["barSeconds"] != BAR_SECONDS:
+                log.info(f"Saved bars in {self._path} are {saved['barSeconds'] // 60}-minute ones, not "
+                         f"{BAR_SECONDS // 60}-minute; every market warms up from scratch.")
+                return {}
             oldest_allowed = int((time.time() - SAVED_BARS_MAX_AGE_HOURS * 3600) // BAR_SECONDS)
             bars = {
                 epic: [[int(bucket), float(close)] for bucket, close in epic_bars[-self._keep:]]
-                for epic, epic_bars in saved.items()
+                for epic, epic_bars in saved["bars"].items()
                 if epic_bars and epic_bars[-1][0] >= oldest_allowed
             }
         except FileNotFoundError:
@@ -447,7 +462,7 @@ class _BarBuilder:
         tmp_path = self._path + ".tmp"
         try:
             with open(tmp_path, "w") as f:
-                json.dump(self._bars, f)
+                json.dump({"barSeconds": BAR_SECONDS, "bars": self._bars}, f)
             os.replace(tmp_path, self._path)
         except OSError as e:
             log.warning(f"Couldn't save bars to {self._path}: {e}")
@@ -745,11 +760,16 @@ def run_bot() -> None:
     log.info(f"Resolved {len(pool)}/{len(POOL_ENTRIES or DEFAULT_POOL)} pool entries")
     log.info(
         f"Streak length={STREAK_LENGTH} bars | Size=each market's IG minimum | "
-        f"Stop-loss={STOP_LOSS_PCT * 100:g}% | Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe=15Min"
+        f"Stop-loss={STOP_LOSS_PCT * 100:g}% | Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe={TIMEFRAME}"
     )
+    pass_seconds = (len(pool) + 1) * 60 / REQUESTS_PER_MINUTE
+    if pass_seconds > BAR_SECONDS / 3:
+        log.warning(f"A pass over {len(pool)} markets takes about {pass_seconds:.0f}s at IG's pace, so each "
+                    f"{BAR_SECONDS // 60}-minute bar gets only a sample or two per market; 5 minutes or longer "
+                    f"suits this scanner.")
     log.info("=" * 78)
     dashboard.describe(account=_account_id, currency=CURRENCY_CODE, config={
-        "markets": [item["name"] for item in pool], "streakLength": STREAK_LENGTH,
+        "markets": [item["name"] for item in pool], "timeframe": TIMEFRAME, "streakLength": STREAK_LENGTH,
         "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
     })
 

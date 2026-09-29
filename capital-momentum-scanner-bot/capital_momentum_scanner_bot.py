@@ -8,11 +8,13 @@ signal, longs AND shorts, and the stop-loss / take-profit attached to the
 order. Capital.com sells small fractions of its markets (a hundredth of
 the US 500, a tenth of an ounce of gold), so each trade is sized from a
 small budget instead of being IG's minimum contract worth thousands, and
-its API gives free 15-minute price history for everything it offers.
+its API gives free price history for everything it offers.
 
 Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
 -----------------------------------------------------------------------
-- Timeframe : 15-minute bars (Capital.com's own, mid of bid and ask, closed bars only)
+- Timeframe : 15-minute bars by default (SCANNER_TIMEFRAME env var: M1, M5,
+  M15 or M30, shared with the other scanners); Capital.com's own, mid of
+  bid and ask, closed bars only
 - Buy       : STREAK_LENGTH consecutive HIGHER closes -> open LONG
 - Sell      : STREAK_LENGTH consecutive LOWER closes  -> open SHORT
 - A reversal streak closes an opposing position; the same-direction streak
@@ -41,7 +43,7 @@ Differences from the IG scanner
   locally built bars, no bar file and no 45-minute warm-up.
 - Closed bars only, acted on as they close: each market is traded at most
   once per bar, and never on a bar that closed before the bot started — so
-  after a start, nothing happens until the next bar closes (up to 15 min).
+  after a start, nothing happens until the next bar closes (up to one bar).
 - No tight request budget: Capital.com allows 10 requests a second, and
   this makes about one.
 
@@ -112,9 +114,13 @@ TRADE_EXPOSURE = BUDGET / MAX_OPEN_POSITIONS
 STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PERCENT", "2")) / 100
 TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PERCENT", "5")) / 100
 
-RESOLUTION = "MINUTE_15"
-BAR_SECONDS = 15 * 60
-LOOP_INTERVAL_SECONDS = 30     # how often to look for newly closed bars
+RESOLUTIONS = {"M1": "MINUTE", "M5": "MINUTE_5", "M15": "MINUTE_15", "M30": "MINUTE_30"}
+BAR_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30}
+TIMEFRAME = os.environ.get("SCANNER_TIMEFRAME", "").strip().upper() or "M15"  # bar length
+assert TIMEFRAME in BAR_MINUTES, "SCANNER_TIMEFRAME must be M1, M5, M15 or M30"
+RESOLUTION = RESOLUTIONS[TIMEFRAME]
+BAR_SECONDS = BAR_MINUTES[TIMEFRAME] * 60
+LOOP_INTERVAL_SECONDS = min(30, BAR_SECONDS // 4)  # how often to look for newly closed bars
 REQUEST_TIMEOUT_SECONDS = 20
 MIN_REQUEST_INTERVAL = 0.15    # Capital.com allows 10 requests a second
 ERROR_BACKOFF_SECONDS = 60
@@ -666,12 +672,12 @@ def run_bot() -> None:
     log.info(
         f"Budget={BUDGET:,.2f} {currency} in {MAX_OPEN_POSITIONS} slices of {TRADE_EXPOSURE:,.2f} | "
         f"Streak length={STREAK_LENGTH} bars | Stop-loss={STOP_LOSS_PCT * 100:g}% | "
-        f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe=15Min"
+        f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe={TIMEFRAME}"
     )
     log.info("=" * 78)
     dashboard.describe(account=account["id"], currency=currency, config={
         "markets": list(pool), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
-        "streakLength": STREAK_LENGTH, "stopLossPercent": STOP_LOSS_PCT * 100,
+        "timeframe": TIMEFRAME, "streakLength": STREAK_LENGTH, "stopLossPercent": STOP_LOSS_PCT * 100,
         "takeProfitPercent": TAKE_PROFIT_PCT * 100,
     })
 
@@ -692,7 +698,7 @@ def run_bot() -> None:
             if seen_bar is None:
                 # Bars that closed before startup are never traded on.
                 seen_bar = {s: t for s, (t, _) in latest.items()}
-                log.info("Waiting for the next 15-minute bar to close before trading.")
+                log.info(f"Waiting for the next {BAR_MINUTES[TIMEFRAME]}-minute bar to close before trading.")
             else:
                 new_bars = {s: bars for s, bars in latest.items() if bars[0] != seen_bar.get(s)}
                 if new_bars:

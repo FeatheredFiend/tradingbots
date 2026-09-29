@@ -10,7 +10,9 @@ account can hold several real positions at once.
 
 Strategy — momentum streak, buys only
 -------------------------------------
-- Timeframe : 15-minute bars, regular US market hours (9:30-16:00 ET)
+- Timeframe : 15-minute bars by default (SCANNER_TIMEFRAME env var: M1, M5,
+  M15 or M30, shared with the other scanners), regular US market hours
+  (9:30-16:00 ET)
 - Buy       : STREAK_LENGTH consecutive HIGHER closes -> buy one slice
 - Sell      : STREAK_LENGTH consecutive LOWER closes  -> close the position
 - Risk mgmt : 2% stop-loss / 5% take-profit by default (STOP_LOSS_PERCENT /
@@ -35,8 +37,10 @@ budget the way they would with real money.
 
 Differences from the IG scanner
 -------------------------------
-- Real price history: Alpaca's free IEX feed gives 15-minute bars for the
-  whole pool in one request, so shares work and there's no warm-up.
+- Real price history: Alpaca's free IEX feed gives bars for the whole pool
+  in one request, so shares work and there's no warm-up. IEX is a small
+  slice of US trading, so on 1-minute bars some minutes have no trade and
+  no bar; a streak then runs across the gap.
 - Closed bars only: the signal is judged on completed bars, so it can't
   flicker on and off within a bar. Each bar allows at most one buy per
   symbol, so a stop-loss mid-bar doesn't immediately re-buy on the same,
@@ -99,10 +103,18 @@ BUDGET_USD = float(os.environ.get("BOT_BUDGET_USD", "100"))
 MAX_OPEN_POSITIONS = int(os.environ.get("BOT_MAX_POSITIONS", "5"))
 TRADE_NOTIONAL_USD = round(BUDGET_USD / MAX_OPEN_POSITIONS, 2)
 
-BAR_TIMEFRAME = TimeFrame(15, TimeFrameUnit.Minute)
-BAR_LENGTH = pd.Timedelta(minutes=15)
-# Calendar days of bars per fetch — enough to find STREAK_LENGTH + 1
-# regular-hours bars even first thing on the Tuesday after a long weekend.
+BAR_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30}
+TIMEFRAME = os.environ.get("SCANNER_TIMEFRAME", "").strip().upper() or "M15"  # bar length
+assert TIMEFRAME in BAR_MINUTES, "SCANNER_TIMEFRAME must be M1, M5, M15 or M30"
+BAR_TIMEFRAME = TimeFrame(BAR_MINUTES[TIMEFRAME], TimeFrameUnit.Minute)
+BAR_LENGTH = pd.Timedelta(minutes=BAR_MINUTES[TIMEFRAME])
+LAST_BAR_START = (pd.Timestamp("16:00") - BAR_LENGTH).strftime("%H:%M")  # the regular session's last bar
+# Bars are fetched for the last 60 bars' worth of time, which holds plenty
+# for most of the day. Near the open, a streak reaches back past the
+# overnight gap, so any symbol short of STREAK_LENGTH + 1 bars is fetched
+# again over this many calendar days: enough even first thing on the
+# Tuesday after a long weekend.
+RECENT_HISTORY = BAR_LENGTH * 60
 BAR_HISTORY_DAYS = 5
 # How long after a bar closes to wait before fetching it, so it's complete.
 BAR_SETTLE = pd.Timedelta(seconds=15)
@@ -113,7 +125,7 @@ MARKET_TZ = "America/New_York"
 STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PERCENT", "2")) / 100
 TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PERCENT", "5")) / 100
 
-LOOP_INTERVAL_SECONDS = 60          # Risk checks run this often; bars refresh once per bar.
+LOOP_INTERVAL_SECONDS = min(60, int(BAR_LENGTH.total_seconds()) // 4)  # Risk checks run this often; bars refresh once per bar.
 CLOSED_MARKET_SLEEP_SECONDS = 300
 MAX_CONSECUTIVE_ERRORS = 10         # Safety cutoff to avoid an unattended error loop.
 
@@ -187,26 +199,34 @@ def resolve_pool(api: tradeapi.REST) -> list:
 # ---------------------------------------------------------------------------
 def latest_settled_bar_close(now: pd.Timestamp) -> pd.Timestamp:
     """End time of the most recent bar that closed at least BAR_SETTLE ago —
-    bars only need refetching when this changes, once per 15 minutes."""
+    bars only need refetching when this changes, once per bar."""
     return (now - BAR_SETTLE).floor(BAR_LENGTH)
 
 
 def fetch_closes(api: tradeapi.REST, symbols: list) -> dict:
-    """Closed, regular-hours 15-minute bars for the whole pool in one request:
-    {symbol: (start time of its latest closed bar, [last STREAK_LENGTH + 1
-    closes, oldest first])}. Raises on failure, so the caller keeps its
-    previous bars and retries next loop."""
+    """Closed, regular-hours bars for the whole pool: {symbol: (start time
+    of its latest closed bar, [last STREAK_LENGTH + 1 closes, oldest
+    first])}. Raises on failure, so the caller keeps its previous bars and
+    retries next loop."""
     now = pd.Timestamp.now(tz="UTC")
-    start = (now - pd.Timedelta(days=BAR_HISTORY_DAYS)).isoformat()
+    closes = fetch_closes_since(api, symbols, now - RECENT_HISTORY, now)
+    short = [s for s in symbols if len(closes.get(s, (None, []))[1]) < STREAK_LENGTH + 1]
+    if short:
+        closes.update(fetch_closes_since(api, short, now - pd.Timedelta(days=BAR_HISTORY_DAYS), now))
+    return closes
+
+
+def fetch_closes_since(api: tradeapi.REST, symbols: list, start: pd.Timestamp, now: pd.Timestamp) -> dict:
+    """fetch_closes() for bars from `start` on, in one request."""
     # Always a list, even for one symbol, so the SDK tags rows with "symbol".
-    df = api.get_bars(list(symbols), BAR_TIMEFRAME, start=start, feed=DATA_FEED).df
+    df = api.get_bars(list(symbols), BAR_TIMEFRAME, start=start.isoformat(), feed=DATA_FEED).df
     if df is None or df.empty:
         return {}
 
     df = df[df.index + BAR_LENGTH <= now]  # drop the still-forming bar
     # Bars are indexed by start time: 09:30 is the first regular-hours bar,
-    # 15:45 the last. IEX pre/after-market bars fall outside that.
-    df = df.tz_convert(MARKET_TZ).between_time("09:30", "15:45")
+    # LAST_BAR_START the last. IEX pre/after-market bars fall outside that.
+    df = df.tz_convert(MARKET_TZ).between_time("09:30", LAST_BAR_START)
 
     return {
         symbol: (bars.index[-1], bars["close"].tolist()[-(STREAK_LENGTH + 1):])
@@ -415,7 +435,7 @@ def run_bot() -> None:
     log.info(
         f"Budget=${BUDGET_USD:.2f} in {MAX_OPEN_POSITIONS} slices of ${TRADE_NOTIONAL_USD:.2f} | "
         f"Streak length={STREAK_LENGTH} bars | Stop-loss={STOP_LOSS_PCT * 100:g}% | "
-        f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe=15Min"
+        f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe={TIMEFRAME}"
     )
     log.info("=" * 78)
 
@@ -430,7 +450,7 @@ def run_bot() -> None:
 
     dashboard.describe(currency="USD", config={
         "pool": pool, "budgetUsd": BUDGET_USD, "maxPositions": MAX_OPEN_POSITIONS,
-        "tradeUsd": TRADE_NOTIONAL_USD, "streakLength": STREAK_LENGTH,
+        "tradeUsd": TRADE_NOTIONAL_USD, "timeframe": TIMEFRAME, "streakLength": STREAK_LENGTH,
         "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
     })
 

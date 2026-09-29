@@ -11,7 +11,9 @@ so each trade is sized from a small budget.
 
 Strategy
 --------
-- Timeframe : 15-minute bars (Capital.com's own, mid of bid and ask, closed bars only)
+- Timeframe : 15-minute bars by default (EMA_TIMEFRAME env var: M1, M5, M15
+  or M30, shared with the other EMA bots); Capital.com's own, mid of bid and
+  ask, closed bars only
 - Entry     : 9-period EMA crosses ABOVE the 21-period EMA -> BUY (open long)
 - Exit      : 9-period EMA crosses BELOW the 21-period EMA -> close the long
 - Risk mgmt : 2% stop-loss / 5% take-profit, attached to the order, so
@@ -35,7 +37,7 @@ listing similar markets it does have. US shares trade 14:30-21:00 UK time;
 outside that there are no new bars, so nothing happens.
 
 Bars are acted on as they close, so after a start nothing happens until the
-next 15-minute bar closes. The bot treats every position in its markets as
+next bar closes. The bot treats every position in its markets as
 its own — fine alongside capital_momentum_scanner_bot.py on one account
 while their market lists don't overlap (see that bot's docstring).
 
@@ -82,7 +84,7 @@ WATCHLIST = [
 
 EMA_SHORT_PERIOD = 9
 EMA_LONG_PERIOD = 21
-BARS_LOOKBACK = 200           # ~50 hours of 15-min bars — plenty for a 21-EMA warm-up.
+BARS_LOOKBACK = 200           # plenty for a 21-EMA warm-up.
 
 BUDGET = float(os.environ.get("CAPITAL_BUDGET", "600"))  # total exposure, in the account's currency
 MAX_OPEN_POSITIONS = int(os.environ.get("CAPITAL_MAX_POSITIONS", "5"))
@@ -91,9 +93,13 @@ TRADE_EXPOSURE = BUDGET / MAX_OPEN_POSITIONS
 STOP_LOSS_PCT = 0.02           # 2% hard stop-loss, attached to the order itself.
 TAKE_PROFIT_PCT = 0.05         # 5% take-profit, attached to the order itself.
 
-RESOLUTION = "MINUTE_15"
-BAR_SECONDS = 15 * 60
-LOOP_INTERVAL_SECONDS = 60     # how often to look for newly closed bars
+RESOLUTIONS = {"M1": "MINUTE", "M5": "MINUTE_5", "M15": "MINUTE_15", "M30": "MINUTE_30"}
+BAR_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30}
+TIMEFRAME = os.environ.get("EMA_TIMEFRAME", "").strip().upper() or "M15"  # bar length
+assert TIMEFRAME in BAR_MINUTES, "EMA_TIMEFRAME must be M1, M5, M15 or M30"
+RESOLUTION = RESOLUTIONS[TIMEFRAME]
+BAR_SECONDS = BAR_MINUTES[TIMEFRAME] * 60
+LOOP_INTERVAL_SECONDS = min(60, BAR_SECONDS // 4)  # how often to look for newly closed bars
 REQUEST_TIMEOUT_SECONDS = 20
 MIN_REQUEST_INTERVAL = 0.15    # Capital.com allows 10 requests a second
 MAX_CONSECUTIVE_ERRORS = 10
@@ -627,13 +633,13 @@ def run_bot() -> None:
     log.info(
         f"Budget={BUDGET:,.2f} {currency} in {MAX_OPEN_POSITIONS} slices of {TRADE_EXPOSURE:,.2f} | "
         f"Stop-loss={STOP_LOSS_PCT:.0%} | Take-profit={TAKE_PROFIT_PCT:.0%} | "
-        f"Timeframe=15Min | EMA periods={EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}"
+        f"Timeframe={TIMEFRAME} | EMA periods={EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}"
     )
     log.info("=" * 78)
     dashboard.describe(account=account["id"], currency=currency, config={
         "watchlist": list(watchlist), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
-        "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}", "stopLossPercent": STOP_LOSS_PCT * 100,
-        "takeProfitPercent": TAKE_PROFIT_PCT * 100,
+        "timeframe": TIMEFRAME, "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}",
+        "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
     })
 
     seen_bar = None  # epic -> start time of the latest closed bar already dealt with
@@ -653,7 +659,7 @@ def run_bot() -> None:
             if seen_bar is None:
                 # Bars that closed before startup are never traded on.
                 seen_bar = {s: t for s, (t, _) in latest.items()}
-                log.info("Waiting for the next 15-minute bar to close before trading.")
+                log.info(f"Waiting for the next {BAR_MINUTES[TIMEFRAME]}-minute bar to close before trading.")
             else:
                 new_bars = {s: bars for s, bars in latest.items() if bars[0] != seen_bar.get(s)}
                 if new_bars:

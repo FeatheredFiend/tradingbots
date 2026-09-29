@@ -16,7 +16,9 @@ account; MT4 and cTrader accounts can't be reached this way.
 
 Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
 -----------------------------------------------------------------------
-- Timeframe : 15-minute bars (MT5's own history, closed bars only)
+- Timeframe : 15-minute bars by default (SCANNER_TIMEFRAME env var: M1, M5,
+  M15 or M30, shared with the other scanners); MT5's own history, closed
+  bars only
 - Buy       : STREAK_LENGTH consecutive HIGHER closes -> open LONG
 - Sell      : STREAK_LENGTH consecutive LOWER closes  -> open SHORT
 - A reversal streak closes an opposing position; the same-direction streak
@@ -47,7 +49,7 @@ Differences from the IG scanner
   no warm-up.
 - Closed bars only, acted on as they close: each market is traded at most
   once per bar, and never on a bar that closed before the bot started — so
-  after a start, nothing happens until the next bar closes (up to 15 min).
+  after a start, nothing happens until the next bar closes (up to one bar).
 - Its positions are tagged with a magic number and it ignores all others,
   so it can share an account with pepperstone_ema_bot.py and your own
   manual trades — on a hedging account, that is (the startup log shows the
@@ -114,8 +116,12 @@ TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PERCENT", "5")) / 100
 MAGIC = 928001                # tags this bot's positions; pepperstone_ema_bot.py uses 928002
 ORDER_COMMENT = "momentum scanner"
 DEVIATION_POINTS = 20         # accepted slippage, where the symbol's execution mode honours it
-BAR_SECONDS = 15 * 60
-LOOP_INTERVAL_SECONDS = 30    # how often to look for newly closed bars
+BAR_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30}
+TIMEFRAME = os.environ.get("SCANNER_TIMEFRAME", "").strip().upper() or "M15"  # bar length
+assert TIMEFRAME in BAR_MINUTES, "SCANNER_TIMEFRAME must be M1, M5, M15 or M30"
+MT5_TIMEFRAME = getattr(mt5, f"TIMEFRAME_{TIMEFRAME}")
+BAR_SECONDS = BAR_MINUTES[TIMEFRAME] * 60
+LOOP_INTERVAL_SECONDS = min(30, BAR_SECONDS // 4)  # how often to look for newly closed bars
 ERROR_BACKOFF_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
 
@@ -256,7 +262,7 @@ def fetch_closes(symbol: str, count: int):
     first), or None if MT5 has no bars for it. Position 0 is the bar still
     forming, so this starts at 1. MT5 bars are built from bid prices, and
     their times are in the broker's server time zone, not UTC."""
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 1, count)
+    rates = mt5.copy_rates_from_pos(symbol, MT5_TIMEFRAME, 1, count)
     if rates is None or len(rates) == 0:
         return None
     return int(rates["time"][-1]), rates["close"].tolist()
@@ -551,12 +557,12 @@ def run_bot() -> None:
     log.info(
         f"Budget={BUDGET:,.2f} {currency} in {MAX_OPEN_POSITIONS} slices of {TRADE_EXPOSURE:,.2f} | "
         f"Streak length={STREAK_LENGTH} bars | Stop-loss={STOP_LOSS_PCT * 100:g}% | "
-        f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe=15Min"
+        f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe={TIMEFRAME}"
     )
     log.info("=" * 78)
     dashboard.describe(account=f"{account.login} on {account.server}", currency=currency, config={
         "markets": list(pool), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
-        "streakLength": STREAK_LENGTH, "stopLossPercent": STOP_LOSS_PCT * 100,
+        "timeframe": TIMEFRAME, "streakLength": STREAK_LENGTH, "stopLossPercent": STOP_LOSS_PCT * 100,
         "takeProfitPercent": TAKE_PROFIT_PCT * 100, "magicNumber": MAGIC,
     })
 
@@ -577,7 +583,7 @@ def run_bot() -> None:
             if seen_bar is None:
                 # Bars that closed before startup are never traded on.
                 seen_bar = {s: t for s, (t, _) in latest.items()}
-                log.info("Waiting for the next 15-minute bar to close before trading.")
+                log.info(f"Waiting for the next {BAR_MINUTES[TIMEFRAME]}-minute bar to close before trading.")
             else:
                 new_bars = {s: bars for s, bars in latest.items() if bars[0] != seen_bar.get(s)}
                 if new_bars:

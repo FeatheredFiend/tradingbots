@@ -12,7 +12,9 @@ IG, a practice login can generate its own API token: no live account needed.
 
 Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
 -----------------------------------------------------------------------
-- Timeframe : 15-minute bars (OANDA's own mid-price candles, closed bars only)
+- Timeframe : 15-minute bars by default (SCANNER_TIMEFRAME env var: M1, M5,
+  M15 or M30, shared with the other scanners); OANDA's own mid-price
+  candles, closed bars only
 - Buy       : STREAK_LENGTH consecutive HIGHER closes -> open LONG
 - Sell      : STREAK_LENGTH consecutive LOWER closes  -> open SHORT
 - A reversal streak closes an opposing position; the same-direction streak
@@ -44,8 +46,9 @@ Differences from the IG scanner
   no locally built bars, no bar file and no 45-minute warm-up.
 - Closed bars only, acted on as they close: each market is traded at most
   once per bar, and never on a bar that closed before the bot started — so
-  after a start, nothing happens until the next bar closes (up to 15 min).
-- No request pacing: this makes ~30 requests a minute, far under OANDA's limit.
+  after a start, nothing happens until the next bar closes (up to one bar).
+- No request pacing: this makes ~30 requests a minute (~60 on 1-minute
+  bars), far under OANDA's limit.
 
 One bot per account
 -------------------
@@ -111,9 +114,12 @@ TRADE_EXPOSURE = BUDGET / MAX_OPEN_POSITIONS
 STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PERCENT", "2")) / 100
 TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PERCENT", "5")) / 100
 
-GRANULARITY = "M15"
-BAR_SECONDS = 15 * 60
-LOOP_INTERVAL_SECONDS = 30     # how often to look for newly closed bars
+BAR_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30}
+TIMEFRAME = os.environ.get("SCANNER_TIMEFRAME", "").strip().upper() or "M15"  # bar length
+assert TIMEFRAME in BAR_MINUTES, "SCANNER_TIMEFRAME must be M1, M5, M15 or M30"
+GRANULARITY = TIMEFRAME        # OANDA's own names for these
+BAR_SECONDS = BAR_MINUTES[TIMEFRAME] * 60
+LOOP_INTERVAL_SECONDS = min(30, BAR_SECONDS // 4)  # how often to look for newly closed bars
 REQUEST_TIMEOUT_SECONDS = 20
 ERROR_BACKOFF_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
@@ -504,12 +510,12 @@ def run_bot() -> None:
     log.info(
         f"Budget={BUDGET:,.2f} {currency} in {MAX_OPEN_POSITIONS} slices of {TRADE_EXPOSURE:,.2f} | "
         f"Streak length={STREAK_LENGTH} bars | Stop-loss={STOP_LOSS_PCT * 100:g}% | "
-        f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe=15Min"
+        f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe={TIMEFRAME}"
     )
     log.info("=" * 78)
     dashboard.describe(account=account_id, currency=currency, config={
         "markets": list(pool), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
-        "streakLength": STREAK_LENGTH, "stopLossPercent": STOP_LOSS_PCT * 100,
+        "timeframe": TIMEFRAME, "streakLength": STREAK_LENGTH, "stopLossPercent": STOP_LOSS_PCT * 100,
         "takeProfitPercent": TAKE_PROFIT_PCT * 100,
     })
 
@@ -530,7 +536,7 @@ def run_bot() -> None:
             if seen_bar is None:
                 # Bars that closed before startup are never traded on.
                 seen_bar = {s: t for s, (t, _) in latest.items()}
-                log.info("Waiting for the next 15-minute bar to close before trading.")
+                log.info(f"Waiting for the next {BAR_MINUTES[TIMEFRAME]}-minute bar to close before trading.")
             else:
                 new_bars = {s: bars for s, bars in latest.items() if bars[0] != seen_bar.get(s)}
                 if new_bars:

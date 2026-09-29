@@ -17,7 +17,8 @@ between brokers is how small a trade can be:
 
 ## EMA crossover strategy (`alpaca-ema-bot/`, `ig-cfd-ema-bot/`, `oanda-ema-bot/`, `pepperstone-ema-bot/`, `capital-ema-bot/`)
 
-- Timeframe: 15-minute bars
+- Timeframe: 15-minute bars by default. `EMA_TIMEFRAME` sets `M1`, `M5`,
+  `M15` or `M30` (1, 5, 15 or 30 minutes) for every EMA bot
 - Buy: 9-period EMA crosses **above** the 21-period EMA
 - Sell / close: 9-period EMA crosses **below** the 21-period EMA
 - Risk management: 2% stop-loss / 5% take-profit from the position's entry price
@@ -114,20 +115,21 @@ and more round-trips hitting the stop-loss than the EMA bots. Same native
 stop-loss/take-profit (2%/5%) as `ig-cfd-ema-bot/`, and the same catch on
 trade size — see [IG position sizing](#ig-position-sizing-both-ig-bots).
 
-**It builds its own 15-minute bars instead of fetching them.** IG's
+**It builds its own bars instead of fetching them.** IG's
 price-history endpoint refuses every share with a 403
 (`unauthorised.access.to.equity.exception` — IG's data vendors don't license
 equity prices over the API) and caps everything else at 10,000 data points a
 week, which a scanner polling ~15 markets would burn through in about half
 an hour. So the bot samples each market's live bid/offer from the market
-details it already reads every pass, and buckets those into 15-minute
-closes. **Shares are left out entirely:** IG's market details carry no
+details it already reads every pass, and buckets those into one close per
+bar. **Shares are left out entirely:** IG's market details carry no
 bid/offer for them either, so the API gives no way to price a share at all.
-The cost is a **~45-minute warm-up** (logged as
+The cost is a **4-bar warm-up** (45 minutes on 15-minute bars, logged as
 `warming up (n/4 bars)`) before a market can signal. Bars are saved to
 `ig-momentum-scanner-bot/momentum_bars.json` as they change and reloaded at
 startup, so a restart picks up where it left off — only the first start,
-or one after a stop of more than 16 hours, has to warm up again. Delete
+or one after a stop of more than 16 hours or a change of bar length, has
+to warm up again. Delete
 that file to force a fresh warm-up.
 
 ```bash
@@ -139,12 +141,16 @@ python ig-momentum-scanner-bot/ig_momentum_scanner_bot.py
 ```
 
 Requires the same live-IG-account-for-an-API-key step as `ig-cfd-ema-bot/`,
-and is hardcoded to the demo account. Optional env vars: `STREAK_LENGTH`
-(default `3`), `IG_POOL` (comma-separated override of the whole scanning
+and is hardcoded to the demo account. Optional env vars: `SCANNER_TIMEFRAME`
+(bar length: `M1`, `M5`, `M15` or `M30`, default `M15`; shared by every
+scanner), `STREAK_LENGTH` (default `3`), `IG_POOL` (comma-separated override of the whole scanning
 pool), and `STOP_LOSS_PERCENT` / `TAKE_PROFIT_PERCENT` (defaults `2` and
 `5`, in percent of the entry price — e.g. `0.5` for 0.5%). IG has a minimum
 stop/limit distance per market, so a very tight value can get a trade
-rejected; the reason is logged.
+rejected; the reason is logged. A pass samples each market once and IG's
+request limit stretches a pass to about 35 seconds for the default pool,
+so a 1-minute bar gets a sample or two, and one a slow pass misses is skipped. Use 5 minutes or
+longer here; the bot warns at startup when the bars are too short.
 
 **Resolution is intentionally looser here than `ig-cfd-ema-bot/`:** that bot
 hard-exits on any ambiguous or unresolved name, because getting one specific
@@ -163,8 +169,8 @@ that `DEFAULT_POOL` entry to `Name:EPIC`.
 The IG momentum scanner's signal, moved to Alpaca so it can trade small
 amounts: IG's smallest trade is thousands of pounds of exposure, while
 Alpaca sells fractions of a US share from $1. It scans ~30 liquid US large
-caps (override with `BOT_POOL`) on 15-minute bars during regular market
-hours (9:30–16:00 New York, 14:30–21:00 UK):
+caps (override with `BOT_POOL`) on 15-minute bars (`SCANNER_TIMEFRAME`)
+during regular market hours (9:30–16:00 New York, 14:30–21:00 UK):
 
 - Buy: 3 consecutive higher closes in a row
 - Sell (close): 3 consecutive lower closes in a row, a 2% stop-loss or a 5%
@@ -193,11 +199,14 @@ python alpaca-momentum-scanner-bot/alpaca_momentum_scanner_bot.py
 Differences from the IG scanner worth knowing:
 
 - **Real price history, no warm-up.** Alpaca's free IEX feed gives the
-  whole pool's 15-minute bars in one request, and shares work.
+  whole pool's bars in one request, and shares work. IEX is a small slice
+  of US trading, so on 1-minute bars some minutes have no trade and no bar;
+  a streak then runs across the gap.
 - **Closed bars only.** The signal is judged on completed bars, so it can't
   flicker on and off within a bar, and a share is bought at most once per
   bar — a stop-loss doesn't immediately re-buy on the same streak.
-- **Stop-loss and take-profit are checked by the bot** (every minute), not
+- **Stop-loss and take-profit are checked by the bot** (every minute, or
+  every 15 seconds on 1-minute bars), not
   the broker: Alpaca can't attach them to fractional orders. They only work
   while the bot is running and the market is open, and positions are held
   overnight, so a gap at the next open can go well past 2%.
@@ -215,7 +224,7 @@ The IG bots' two strategies on an [OANDA](https://www.oanda.com)
 - **Trades as small as one unit** (one unit of EUR/USD is one euro), so
   trades are sized from a small budget, not a broker minimum.
 - **Free price history for every market**, so both bots use OANDA's own
-  closed 15-minute bars: no warm-up, no bar file.
+  closed bars: no warm-up, no bar file.
 - Stop-loss/take-profit are attached to the order, as on IG.
 
 ```bash
@@ -242,8 +251,8 @@ other indices and gold, and £1,100 for the UK 100. An `OANDA_BUDGET` of
 `5500` (slices of £1,100) takes in the scanner's whole pool.
 
 **Scanner:** the IG scanner's rules (3-bar streak, long and short, a reversal
-closes) and the same `STREAK_LENGTH` / `STOP_LOSS_PERCENT` /
-`TAKE_PROFIT_PERCENT` env vars — if those are set for the other scanners,
+closes) and the same `SCANNER_TIMEFRAME` / `STREAK_LENGTH` /
+`STOP_LOSS_PERCENT` / `TAKE_PROFIT_PERCENT` env vars — if those are set for the other scanners,
 this one uses them too. `OANDA_POOL` overrides its pool: the IG scanner's 15
 markets in OANDA's names (`EUR_USD`, `SPX500_USD`, `XAU_USD`, ...). A name
 the account doesn't offer is skipped, with similar names it does offer.
@@ -255,7 +264,7 @@ defaults to eight currency pairs, since OANDA has no single-company shares.
 A name the account doesn't offer stops it at startup.
 
 **Both** act on each bar as it closes, so after a start nothing happens
-until the next 15-minute bar closes. **Give each bot its own OANDA
+until the next bar closes. **Give each bot its own OANDA
 sub-account** (add one in the hub; set `OANDA_ACCOUNT_ID` in each bot's
 window): each treats every position in its markets as its own, and OANDA
 nets buys and sells of one market into a single position, so two bots on
@@ -325,7 +334,7 @@ The IG bots' two strategies on a [Capital.com](https://capital.com)
   units of a currency pair — so trades are sized from a budget, not a
   broker minimum.
 - **Free price history for everything, shares included**, so both bots use
-  Capital.com's own closed 15-minute bars (no warm-up, no bar file), and
+  Capital.com's own closed bars (no warm-up, no bar file), and
   the EMA bot can trade the US shares the IG bot never could.
 - Stop-loss/take-profit are attached to the order, as on IG.
 
@@ -632,7 +641,8 @@ doesn't catch, so an unpaced burst makes every later call fail too. Both IG
 bots pace every non-trading call to stay under it, which means:
 
 - The momentum bot takes about a minute to resolve its pool at startup, and
-  a full pass over it takes well under a minute (fine for 15-minute bars).
+  a full pass over it takes about 35 seconds: fine for 5-minute bars or
+  longer, too slow for 1-minute ones.
 - A startup lookup that fails is retried (after 20s, 40s, then 60s) rather
   than dropped, since it's nearly always a temporary 403 — e.g. from a bot
   you stopped less than a minute ago.
@@ -715,7 +725,7 @@ to 2,000 log lines to send later. What each broker can report:
 - **Settings:** a form for every environment variable the bots read -
   keys, budgets, market lists, stop-loss / take-profit, each strategy's
   parameters, the dashboard - in sections (General, the momentum scanners,
-  each strategy, then each broker with its bots' own markets and budgets),
+  the EMA bots, each strategy, then each broker with its bots' own markets and budgets),
   saved as Windows user environment variables (the same place
   `[Environment]::SetEnvironmentVariable(..., "User")` writes). Empty means
   the bot's default. It offers to restart running bots so they pick changes up.

@@ -336,9 +336,13 @@ SETTING_GROUPS = [
         Setting("STRATEGY_DRY_RUN", "Strategy bots: dry run", "1 = log the trades they'd make without sending them"),
     ]),
     ("Momentum scanners", "Shared by the Alpaca, OANDA, Pepperstone, Capital.com and IG scanners.", [
+        Setting("SCANNER_TIMEFRAME", "Bar length", "M1, M5, M15 or M30 - default M15 (M1 is too quick for IG's)"),
         Setting("STREAK_LENGTH", "Streak length", "Bars in a row that trigger a trade - default 3", number=True),
         Setting("STOP_LOSS_PERCENT", "Stop-loss %", "Of the entry price - default 2", number=True),
         Setting("TAKE_PROFIT_PERCENT", "Take-profit %", "Of the entry price - default 5", number=True),
+    ]),
+    ("EMA crossover bots", "Shared by the Alpaca, OANDA, Pepperstone, Capital.com and IG EMA bots.", [
+        Setting("EMA_TIMEFRAME", "Bar length", "M1, M5, M15 or M30 - default M15"),
     ]),
     ("Forex session breakout", "Shared by the breakout bot on every broker. Trades the break of the London "
                                "morning's range in the London / New York overlap; always flat before the rollover. "

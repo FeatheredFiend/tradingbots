@@ -16,7 +16,8 @@ account; MT4 and cTrader accounts can't be reached this way.
 
 Strategy
 --------
-- Timeframe : 15-minute bars (MT5's own history, closed bars only)
+- Timeframe : 15-minute bars by default (EMA_TIMEFRAME env var: M1, M5, M15
+  or M30, shared with the other EMA bots); MT5's own history, closed bars only
 - Entry     : 9-period EMA crosses ABOVE the 21-period EMA -> BUY (open long)
 - Exit      : 9-period EMA crosses BELOW the 21-period EMA -> close the long
 - Risk mgmt : 2% stop-loss / 5% take-profit, attached to the order, so
@@ -42,7 +43,7 @@ several symbols, stops the bot at startup (like the IG bot, a hand-picked
 list should be exactly right), listing what it did find.
 
 Bars are acted on as they close, so after a start nothing happens until the
-next 15-minute bar closes; a share's last bar of the day is only seen as
+next bar closes; a share's last bar of the day is only seen as
 closed at the next day's open. The bot's positions are tagged with a magic
 number and it ignores all others, so it can share a (hedging) account with
 pepperstone_momentum_scanner_bot.py and your own trades.
@@ -93,7 +94,7 @@ WATCHLIST = [
 
 EMA_SHORT_PERIOD = 9
 EMA_LONG_PERIOD = 21
-BARS_LOOKBACK = 200           # ~50 hours of 15-min bars — plenty for a 21-EMA warm-up.
+BARS_LOOKBACK = 200           # plenty for a 21-EMA warm-up.
 
 BUDGET = float(os.environ.get("PEPPERSTONE_BUDGET", "10000"))  # total exposure, in the account's currency
 MAX_OPEN_POSITIONS = int(os.environ.get("PEPPERSTONE_MAX_POSITIONS", "5"))
@@ -105,7 +106,11 @@ TAKE_PROFIT_PCT = 0.05         # 5% take-profit, attached to the order itself.
 MAGIC = 928002                # tags this bot's positions; the momentum scanner uses 928001
 ORDER_COMMENT = "ema bot"
 DEVIATION_POINTS = 20         # accepted slippage, where the symbol's execution mode honours it
-LOOP_INTERVAL_SECONDS = 60    # how often to look for newly closed bars
+BAR_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30}
+TIMEFRAME = os.environ.get("EMA_TIMEFRAME", "").strip().upper() or "M15"  # bar length
+assert TIMEFRAME in BAR_MINUTES, "EMA_TIMEFRAME must be M1, M5, M15 or M30"
+MT5_TIMEFRAME = getattr(mt5, f"TIMEFRAME_{TIMEFRAME}")
+LOOP_INTERVAL_SECONDS = min(60, BAR_MINUTES[TIMEFRAME] * 15)  # how often to look for newly closed bars
 MAX_CONSECUTIVE_ERRORS = 10
 
 assert MAX_OPEN_POSITIONS >= 1, "PEPPERSTONE_MAX_POSITIONS must be at least 1"
@@ -245,7 +250,7 @@ def fetch_closes(symbol: str, count: int):
     """(start time of the latest closed bar, its last `count` closes, oldest
     first), or None if MT5 has no bars for it. Position 0 is the bar still
     forming, so this starts at 1. MT5 bars are built from bid prices."""
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 1, count)
+    rates = mt5.copy_rates_from_pos(symbol, MT5_TIMEFRAME, 1, count)
     if rates is None or len(rates) == 0:
         return None
     return int(rates["time"][-1]), rates["close"].tolist()
@@ -521,13 +526,13 @@ def run_bot() -> None:
     log.info(
         f"Budget={BUDGET:,.2f} {currency} in {MAX_OPEN_POSITIONS} slices of {TRADE_EXPOSURE:,.2f} | "
         f"Stop-loss={STOP_LOSS_PCT:.0%} | Take-profit={TAKE_PROFIT_PCT:.0%} | "
-        f"Timeframe=15Min | EMA periods={EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}"
+        f"Timeframe={TIMEFRAME} | EMA periods={EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}"
     )
     log.info("=" * 78)
     dashboard.describe(account=f"{account.login} on {account.server}", currency=currency, config={
         "watchlist": list(watchlist), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
-        "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}", "stopLossPercent": STOP_LOSS_PCT * 100,
-        "takeProfitPercent": TAKE_PROFIT_PCT * 100, "magicNumber": MAGIC,
+        "timeframe": TIMEFRAME, "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}",
+        "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100, "magicNumber": MAGIC,
     })
 
     seen_bar = None  # symbol -> start time of the latest closed bar already dealt with
@@ -547,7 +552,7 @@ def run_bot() -> None:
             if seen_bar is None:
                 # Bars that closed before startup are never traded on.
                 seen_bar = {s: t for s, (t, _) in latest.items()}
-                log.info("Waiting for the next 15-minute bar to close before trading.")
+                log.info(f"Waiting for the next {BAR_MINUTES[TIMEFRAME]}-minute bar to close before trading.")
             else:
                 new_bars = {s: bars for s, bars in latest.items() if bars[0] != seen_bar.get(s)}
                 if new_bars:

@@ -12,7 +12,8 @@ targets instead.
 
 Strategy
 --------
-- Timeframe : 15-minute bars
+- Timeframe : 15-minute bars by default (EMA_TIMEFRAME env var: M1, M5, M15
+  or M30, shared with the other EMA bots)
 - Entry     : 9-period EMA crosses ABOVE the 21-period EMA  -> BUY (open long CFD)
 - Exit      : 9-period EMA crosses BELOW the 21-period EMA  -> SELL (close position)
 - Risk mgmt : 2% stop-loss / 5% take-profit, attached DIRECTLY to the order
@@ -92,13 +93,16 @@ WATCHLIST_SEARCH_TERMS = [
 
 EMA_SHORT_PERIOD = 9
 EMA_LONG_PERIOD = 21
-BAR_RESOLUTION = "15Min"      # trading_ig's conv_resol() maps this to MINUTE_15.
-BARS_LOOKBACK = 200           # ~50 hours of 15-min bars — plenty for a 21-EMA warm-up.
+BAR_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30}
+TIMEFRAME = os.environ.get("EMA_TIMEFRAME", "").strip().upper() or "M15"  # bar length
+assert TIMEFRAME in BAR_MINUTES, "EMA_TIMEFRAME must be M1, M5, M15 or M30"
+BAR_RESOLUTION = f"{BAR_MINUTES[TIMEFRAME]}Min"  # trading_ig's conv_resol() maps 15Min to MINUTE_15.
+BARS_LOOKBACK = 200           # plenty for a 21-EMA warm-up.
 
 STOP_LOSS_PCT = 0.02           # 2% hard stop-loss, attached to the order itself.
 TAKE_PROFIT_PCT = 0.05         # 5% take-profit, attached to the order itself.
 
-LOOP_INTERVAL_SECONDS = 60
+LOOP_INTERVAL_SECONDS = 60  # not shorter on short bars: every loop spends IG's weekly price-history allowance
 MAX_CONSECUTIVE_ERRORS = 10
 # IG's limit is ~30/min for the whole account. Bots don't coordinate, so if
 # two run at once on the same account, give each a share (e.g. 10 and 18).
@@ -325,7 +329,7 @@ def fetch_market_details(ig_service: IGService, epic: str) -> Optional[dict]:
 # MARKET DATA
 # ---------------------------------------------------------------------------
 def fetch_bars(ig_service: IGService, epic: str) -> Optional[pd.DataFrame]:
-    """Fetch recent 15-minute bars as a flat OHLC frame (mid of bid/ask)."""
+    """Fetch recent bars as a flat OHLC frame (mid of bid/ask)."""
     try:
         _rate_limiter.wait()
         data = ig_service.fetch_historical_prices_by_epic_and_num_points(
@@ -496,7 +500,7 @@ def trading_cycle(ig_service: IGService, watch_item: dict, positions: Optional[p
 
     df = fetch_bars(ig_service, epic)
     if df is None or len(df) < EMA_LONG_PERIOD + 1:
-        log.warning(f"Not enough closed 15-min bars for {name} ({epic}) yet; skipping this cycle.")
+        log.warning(f"Not enough closed {TIMEFRAME} bars for {name} ({epic}) yet; skipping this cycle.")
         return
 
     df = compute_emas(df)
@@ -555,12 +559,13 @@ def run_bot() -> None:
     log.info(
         f"Size=each market's IG minimum | "
         f"Stop-loss={STOP_LOSS_PCT:.0%} | Take-profit={TAKE_PROFIT_PCT:.0%} | "
-        f"Timeframe=15Min | EMA periods={EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}"
+        f"Timeframe={TIMEFRAME} | EMA periods={EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}"
     )
     log.info("=" * 78)
     # Log lines and a heartbeat only: IG's tight request limits leave no room for extra snapshot calls.
     dashboard.describe(currency=CURRENCY_CODE, config={
-        "watchlist": [item["name"] for item in watchlist], "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}",
+        "watchlist": [item["name"] for item in watchlist], "timeframe": TIMEFRAME,
+        "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}",
         "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
     })
 

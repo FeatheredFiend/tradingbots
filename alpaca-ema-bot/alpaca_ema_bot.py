@@ -5,7 +5,8 @@ Alpaca Paper Trading Bot — EMA(9/21) Crossover Trend Follower
 
 Strategy
 --------
-- Timeframe : 15-minute bars
+- Timeframe : 15-minute bars by default (EMA_TIMEFRAME env var: M1, M5, M15
+  or M30, shared with the other EMA bots)
 - Entry     : 9-period EMA crosses ABOVE the 21-period EMA  -> BUY
 - Exit      : 9-period EMA crosses BELOW the 21-period EMA  -> SELL (close position)
 - Risk mgmt : 2% hard stop-loss / 5% take-profit, measured against the
@@ -84,14 +85,17 @@ WATCHLIST = [
 TRADE_NOTIONAL_USD = 2.00     # Fixed dollar size per trade, per symbol.
 EMA_SHORT_PERIOD = 9
 EMA_LONG_PERIOD = 21
-BAR_TIMEFRAME = TimeFrame(15, TimeFrameUnit.Minute)
-BARS_LOOKBACK = 200           # ~50 hours of 15-min bars — plenty for a 21-EMA warm-up.
+BAR_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30}
+TIMEFRAME = os.environ.get("EMA_TIMEFRAME", "").strip().upper() or "M15"  # bar length
+assert TIMEFRAME in BAR_MINUTES, "EMA_TIMEFRAME must be M1, M5, M15 or M30"
+BAR_TIMEFRAME = TimeFrame(BAR_MINUTES[TIMEFRAME], TimeFrameUnit.Minute)
+BARS_LOOKBACK = 200           # plenty for a 21-EMA warm-up.
 DATA_FEED = "iex"             # Free-tier Alpaca data plans only permit the IEX feed (equities only).
 
 STOP_LOSS_PCT = 0.02          # 2% hard stop-loss on average entry price.
 TAKE_PROFIT_PCT = 0.05        # 5% take-profit target on average entry price.
 
-LOOP_INTERVAL_SECONDS = 60          # Poll cadence while the market is open.
+LOOP_INTERVAL_SECONDS = min(60, BAR_MINUTES[TIMEFRAME] * 15)  # Poll cadence while the market is open.
 CLOSED_MARKET_SLEEP_SECONDS = 300   # Sleep cadence while all-equity watchlists are closed.
 MAX_CONSECUTIVE_ERRORS = 10         # Safety cutoff to avoid an unattended error loop.
 
@@ -167,7 +171,7 @@ def verify_asset_is_tradable(api: tradeapi.REST, symbol: str) -> None:
 # MARKET DATA
 # ---------------------------------------------------------------------------
 def fetch_bars(api: tradeapi.REST, symbol: str) -> Optional[pd.DataFrame]:
-    """Fetch recent 15-minute bars and drop any still-forming (incomplete) bar."""
+    """Fetch recent bars and drop any still-forming (incomplete) bar."""
     try:
         if is_crypto_symbol(symbol):
             df = api.get_crypto_bars(symbol, BAR_TIMEFRAME, limit=BARS_LOOKBACK).df
@@ -194,9 +198,9 @@ def fetch_bars(api: tradeapi.REST, symbol: str) -> Optional[pd.DataFrame]:
     df = df.copy()
 
     # The API can include a partially-formed final bar; exclude it so the
-    # crossover check only ever acts on fully closed 15-minute candles.
+    # crossover check only ever acts on fully closed candles.
     now_utc = pd.Timestamp.now(tz="UTC")
-    last_bar_close = df.index[-1] + pd.Timedelta(minutes=15)
+    last_bar_close = df.index[-1] + pd.Timedelta(minutes=BAR_MINUTES[TIMEFRAME])
     if last_bar_close > now_utc:
         df = df.iloc[:-1]
 
@@ -386,7 +390,7 @@ def trading_cycle(api: tradeapi.REST, symbol: str) -> None:
 
     df = fetch_bars(api, symbol)
     if df is None or len(df) < EMA_LONG_PERIOD + 1:
-        log.warning(f"Not enough closed 15-min bars for {symbol} yet; skipping this cycle.")
+        log.warning(f"Not enough closed {TIMEFRAME} bars for {symbol} yet; skipping this cycle.")
         return
 
     df = compute_emas(df)
@@ -451,7 +455,7 @@ def run_bot() -> None:
     log.info(
         f"Trade size=${TRADE_NOTIONAL_USD:.2f}/symbol | "
         f"Stop-loss={STOP_LOSS_PCT:.0%} | Take-profit={TAKE_PROFIT_PCT:.0%} | "
-        f"Timeframe=15Min | EMA periods={EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}"
+        f"Timeframe={TIMEFRAME} | EMA periods={EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}"
     )
     log.info("=" * 78)
 
@@ -470,7 +474,7 @@ def run_bot() -> None:
 
     dashboard.describe(currency="USD", config={
         "watchlist": WATCHLIST, "tradeUsd": TRADE_NOTIONAL_USD,
-        "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}",
+        "timeframe": TIMEFRAME, "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}",
         "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
     })
 
