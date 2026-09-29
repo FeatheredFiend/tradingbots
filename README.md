@@ -4,8 +4,10 @@ Small, paper/demo-only trading bots against different brokers' APIs.
 **Nothing in this repo trades real money.** The same strategies run on
 each broker - a momentum scanner and an EMA crossover bot, plus four
 [strategy bots](#strategy-bots-strategy-bots) (forex session breakout,
-index mean reversion, commodity trend, and an "HFT-style" tick scalper) -
-29 bots in all. What differs
+index mean reversion, commodity trend, and an "HFT-style" tick scalper),
+and an [opening surge](#opening-surge-strategy-botssurge_) scanner that
+watches the whole US stock market at the open and passes what it finds to
+a follower bot on each broker with US shares - 33 bots in all. What differs
 between brokers is how small a trade can be:
 
 | Broker | API access | Smallest trade | Runs on |
@@ -712,7 +714,85 @@ Clock and DST rules, indicators, each strategy's signals on made-up bars,
 and the runner's sizing, spread, rollover, slots, dry run and
 other-people's-positions rules against a fake broker. `test_rollover.py`
 covers the CFD scanners' close before the rollover: its timing, and that
-each closes only its own trades. No broker is contacted.
+each closes only its own trades. `test_surge.py` covers the opening surge:
+the surge rule, the signals file, the scanner on made-up Alpaca data and
+the followers against a fake broker. No broker is contacted. Run them in
+`ig-bot-env`, which has everything they import.
+
+## Opening surge (`strategy-bots/surge_*`)
+
+**Concept.** The first minutes after the 09:30 New York open (14:30 UK)
+are the wildest of the US day. One bot watches the **whole US stock
+market** then and spots any share whose price keeps jumping the same way,
+poll after poll; the others jump on it, betting the surge carries on.
+It's two kinds of bot, talking through a file on this PC:
+
+| Bot | Runs in | Does |
+|---|---|---|
+| `surge_scanner_bot.py` (**Surge scanner**) | alpaca-bot-env | Watches every liquid US share through Alpaca's market data and writes each surge to `strategy-bots/state/surge-signals-<date>.jsonl`. Places no trades. |
+| `alpaca_surge_follower_bot.py` | alpaca-bot-env | Buys the rising ones (Alpaca: buys only, $100 budget) |
+| `capital_surge_follower_bot.py` | ig-bot-env | Trades each surge as a share CFD, long or short (200 budget) |
+| `pepperstone_surge_follower_bot.py` | pepperstone-bot-env | The same on MT5 (`AAPL.US` and co., 1,000 budget, magic number 928007) |
+
+Start the scanner and at least one follower - from the launcher, or:
+
+```powershell
+python strategy-bots\surge_scanner_bot.py                  # alpaca-bot-env
+python strategy-bots\capital_surge_follower_bot.py         # ig-bot-env
+```
+
+IG has no follower (it doesn't give share prices over its API) and nor has
+OANDA (no shares). A follower warns in its log just after the open if the
+scanner isn't running. On the dashboard they're `surge-scanner` (its log
+shows every surge it sends) and e.g. `capital-surge-follower`.
+
+**Scanner.**
+- Shares: every active, tradable share or fund on NYSE, Nasdaq, NYSE Arca,
+  NYSE American and Cboe BZX that closed at `SURGE_MIN_PRICE` ($5) or more
+  with a median of `SURGE_MIN_DOLLAR_VOLUME` ($20 million) traded a day over
+  the last week - the `SURGE_MAX_SHARES` (1,500) most traded of them.
+  Picked ten minutes before the watch starts, from consolidated (SIP) daily
+  bars, and cached for the day. On 29 September 2026: 2,721 of 13,192
+  listed qualified; SPY, QQQ, MU, NVDA and META were the most traded.
+- Reads: every share's latest trade, every `SURGE_POLL_SECONDS` (5), from a
+  minute before the open to `SURGE_WATCH_MINUTES` (15) after it - 4 requests
+  a poll for 1,500 shares (~0.4s), ~48 a minute of the 200 Alpaca allows
+  each key. Alpaca's calendar says when each session opens, holidays and
+  early closes included.
+- Surge: the latest trade price has jumped at least `SURGE_JUMP_PERCENT`
+  (0.2%) the same way on each of the last `SURGE_CONFIRM_POLLS` (3) polls -
+  each a new trade, all at or after the open (so at the defaults, 0.6%+ in
+  15 seconds). Up -> **long** signal, down -> **short**. Each share signals
+  at most once a day; when more than 10 surge on the same poll, the 10
+  biggest go out.
+- Prices come from Alpaca's free IEX feed - one exchange's trades, a few
+  percent of the market's, so a thinly traded share can look still when it
+  isn't. `SURGE_FEED=sip` uses every exchange's trades, on Alpaca's paid
+  plan.
+
+**Followers.**
+- Each reads the signals file every second. A signal older than
+  `SURGE_MAX_SIGNAL_AGE` (20s) is dropped - the surge has moved on - as is
+  a short on Alpaca, and a share its broker doesn't offer (looked up once a
+  day; `<BROKER>_SURGE_SYMBOL` says how the broker writes a ticker: `{}` on
+  Alpaca and Capital.com, `{}.US` on Pepperstone).
+- Stop-loss: back where the surge started - the surge's size, as a % of the
+  follower's own entry price. Take-profit: `SURGE_REWARD_RISK` (2) x that.
+  Both go on the order (pushed out to the broker's minimum distance if
+  they're inside it) and the bot also checks them itself every 5 seconds.
+- Time stop: `SURGE_MAX_HOLD_MINUTES` (15). Anything still open 15 minutes
+  before the US close is closed - never held overnight.
+- The strategy bots' risk rules: `SURGE_RISK_PERCENT` (0.5) of the budget at
+  risk per trade, leverage cap, `<BROKER>_SURGE_MAX_POSITIONS` (3), spread
+  at most `SURGE_MAX_SPREAD_PERCENT` (25%) of the stop distance, at most
+  `SURGE_MAX_TRADES_PER_DAY` (1) per share, only its own trades,
+  `STRATEGY_DRY_RUN`, closing from the dashboard.
+
+**What to expect.** The [market movers backtest](#market-movers-backtest-backtestmovers_backtestpy)
+tested a close cousin - chasing the whole market's fastest 5-60 minute
+movers - over six months and found nothing before costs and a loss after
+the spread, which is widest just when prices move fast. This tries it
+second by second, right at the open; treat the demo accounts as the test.
 
 ## IG position sizing (both IG bots)
 
@@ -895,7 +975,7 @@ who can sign in to the dashboard as an admin can close trades.
 
 `TradingBots.exe` starts and stops the bots and edits their settings:
 
-- **Bots:** all 29 bots with their status - including ones started by hand -
+- **Bots:** all 33 bots with their status - including ones started by hand -
   filtered by broker and strategy (and "Running only" to hide stopped ones), and Start / Stop / Restart per bot,
   "Start all ticked" and "Stop all", plus a link to each bot's dashboard
   page. Starting runs
@@ -938,7 +1018,8 @@ e.g. `start_bot.bat oanda-momentum-scanner`.
 Each momentum scanner and EMA bot lives in its own folder with its own
 `requirements.txt`; the shared pieces are `shared/dashboard_reporter.py`
 and `shared/rollover.py` (standard library only; the latter uses the
-strategy engine's `clock.py`). The strategy bots share `strategy-bots/engine/`
-and need nothing beyond their broker's existing requirements.
+strategy engine's `clock.py`). The strategy bots, and the opening surge
+scanner and followers, share `strategy-bots/engine/` and need nothing
+beyond their broker's existing requirements.
 Virtual environments (`*-bot-env/`) are gitignored — create your own per
 broker (all of a broker's bots share the same requirements).

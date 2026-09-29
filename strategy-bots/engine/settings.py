@@ -5,11 +5,14 @@ default below.
 
 Two kinds:
 - Strategy settings, shared by that strategy on every broker (like the
-  scanners' STREAK_LENGTH): BREAKOUT_*, REVERSION_*, TREND_*, SCALPER_*.
+  scanners' STREAK_LENGTH): BREAKOUT_*, REVERSION_*, TREND_*, SCALPER_*,
+  SURGE_* (the opening surge scanner and its followers).
 - Per-bot settings, one set per broker and strategy:
   <BROKER>_<BREAKOUT|REVERSION|TREND|SCALPER>_MARKETS / _BUDGET / _MAX_POSITIONS,
   plus _ACCOUNT_ID on OANDA and Capital.com (falling back to the broker's
-  OANDA_ACCOUNT_ID / CAPITAL_ACCOUNT_ID).
+  OANDA_ACCOUNT_ID / CAPITAL_ACCOUNT_ID). The surge followers have no
+  market list - they trade whatever the scanner finds - but a
+  <BROKER>_SURGE_SYMBOL naming how the broker writes a US share's ticker.
 
 STRATEGY_DRY_RUN=1 makes every strategy bot log the trades it would make
 without sending them.
@@ -25,9 +28,15 @@ STRATEGY_NAMES = {
     "index-reversion": "Index mean reversion",
     "commodity-trend": "Commodity trend (4H/15M)",
     "scalper": "Tick scalper (HFT-style)",
+    "surge-follower": "Opening surge follower",
 }
 STRATEGY_PREFIX = {"session-breakout": "BREAKOUT", "index-reversion": "REVERSION", "commodity-trend": "TREND",
-                   "scalper": "SCALPER"}
+                   "scalper": "SCALPER", "surge-follower": "SURGE"}
+
+# The surge followers trade the US shares the surge scanner finds, on the
+# brokers that offer them: how each writes a ticker ("{}" is the ticker).
+# IG doesn't give shares' prices over its API and OANDA has no shares.
+SURGE_SYMBOLS = {"alpaca": "{}", "capital": "{}", "pepperstone": "{}.US"}
 
 # Default markets, in each broker's own names. IG's are search terms
 # ("term" or "term:EPIC"), resolved at startup like the IG scanner's pool.
@@ -71,12 +80,15 @@ DEFAULT_BUDGET = {
     ("alpaca", "index-reversion"): 100, ("alpaca", "commodity-trend"): 100,
     ("oanda", "scalper"): 100, ("pepperstone", "scalper"): 1000, ("capital", "scalper"): 100,
     ("ig", "scalper"): 10000, ("alpaca", "scalper"): 100,
+    ("alpaca", "surge-follower"): 100, ("capital", "surge-follower"): 200, ("pepperstone", "surge-follower"): 1000,
 }
-DEFAULT_MAX_POSITIONS = {"session-breakout": 2, "index-reversion": 2, "commodity-trend": 2, "scalper": 2}
+DEFAULT_MAX_POSITIONS = {"session-breakout": 2, "index-reversion": 2, "commodity-trend": 2, "scalper": 2,
+                         "surge-follower": 3}
 
 # MetaTrader 5 tags each bot's positions with its own number; the
 # Pepperstone scanner and EMA bot use 928001 and 928002.
-MT5_MAGIC = {"session-breakout": 928003, "index-reversion": 928004, "commodity-trend": 928005, "scalper": 928006}
+MT5_MAGIC = {"session-breakout": 928003, "index-reversion": 928004, "commodity-trend": 928005, "scalper": 928006,
+             "surge-follower": 928007}
 
 TIMEFRAMES = {"M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400}
 
@@ -224,7 +236,33 @@ def strategy_params(strategy: str) -> dict:
         if params["session_start"] >= params["session_end"]:
             raise SettingsError("SCALPER_SESSION_START must be before SCALPER_SESSION_END (London time)")
         return params
+    if strategy == "surge-follower":
+        p = "SURGE_"
+        return {
+            "reward_risk": number(p + "REWARD_RISK", 2.0, minimum=0.1),
+            "max_hold_minutes": number(p + "MAX_HOLD_MINUTES", 15, minimum=1, maximum=360, whole=True),
+            "max_signal_age": number(p + "MAX_SIGNAL_AGE", 20, minimum=2, maximum=600, whole=True),
+            "max_trades_per_day": number(p + "MAX_TRADES_PER_DAY", 1, minimum=1, whole=True),
+            # The stop is only the surge's own size away, and spreads are wide
+            # at the open, so this is looser than the bar strategies' 10%.
+            **_risk(p, risk=0.5, spread=25),
+        }
     raise SettingsError(f"unknown strategy {strategy!r}")
+
+
+def surge_scanner_params() -> dict:
+    """The opening surge scanner's settings (engine/surge_scanner.py)."""
+    p = "SURGE_"
+    return {
+        "poll_seconds": number(p + "POLL_SECONDS", 5, minimum=2, maximum=60),
+        "confirm_polls": number(p + "CONFIRM_POLLS", 3, minimum=1, maximum=10, whole=True),
+        "jump_percent": number(p + "JUMP_PERCENT", 0.2, minimum=0.01, maximum=20),
+        "watch_minutes": number(p + "WATCH_MINUTES", 15, minimum=1, maximum=390, whole=True),
+        "min_price": number(p + "MIN_PRICE", 5, minimum=0),
+        "min_dollar_volume": number(p + "MIN_DOLLAR_VOLUME", 20, minimum=0),
+        "max_shares": number(p + "MAX_SHARES", 1500, minimum=1, maximum=12000, whole=True),
+        "feed": choice(p + "FEED", "iex", ("iex", "sip")),
+    }
 
 
 def choice(name: str, default: str, options: tuple) -> str:
@@ -257,6 +295,7 @@ class BotSettings:
     account_id: str
     dry_run: bool
     params: dict = field(default_factory=dict)
+    symbol_format: str = ""      # surge followers: how the broker writes a US ticker, "{}" being the ticker
 
     @property
     def env_prefix(self) -> str:
@@ -265,12 +304,23 @@ class BotSettings:
 
 
 def bot_settings(broker: str, strategy: str) -> BotSettings:
-    if (broker, strategy) not in DEFAULT_MARKETS:
+    prefix = f"{broker.upper()}_{STRATEGY_PREFIX.get(strategy, '')}_"
+    symbol_format = ""
+    if strategy == "surge-follower":
+        if broker not in SURGE_SYMBOLS:
+            raise SettingsError(f"there is no {STRATEGY_NAMES[strategy]} bot for {BROKER_NAMES.get(broker, broker)} - "
+                                f"it doesn't offer US shares over its API")
+        markets = []  # whatever the scanner signals
+        symbol_format = _raw(prefix + "SYMBOL") or SURGE_SYMBOLS[broker]
+        if "{}" not in symbol_format:
+            raise SettingsError(f"{prefix}SYMBOL={symbol_format!r} must contain {{}} where the ticker goes, e.g. {{}}.US")
+    elif (broker, strategy) not in DEFAULT_MARKETS:
         raise SettingsError(f"there is no {STRATEGY_NAMES.get(strategy, strategy)} bot for {BROKER_NAMES.get(broker, broker)}")
-    prefix = f"{broker.upper()}_{STRATEGY_PREFIX[strategy]}_"
-    markets = [m.strip() for m in (_raw(prefix + "MARKETS") or DEFAULT_MARKETS[(broker, strategy)]).split(",") if m.strip()]
-    if not markets:
-        raise SettingsError(f"{prefix}MARKETS names no markets")
+    else:
+        markets = [m.strip() for m in (_raw(prefix + "MARKETS") or DEFAULT_MARKETS[(broker, strategy)]).split(",")
+                   if m.strip()]
+        if not markets:
+            raise SettingsError(f"{prefix}MARKETS names no markets")
     account_id = ""
     if broker in ("oanda", "capital"):
         account_id = _raw(prefix + "ACCOUNT_ID") or _raw(f"{broker.upper()}_ACCOUNT_ID")
@@ -285,4 +335,5 @@ def bot_settings(broker: str, strategy: str) -> BotSettings:
         account_id=account_id,
         dry_run=flag("STRATEGY_DRY_RUN", False),
         params=strategy_params(strategy),
+        symbol_format=symbol_format,
     )

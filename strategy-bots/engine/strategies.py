@@ -112,6 +112,10 @@ class Strategy:
     key = ""
     holds_overnight = False
     uses_prices = False          # True: trades on live price reads every few seconds, not closed bars (engine/scalper.py)
+    uses_signals = False         # True: trades another bot's signals, not its own markets (engine/surge.py)
+    # True: the bot closes at its own stop-loss / take-profit, checked on every
+    # pass, because the broker's may sit further out (at its minimum distance).
+    checks_own_levels = False
 
     def __init__(self, params: dict):
         self.p = params
@@ -517,4 +521,7 @@ def make_strategy(key: str, params: dict) -> Strategy:
     if key == "scalper":  # 4. the tick scalper, in engine/scalper.py (which builds on this module)
         from .scalper import Scalper
         return Scalper(params)
+    if key == "surge-follower":  # 5. the opening surge follower, in engine/surge.py
+        from .surge import SurgeFollower
+        return SurgeFollower(params)
     return STRATEGIES[key](params)

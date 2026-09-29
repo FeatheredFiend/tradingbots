@@ -66,6 +66,7 @@ FAMILIES = {
     "index-reversion": "Index mean reversion",
     "commodity-trend": "Commodity trend (4H/15M)",
     "scalper": "Tick scalper (HFT-style)",
+    "surge": "Opening surge (scanner + followers)",
 }
 # The strategy bots in strategy-bots/: each of these on every broker, except
 # forex on Alpaca, which has none. (key, env prefix, default markets per broker).
@@ -122,9 +123,18 @@ def _strategy_bot(broker: str, family: str) -> Bot:
                rf"strategy-bots\{broker}_{family.replace('-', '_')}_bot.py", family)
 
 
+# The opening surge: one scanner (on Alpaca's market data, no trades) and a
+# follower on each broker with US shares - (budget default, how it writes a ticker).
+SURGE_FOLLOWERS = {"alpaca": (100, "{}"), "capital": (200, "{}"), "pepperstone": (1000, "{}.US")}
+SURGE_BOTS = [Bot("surge-scanner", "Surge scanner", "alpaca", "Opening surge scanner (finds, doesn't trade)",
+                  r"strategy-bots\surge_scanner_bot.py", "surge")] + [
+    Bot(f"{broker}-surge-follower", f"{BROKERS[broker]} surge follower", broker, "Opening surge follower",
+        rf"strategy-bots\{broker}_surge_follower_bot.py", "surge") for broker in SURGE_FOLLOWERS]
+
 BOTS = [bot for broker in BROKERS for bot in (
     [b for b in CLASSIC_BOTS if b.broker == broker]
     + [_strategy_bot(broker, family) for family, (_, markets) in STRATEGY_BOTS.items() if broker in markets]
+    + [b for b in SURGE_BOTS if b.broker == broker]
 )]
 
 
@@ -324,6 +334,22 @@ def _strategy_bot_settings(broker: str) -> list:
     return rows
 
 
+def _surge_follower_settings(broker: str) -> list:
+    """The broker's surge follower's own settings, for its broker's section."""
+    budget, symbol = SURGE_FOLLOWERS[broker]
+    p = f"{broker.upper()}_SURGE_"
+    rows = [
+        Sub("Opening surge follower"),
+        Setting(p + "BUDGET", "Budget", f"Its own money, in the account's currency - default {budget:,}", number=True),
+        Setting(p + "MAX_POSITIONS", "Max positions", "Open at once - default 3", number=True),
+        Setting(p + "SYMBOL", "Share names", f"How {BROKERS[broker]} writes a US ticker, {{}} being the ticker - "
+                                             f"default {symbol}"),
+    ]
+    if broker == "capital":
+        rows.append(Setting(p + "ACCOUNT_ID", "Account ID", "Its own sub-account - empty for the CAPITAL_ACCOUNT_ID one"))
+    return rows
+
+
 def _risk_settings(prefix: str, risk: str, spread: str = "10") -> list:
     return [
         Sub("Risk"),
@@ -438,6 +464,28 @@ SETTING_GROUPS = [
         Setting("SCALPER_MAX_HOLD_SECONDS", "Time stop", "Seconds - default 300", number=True),
         *_risk_settings("SCALPER_", "0.5", spread="60"),
     ]),
+    ("Opening surge", "The surge scanner watches every liquid US share for the first minutes after the 09:30 New "
+                      "York open (14:30 UK) and passes each surge to the followers, which trade it. Start the "
+                      "scanner and at least one follower.", [
+        Sub("Scanner"),
+        Setting("SURGE_POLL_SECONDS", "Read prices every", "Seconds - default 5", number=True),
+        Setting("SURGE_CONFIRM_POLLS", "Polls in a row", "The jump must carry on this many polls - default 3",
+                number=True),
+        Setting("SURGE_JUMP_PERCENT", "Jump per poll", "% each poll must move, the same way - default 0.2", number=True),
+        Setting("SURGE_WATCH_MINUTES", "Watch for", "Minutes after the open - default 15", number=True),
+        Setting("SURGE_MIN_PRICE", "Min share price", "Dollars - default 5", number=True),
+        Setting("SURGE_MIN_DOLLAR_VOLUME", "Min traded a day", "$ millions, median of the last week - default 20",
+                number=True),
+        Setting("SURGE_MAX_SHARES", "Shares watched", "The most traded that qualify - default 1500", number=True),
+        Setting("SURGE_FEED", "Price feed", "iex (free plan, default) or sip (Alpaca's paid plan)"),
+        Sub("Followers"),
+        Setting("SURGE_MAX_SIGNAL_AGE", "Signal too old after", "Seconds - default 20", number=True),
+        Setting("SURGE_MAX_TRADES_PER_DAY", "Trades per share per day", "Default 1", number=True),
+        Setting("SURGE_REWARD_RISK", "Take-profit", "Times the stop distance (the stop is where the surge "
+                                                    "started) - default 2", number=True),
+        Setting("SURGE_MAX_HOLD_MINUTES", "Time stop", "Minutes - default 15", number=True),
+        *_risk_settings("SURGE_", "0.5", spread="25"),
+    ]),
     ("OANDA", "Practice account: hub > Tools > API > Generate. Give bots that trade the same markets "
               "sub-accounts of their own - OANDA nets a market's trades together.", [
         Setting("OANDA_API_TOKEN", "API token", secret=True),
@@ -461,6 +509,7 @@ SETTING_GROUPS = [
         Setting("PEPPERSTONE_POOL", "Scanner markets", "Comma-separated MT5 symbols - empty for the default 15"),
         Setting("PEPPERSTONE_WATCHLIST", "EMA bot markets", "Comma-separated - empty for AAPL.US, MSFT.US and co."),
         *_strategy_bot_settings("pepperstone"),
+        *_surge_follower_settings("pepperstone"),
     ]),
     ("Capital.com", "Demo account: Settings > API integrations (needs two-factor login turned on).", [
         Setting("CAPITAL_API_KEY", "API key", secret=True),
@@ -473,6 +522,7 @@ SETTING_GROUPS = [
         Setting("CAPITAL_POOL", "Scanner markets", "Comma-separated epics, e.g. US500,GOLD - empty for the default 15"),
         Setting("CAPITAL_WATCHLIST", "EMA bot markets", "Comma-separated epics - empty for AAPL, MSFT and co."),
         *_strategy_bot_settings("capital"),
+        *_surge_follower_settings("capital"),
     ]),
     ("Alpaca", "Paper account keys. The strategy bots here trade US funds (SPY, GLD, ...), buying only.", [
         Setting("APCA_API_KEY_ID", "API key ID"),
@@ -483,6 +533,7 @@ SETTING_GROUPS = [
         Setting("BOT_POOL", "Scanner shares", "Comma-separated tickers - empty for the default 30"),
         Setting("BOT_SYMBOLS", "EMA bot shares", "Comma-separated - default AAPL,MSFT,AMZN,GOOGL,TSLA"),
         *_strategy_bot_settings("alpaca"),
+        *_surge_follower_settings("alpaca"),
     ]),
     ("IG", "Demo account login and API key. The strategy bots trade each market's minimum size and share "
            "IG's 10,000 price-history points a week.", [

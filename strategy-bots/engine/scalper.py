@@ -68,6 +68,7 @@ class Scalper(Strategy):
     key = "scalper"
     holds_overnight = False
     uses_prices = True           # trades on every read of the live prices, not on closed bars
+    checks_own_levels = True     # its stop is a few spreads away - inside some brokers' minimum distance
 
     def __init__(self, params: dict):
         # No bars, so none of the base class's timeframe set-up.

@@ -43,6 +43,11 @@ the runner reads every market's price, hands it to the strategy, checks the
 scalper's own stop-loss / take-profit (the broker's may sit further out, at
 its minimum distance) and looks for entries - read_prices() and on_prices().
 The same risk rules apply.
+
+The opening surge followers (engine/surge.py: FollowerBot, built on this
+one) have no market list: they trade the US shares the surge scanner
+signals, looked up on their broker as the signals arrive, through the same
+entry, sizing and exit code as here.
 """
 
 import json
@@ -69,7 +74,7 @@ FILL_GRACE_SECONDS = 180         # a position just opened may take this long to 
 ERROR_BACKOFF_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
 ROLLOVER_QUIET = (15, 45)        # minutes before / after the rollover without new trades
-PRICE_CLOSE_RETRY_SECONDS = 20   # the scalper holds for minutes, so a failed close is retried sooner
+PRICE_CLOSE_RETRY_SECONDS = 20   # the scalper and surge follower hold for minutes, so a failed close is retried sooner
 STATUS_EVERY_SECONDS = 300       # the scalper logs each market's state this often (it reads every few seconds)
 # After a trade opens or closes, report to the dashboard this many seconds
 # later, not at the next 15-second snapshot: soon, then again once the
@@ -444,9 +449,10 @@ class StrategyBot:
             self.state.save()
 
     def time_exits(self, positions: dict, now: float, quotes: dict = None) -> None:
-        # The scalper checks its own stop-loss / take-profit on every read too:
-        # the broker's may sit further out, at its minimum distance.
-        check_levels = not self.broker.native_stops or self.strategy.uses_prices
+        # The scalper and the surge follower check their own stop-loss /
+        # take-profit on every pass too: the broker's may sit further out, at
+        # its minimum distance.
+        check_levels = not self.broker.native_stops or self.strategy.checks_own_levels
         if positions and check_levels and quotes is None:
             quotes = self.broker.quotes([self.markets[s] for s in positions])
         for symbol, position in list(positions.items()):
@@ -475,7 +481,7 @@ class StrategyBot:
     def close(self, market, position, reason: str, now: float) -> bool:
         if now < self.close_retry_at.get(market.symbol, 0):
             return False
-        retry = PRICE_CLOSE_RETRY_SECONDS if self.strategy.uses_prices else CLOSE_RETRY_SECONDS
+        retry = PRICE_CLOSE_RETRY_SECONDS if self.strategy.checks_own_levels else CLOSE_RETRY_SECONDS
         if self.settings.dry_run:
             self.log.info(f"DRY RUN: would close {market.symbol} {position.direction} {position.size:g} ({reason}).")
             self.close_retry_at[market.symbol] = now + retry
@@ -644,10 +650,10 @@ class StrategyBot:
             self.dashboard.report_soon(TRADE_REPORT_DELAYS[0])
 
     def broker_levels(self, market, quote, sign: int, entry: float, stop: float, take_profit) -> tuple:
-        """The stop-loss / take-profit to put on the order. The scalper's are
-        only a few spreads away - inside some brokers' minimum distance - so
+        """The stop-loss / take-profit to put on the order. The scalper's (and
+        the surge follower's) can be inside some brokers' minimum distance, so
         those go at the minimum instead and the bot closes at its own levels."""
-        least = self.broker.min_stop_distance(market, quote) * 1.1 if self.strategy.uses_prices else 0.0
+        least = self.broker.min_stop_distance(market, quote) * 1.1 if self.strategy.checks_own_levels else 0.0
         if not least:
             return stop, take_profit
         broker_stop = stop if (entry - stop) * sign >= least else entry - sign * least
@@ -699,7 +705,12 @@ def main(broker_key: str, strategy_key: str) -> None:
         dashboard = DashboardReporter(settings.slug, settings.name, broker=BROKER_NAMES[broker_key],
                                       strategy=STRATEGY_NAMES[strategy_key])
         broker = make_broker(broker_key, settings, dashboard, log)
-        StrategyBot(settings, strategy, broker, dashboard, log).run()
+        if strategy.uses_signals:
+            from .surge import FollowerBot  # needs this module, so imported here
+            bot_class = FollowerBot
+        else:
+            bot_class = StrategyBot
+        bot_class(settings, strategy, broker, dashboard, log).run()
     except SettingsError as e:
         log.error(f"Can't start: {e}.")
         sys.exit(1)
