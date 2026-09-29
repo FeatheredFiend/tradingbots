@@ -243,25 +243,37 @@ class PepperstoneBroker(Broker):
                       f"take-profit={request['tp'] or 'none'} -> {outcome}")
         return done
 
-    def close(self, market: Market, position: Position, reason: str) -> bool:
+    def close(self, market: Market, position: Position, reason: str, size: float = None) -> bool:
         all_closed = True
+        left = size
         for p in position.raw or ():
+            if left is not None and left <= 0:
+                break
+            volume = p.volume if left is None else round(min(left, p.volume), 8)
             tick = mt5.symbol_info_tick(p.symbol)
             if tick is None:
                 self.log.error(f"No live price for {p.symbol}; can't close it ({reason}).")
+                self.close_problem = f"no live price for {p.symbol} (is the market open?)"
                 return False
             closing_long = p.type == mt5.POSITION_TYPE_BUY
             done, outcome = self._send({
-                "action": mt5.TRADE_ACTION_DEAL, "position": p.ticket, "symbol": p.symbol, "volume": p.volume,
+                "action": mt5.TRADE_ACTION_DEAL, "position": p.ticket, "symbol": p.symbol, "volume": volume,
                 "type": mt5.ORDER_TYPE_SELL if closing_long else mt5.ORDER_TYPE_BUY,
                 "price": tick.bid if closing_long else tick.ask, "deviation": DEVIATION_POINTS, "magic": self.magic,
                 "comment": self.comment, "type_time": mt5.ORDER_TIME_GTC, "type_filling": self._filling(market.raw),
             })
-            self.log.info(f"CLOSE {p.symbol} {'long' if closing_long else 'short'} {p.volume:g} lots ({reason}) -> {outcome}")
-            if done:
+            self.log.info(f"CLOSE {p.symbol} {'long' if closing_long else 'short'} {volume:g} lots ({reason}) -> {outcome}")
+            if done and volume >= p.volume:
                 self.close_reasons[p.ticket] = reason
+            if not done:
+                self.close_problem = outcome
+            if left is not None:
+                left -= volume
             all_closed = all_closed and done
         return all_closed
+
+    def refs(self, position: Position) -> set:
+        return {str(p.ticket) for p in position.raw or ()}
 
     # -- dashboard ------------------------------------------------------------------
     def report(self, markets: dict, notes: dict) -> None:
@@ -296,7 +308,7 @@ class PepperstoneBroker(Broker):
         self.dashboard.update(
             account={"balance": account.balance, "equity": account.equity, "unrealizedPl": account.profit},
             positions=[{
-                "symbol": p.symbol, "direction": "long" if p.type == mt5.POSITION_TYPE_BUY else "short",
+                "ref": p.ticket, "symbol": p.symbol, "direction": "long" if p.type == mt5.POSITION_TYPE_BUY else "short",
                 "size": p.volume, "entryPrice": p.price_open, "currentPrice": p.price_current, "pnl": p.profit + p.swap,
                 "stopLoss": p.sl or None, "takeProfit": p.tp or None, "openedAt": self._to_utc(p.time),
             } for p in positions if p.symbol in markets],

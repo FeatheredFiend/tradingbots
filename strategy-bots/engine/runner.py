@@ -34,6 +34,9 @@ open, since most accounts net a market's buys and sells together. The
 ids, notes on each position (entry, stop, best price so far) and the
 day's trade counts are saved to strategy-bots/state/<bot>.json, so a
 restart carries on where it stopped.
+
+With DASHBOARD_COMMANDS=1, the dashboard can close (part of) the bot's own
+positions too - see close_from_dashboard().
 """
 
 import json
@@ -49,7 +52,7 @@ from .settings import BROKER_NAMES, STRATEGY_NAMES, TIMEFRAMES, SettingsError, b
 from .strategies import make_strategy
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "shared"))
-from dashboard_reporter import DashboardReporter  # noqa: E402 - needs the path above
+from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
 
 STATE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state")
 LOOP_SECONDS = 30
@@ -237,6 +240,7 @@ class StrategyBot:
         self.started_at = time.time()
         self.refresh_feeds(self.started_at)
         self.seen = {s: (f["exec"].bars[-1].time if f["exec"].bars else 0.0) for s, f in self.feeds.items()}
+        self.dashboard.accept_closes(self.close_from_dashboard)
         log.info(f"Waiting for the next {self.strategy.timeframe} bar to close before trading.")
 
     def slice_cap(self) -> float:
@@ -324,16 +328,60 @@ class StrategyBot:
                 if bars[-1].time + feeds["exec"].seconds >= self.started_at:
                     new_bars.append(symbol)
 
-        own, others = {}, {}
-        for symbol, position in self.broker.positions(self.markets).items():
-            notes = self.state.positions.get(symbol)
-            mine = position.own if position.own is not None else (
-                notes is not None and notes.get("direction") == position.direction)
-            (own if mine else others)[symbol] = position
+        own, others = self.split_positions(self.markets)
         self.reconcile(own, others, now)
         self.time_exits(own, now)
         if new_bars:
             self.on_new_bars(new_bars, own, others, now)
+
+    def split_positions(self, markets: dict) -> tuple:
+        """({symbol: the bot's own position}, {symbol: anyone else's}) in these markets."""
+        own, others = {}, {}
+        for symbol, position in self.broker.positions(markets).items():
+            notes = self.state.positions.get(symbol)
+            mine = position.own if position.own is not None else (
+                notes is not None and notes.get("direction") == position.direction)
+            (own if mine else others)[symbol] = position
+        return own, others
+
+    def close_from_dashboard(self, symbol: str, ref, direction: str, size) -> str:
+        """A close asked for on the dashboard: all of the bot's own position
+        in `symbol`, or `size` of it. Only ever the bot's own, and only if
+        it's still the position the dashboard showed (same side, same ref)."""
+        # IG's positions go to the dashboard under the market's name, the rest under the symbol.
+        market = self.markets.get(symbol) or next((m for m in self.markets.values() if m.name == symbol), None)
+        if market is None:
+            raise CommandError(f"{symbol} isn't one of this bot's markets.")
+        position = self.split_positions({market.symbol: market})[0].get(market.symbol)
+        if position is None:
+            raise CommandError(f"The bot has no open {symbol} position now - it may have closed already.")
+        if position.direction != direction:
+            raise CommandError(f"The bot's {symbol} position is {position.direction} now, not {direction}, so it "
+                               f"was left alone.")
+        refs = self.broker.refs(position)
+        if ref is not None and refs and ref not in refs:
+            raise CommandError(f"That {symbol} position has closed; the bot's open one now is a different trade, "
+                               f"so it was left alone.")
+        if size is not None:
+            step = market.size_step or market.min_size or 1.0
+            size = round(math.floor(size / step + 1e-9) * step, 10)
+            if size <= 0:
+                raise CommandError(f"That's less than the smallest step {self.broker.name} takes ({step:g}).")
+            if size >= position.size - 1e-9:
+                size = None  # all of it
+        if self.settings.dry_run:
+            raise CommandError("The bot is on a dry run (STRATEGY_DRY_RUN), so it sends no orders - nothing was closed.")
+
+        self.broker.close_problem = ""
+        if not self.broker.close(market, position, "closed from the dashboard", size=size):
+            raise CommandError(f"{self.broker.name} didn't close {symbol}: "
+                               f"{self.broker.close_problem or 'see the bot log for why'}.")
+        if size is not None:
+            return f"Closed {size:g} of the {symbol} {direction} position ({position.size:g}) at {self.broker.name}."
+        self.state.positions.pop(market.symbol, None)
+        self.state.save()
+        self.close_retry_at.pop(market.symbol, None)
+        return f"Closed the {symbol} {direction} position ({position.size:g}) at {self.broker.name}."
 
     def reconcile(self, own: dict, others: dict, now: float) -> None:
         """Match the saved notes to what's really open."""

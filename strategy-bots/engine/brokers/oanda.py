@@ -146,8 +146,11 @@ class OandaBroker(Broker):
             held.size += abs(units)
             held.pnl += float(t.get("unrealizedPL") or 0)
             held.opened_at = min(held.opened_at, float(t["openTime"]))
-            held.raw.append(t["id"])
+            held.raw.append((t["id"], abs(units)))
         return {**others, **own}
+
+    def refs(self, position: Position) -> set:
+        return {trade_id for trade_id, _ in position.raw or ()}
 
     def open(self, market: Market, direction: str, size: float, stop: float, take_profit, quote: Quote) -> bool:
         sign = 1 if direction == "long" else -1
@@ -175,21 +178,36 @@ class OandaBroker(Broker):
                       f"take-profit={order.get('takeProfitOnFill', {}).get('price', 'none')} -> {outcome}")
         return filled
 
-    def close(self, market: Market, position: Position, reason: str) -> bool:
+    def close(self, market: Market, position: Position, reason: str, size: float = None) -> bool:
         """Trade by trade - closing the whole position would close any other
-        bot's trades in the same direction too."""
+        bot's trades in the same direction too. A partial close takes whole
+        trades first and the rest out of the next one."""
         all_closed = True
-        for trade_id in position.raw or ():
+        left = size
+        precision = int(market.raw["tradeUnitsPrecision"])
+        for trade_id, units in position.raw or ():
+            if left is not None and left <= 0:
+                break
+            body = {}
+            if left is not None and left < units:
+                body = {"units": f"{left:.{precision}f}"}
             try:
-                body = self._call("PUT", f"/v3/accounts/{self.account_id}/trades/{trade_id}/close")
+                reply = self._call("PUT", f"/v3/accounts/{self.account_id}/trades/{trade_id}/close",
+                                   **({"json": body} if body else {}))
             except BrokerError as e:
                 self.log.error(f"{market.symbol}: close of trade {trade_id} refused ({reason}): {e}")
+                self.close_problem = str(e)
                 all_closed = False
                 continue
-            filled, outcome = _fill_outcome(body, "order")
-            self.log.info(f"CLOSE {market.symbol} {position.direction} trade {trade_id} ({reason}) -> {outcome}")
-            if filled:
+            filled, outcome = _fill_outcome(reply, "order")
+            self.log.info(f"CLOSE {market.symbol} {position.direction} trade {trade_id} "
+                          f"{body.get('units', 'all')} ({reason}) -> {outcome}")
+            if filled and not body:
                 self.close_reasons[trade_id] = reason
+            if not filled:
+                self.close_problem = outcome
+            if left is not None:
+                left -= min(left, units)
             all_closed = all_closed and filled
         return all_closed
 

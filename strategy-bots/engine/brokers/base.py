@@ -80,6 +80,7 @@ class Broker:
         self.dashboard = dashboard
         self.log = log
         self.close_reasons = {}  # broker trade/deal id -> why this bot closed it, for the dashboard
+        self.close_problem = ""  # why the last close() failed, in a few words, for the dashboard
         # The broker's ids for the trades this bot opened (saved by the runner),
         # so it only ever manages - and reports - its own, never another bot's
         # or a manual trade in the same market.
@@ -113,9 +114,16 @@ class Broker:
         attached. True if it filled; the new trade's ids go into own_ids."""
         raise NotImplementedError
 
-    def close(self, market: Market, position: Position, reason: str) -> bool:
-        """Close the bot's own position at market - only its own trades. True if it did."""
+    def close(self, market: Market, position: Position, reason: str, size: float = None) -> bool:
+        """Close the bot's own position at market - only its own trades - or
+        just `size` of it (already rounded to the market's step). True if it
+        did; if not, close_problem says why."""
         raise NotImplementedError
+
+    def refs(self, position: Position) -> set:
+        """The broker refs of the trades making up the position, as the
+        dashboard shows them (empty if it shows none)."""
+        return set()
 
     def swap_percent_per_night(self, market: Market, direction: str):
         """Overnight financing for holding `direction` one night, as a percent

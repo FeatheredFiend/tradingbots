@@ -80,7 +80,7 @@ from datetime import datetime, timezone
 import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
-from dashboard_reporter import DashboardReporter  # noqa: E402 - needs the path above
+from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -477,6 +477,34 @@ def close_position(epic: str, position: dict, reason: str) -> bool:
     return all_closed
 
 
+def close_from_dashboard(markets: dict, symbol: str, ref, direction: str, size) -> str:
+    """A close asked for on the dashboard (DASHBOARD_COMMANDS=1): the
+    position it showed as `ref`, if it's still open on the same side.
+    Capital.com's API only closes whole positions, so there's no `size`.
+    Answers what happened, or raises CommandError."""
+    if symbol not in markets:
+        raise CommandError(f"{symbol} isn't one of this bot's markets.")
+    if size is not None:
+        raise CommandError("Capital.com's API only closes whole positions - close all of it instead.")
+    items = [i for i in capital("GET", "/positions").get("positions", [])
+             if i["market"]["epic"] == symbol and (not ref or i["position"]["dealId"] == ref)]
+    if not items:
+        raise CommandError(f"There's no open {symbol} position now - it may have closed already.")
+    p = items[0]["position"]
+    side = "long" if p["direction"] == "BUY" else "short"
+    if side != direction:
+        raise CommandError(f"The {symbol} position is {side} now, not {direction}, so it was left alone.")
+    try:
+        closed, outcome = deal_outcome(confirm(capital("DELETE", f"/positions/{p['dealId']}")["dealReference"]))
+    except CapitalError as e:
+        raise CommandError(f"Capital.com refused: {e}") from None
+    log.info(f"CLOSE submitted (from the dashboard) -> {symbol} {side} {float(p['size']):g} result={outcome}")
+    if not closed:
+        raise CommandError(f"Capital.com didn't close it: {outcome}")
+    CLOSE_REASONS[p["dealId"]] = "closed from the dashboard"
+    return f"Closed the {symbol} {side} position ({float(p['size']):g}): {outcome}."
+
+
 # ---------------------------------------------------------------------------
 # DASHBOARD
 # ---------------------------------------------------------------------------
@@ -492,6 +520,7 @@ def dashboard_position(item: dict) -> dict:
     p, market = item["position"], item["market"]
     is_long = p["direction"] == "BUY"
     return {
+        "ref": p["dealId"],
         "symbol": market["epic"],
         "direction": "long" if is_long else "short",
         "size": float(p["size"]),
@@ -680,6 +709,7 @@ def run_bot() -> None:
         "timeframe": TIMEFRAME, "streakLength": STREAK_LENGTH, "stopLossPercent": STOP_LOSS_PCT * 100,
         "takeProfitPercent": TAKE_PROFIT_PCT * 100,
     })
+    dashboard.accept_closes(lambda *command: close_from_dashboard(pool, *command))
 
     seen_bar = None  # epic -> start time of the latest closed bar already dealt with
     consecutive_errors = 0

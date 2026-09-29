@@ -161,19 +161,22 @@ class AlpacaBroker(Broker):
                       f"-> order {order.id} {order.status}")
         return True
 
-    def close(self, market: Market, position: Position, reason: str) -> bool:
+    def close(self, market: Market, position: Position, reason: str, size: float = None) -> bool:
         try:
-            order = self.api.close_position(market.symbol)
+            order = self.api.close_position(market.symbol, qty=size)
         except (APIError, requests.exceptions.RequestException) as e:
             self.log.error(f"{market.symbol}: close refused ({reason}): {e}")
+            self.close_problem = str(e)
             return False
-        self.log.info(f"CLOSE {market.symbol} ({reason}) -> order {order.id}")
+        self.log.info(f"CLOSE {market.symbol} {size if size is not None else 'all'} ({reason}) -> order {order.id}")
         p = position.raw
         if p is not None:  # priced as Alpaca valued the position just before the sell
+            share = 1.0 if size is None else size / float(p.qty)
             self.dashboard.trade({
-                "ref": str(order.id), "symbol": p.symbol, "direction": "long", "size": float(p.qty),
+                "ref": str(order.id), "symbol": p.symbol, "direction": "long",
+                "size": float(p.qty) if size is None else size,
                 "entryPrice": float(p.avg_entry_price), "exitPrice": float(p.current_price),
-                "closedAt": datetime.now(timezone.utc).isoformat(), "pnl": float(p.unrealized_pl),
+                "closedAt": datetime.now(timezone.utc).isoformat(), "pnl": float(p.unrealized_pl) * share,
                 "closeReason": reason,
             })
         return True

@@ -333,6 +333,8 @@ SETTING_GROUPS = [
     ("General", "Where every bot reports to (leave empty to switch reporting off), and a dry run for the strategy bots.", [
         Setting("DASHBOARD_URL", "Dashboard address", "e.g. https://tradingdashboard.proprietary-data.com"),
         Setting("DASHBOARD_TOKEN", "Dashboard token", "The dashboard's INGEST_TOKEN", secret=True),
+        Setting("DASHBOARD_COMMANDS", "Close from dashboard", "1 = a dashboard admin can close (part of) a bot's "
+                                                              "positions; empty = off"),
         Setting("STRATEGY_DRY_RUN", "Strategy bots: dry run", "1 = log the trades they'd make without sending them"),
     ]),
     ("Momentum scanners", "Shared by the Alpaca, OANDA, Pepperstone, Capital.com and IG scanners.", [

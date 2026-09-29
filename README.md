@@ -703,6 +703,27 @@ to 2,000 log lines to send later. What each broker can report:
 | IG EMA bot | log and running status only | none |
 | Strategy bots | as their broker's bots above, but only the bot's own positions and trades; its Settings tab lists every setting it started with | as their broker's bots |
 
+### Closing positions from the dashboard (`DASHBOARD_COMMANDS`)
+
+With `DASHBOARD_COMMANDS=1` as well (launcher: Settings > General > "Close
+from dashboard"), a dashboard admin gets a **Close** button on each of the
+bot's open positions - all of it, or part. The dashboard can't reach this
+PC, so the request rides back on the reply to the bot's next report
+(within about 10 seconds); the bot carries it out between its passes and
+its answer shows on the bot page. It's off by default: with it on, anyone
+who can sign in to the dashboard as an admin can close trades.
+
+- Only ever the bot's own position, and only if it's still the one the
+  dashboard showed - same side and same broker ref. If the bot reversed or
+  closed it in the meantime, nothing happens and the answer says why.
+- A request the bot doesn't collect within a minute (it's stopped, or the
+  PC is off) is dropped, so a close never fires late. Each goes out once.
+- Part closes are rounded down to the market's size step. Capital.com's
+  API only closes whole positions, and IG's minimum-size positions can't be
+  split.
+- The IG EMA bot doesn't report positions, so it has nothing to close.
+- A strategy bot on a dry run answers that it sent nothing.
+
 ## Launcher (`launcher/`) - a Windows app for all of this
 
 `TradingBots.exe` starts and stops the bots and edits their settings:

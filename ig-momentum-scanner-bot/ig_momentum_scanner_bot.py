@@ -101,7 +101,7 @@ from trading_ig import IGService
 from trading_ig.rest import IGException
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
-from dashboard_reporter import DashboardReporter  # noqa: E402 - needs the path above
+from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -571,6 +571,43 @@ def close_position(ig_service: IGService, epic: str, name: str, position: dict, 
         log.error(f"Error closing position for {name} ({epic}) ({reason}): {e}")
 
 
+def close_from_dashboard(ig_service: IGService, pool: list, symbol: str, ref, direction: str, size) -> str:
+    """A close asked for on the dashboard (DASHBOARD_COMMANDS=1): the
+    position it showed as `ref` (IG's deal ID) - all of it, or `size` of
+    it - if it's still open on the same side. Answers what happened, or
+    raises CommandError. The dashboard names markets as this bot does."""
+    item = next((i for i in pool if symbol in (i["name"], i["epic"])), None)
+    if item is None:
+        raise CommandError(f"{symbol} isn't one of this bot's markets.")
+    positions = fetch_all_positions(ig_service)
+    match = None
+    for _, row in (positions.iterrows() if positions is not None else ()):
+        if row["epic"] == item["epic"] and (not ref or row["dealId"] == ref):
+            match = row
+            break
+    if match is None:
+        raise CommandError(f"There's no open {symbol} position now - it may have closed already.")
+    side = "long" if match["direction"] == "BUY" else "short"
+    if side != direction:
+        raise CommandError(f"The {symbol} position is {side} now, not {direction}, so it was left alone.")
+    held = float(match["size"])
+    amount = held if size is None or size >= held else size
+    _rate_limiter.wait()
+    try:
+        # By deal ID alone: IG rejects a close that also names the epic and expiry.
+        result = ig_service.close_open_position(
+            deal_id=match["dealId"], direction="SELL" if match["direction"] == "BUY" else "BUY", epic=None,
+            expiry=None, level=None, order_type="MARKET", quote_id=None, size=amount,
+        )
+    except Exception as e:
+        raise CommandError(f"IG refused: {e or 'empty response - likely rate limited'}") from None
+    outcome = deal_outcome(result)
+    log.info(f"CLOSE submitted (from the dashboard) -> {item['name']} ({item['epic']}) {amount:g} result={outcome}")
+    if not outcome.startswith("ACCEPTED"):
+        raise CommandError(f"IG didn't close it: {outcome}")
+    return f"Closed {amount:g} of the {item['name']} {side} position ({held:g}): {outcome}."
+
+
 # ---------------------------------------------------------------------------
 # DASHBOARD
 # ---------------------------------------------------------------------------
@@ -624,6 +661,7 @@ def dashboard_positions(positions: Optional[pd.DataFrame], pool: list) -> list:
             continue
         is_long = p["direction"] == "BUY"
         rows.append({
+            "ref": p["dealId"],
             "symbol": names[p["epic"]],
             "direction": "long" if is_long else "short",
             "size": _number(p["size"]),
@@ -774,6 +812,7 @@ def run_bot() -> None:
         "markets": [item["name"] for item in pool], "timeframe": TIMEFRAME, "streakLength": STREAK_LENGTH,
         "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
     })
+    dashboard.accept_closes(lambda *command: close_from_dashboard(ig_service, pool, *command))
 
     consecutive_errors = 0
     pass_number = 0
@@ -781,6 +820,7 @@ def run_bot() -> None:
         pass_number += 1
         pass_started = time.monotonic()
         pass_had_error = False
+        dashboard.run_commands()  # closes asked for on the dashboard, before this pass's positions
 
         try:
             positions = fetch_all_positions(ig_service)

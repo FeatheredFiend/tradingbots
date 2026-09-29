@@ -279,20 +279,29 @@ class CapitalBroker(Broker):
                       f"take-profit={order.get('profitLevel', 'none')} -> {outcome}")
         return accepted
 
-    def close(self, market: Market, position: Position, reason: str) -> bool:
+    def close(self, market: Market, position: Position, reason: str, size: float = None) -> bool:
+        if size is not None:
+            self.close_problem = "Capital.com's API only closes whole positions"
+            return False
         all_closed = True
         for deal_id in position.raw or ():
             try:
                 closed, outcome = self._outcome(self._confirm(self._call("DELETE", f"/positions/{deal_id}")["dealReference"]))
             except BrokerError as e:
                 self.log.error(f"{market.symbol}: close refused ({reason}): {e}")
+                self.close_problem = str(e)
                 all_closed = False
                 continue
             self.log.info(f"CLOSE {market.symbol} {position.direction} ({reason}) -> {outcome}")
             if closed:
                 self.close_reasons[deal_id] = reason
+            else:
+                self.close_problem = outcome
             all_closed = all_closed and closed
         return all_closed
+
+    def refs(self, position: Position) -> set:
+        return set(position.raw or ())
 
     # -- dashboard ------------------------------------------------------------------
     def report(self, markets: dict, notes: dict) -> None:
@@ -317,6 +326,7 @@ class CapitalBroker(Broker):
             account={"balance": float(money["deposit"]), "equity": float(money["balance"]),
                      "unrealizedPl": float(money["profitLoss"])},
             positions=[{
+                "ref": i["position"]["dealId"],
                 "symbol": i["market"]["epic"],
                 "direction": "long" if i["position"]["direction"] == "BUY" else "short",
                 "size": float(i["position"]["size"]),

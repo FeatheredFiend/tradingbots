@@ -255,9 +255,15 @@ class FakeBroker(Broker):
         self.opened.append((market.symbol, direction, size, stop, take_profit))
         return True
 
-    def close(self, market, position, reason):
-        self.closed.append((market.symbol, reason))
+    def close(self, market, position, reason, size=None):
+        self.closed.append((market.symbol, reason) if size is None else (market.symbol, reason, size))
+        if getattr(self, "refuse", None):
+            self.close_problem = self.refuse
+            return False
         return True
+
+    def refs(self, position):
+        return set(position.raw or ())
 
 
 def settings(strategy="session-breakout", **overrides):
@@ -412,6 +418,70 @@ class RunnerTests(unittest.TestCase):
                 bot.cycle()
         self.assertEqual(broker.opened, [])
         self.assertEqual(broker.closed, [])
+
+
+    # -- closes asked for on the dashboard ------------------------------------------
+    def dashboard_bot(self, position, dry_run=False, refuse=None):
+        s = settings(dry_run=dry_run)
+        broker = FakeBroker(s, {}, Quote(1.3, 1.3001, True, unit_value=1.0), positions={"GBP_USD": position},
+                            refuse=refuse)
+        bot = self.bot(broker, s)
+        bot.markets = broker.resolve(["GBP_USD"])
+        bot.state.positions["GBP_USD"] = {"direction": position.direction, "opened_at": 1.0}
+        return bot, broker
+
+    def test_dashboard_closes_the_bots_own_position(self):
+        bot, broker = self.dashboard_bot(Position("GBP_USD", "long", 250, 1.3, raw=["T1"], own=True))
+        answer = bot.close_from_dashboard("GBP_USD", "T1", "long", None)
+        self.assertEqual(broker.closed, [("GBP_USD", "closed from the dashboard")])
+        self.assertIn("Closed the GBP_USD long position (250)", answer)
+        self.assertNotIn("GBP_USD", bot.state.positions)
+
+    def test_dashboard_closes_part_rounded_down_to_the_step(self):
+        bot, broker = self.dashboard_bot(Position("GBP_USD", "long", 250, 1.3, own=True))
+        answer = bot.close_from_dashboard("GBP_USD", None, "long", 100.7)
+        self.assertEqual(broker.closed, [("GBP_USD", "closed from the dashboard", 100.0)])
+        self.assertIn("Closed 100 of the GBP_USD long position (250)", answer)
+        self.assertIn("GBP_USD", bot.state.positions, "still open, so the notes stay")
+        broker.closed.clear()
+        bot.close_from_dashboard("GBP_USD", None, "long", 250)
+        self.assertEqual(broker.closed, [("GBP_USD", "closed from the dashboard")], "all of it is a plain close")
+
+    def test_dashboard_close_is_refused_when_the_position_isnt_the_one_shown(self):
+        from dashboard_reporter import CommandError
+        cases = [
+            (Position("GBP_USD", "short", 19, 1.3257, own=False), "GBP_USD", None, "short", "no open GBP_USD"),
+            (Position("GBP_USD", "short", 250, 1.3, own=True), "GBP_USD", None, "long", "is short now"),
+            (Position("GBP_USD", "long", 250, 1.3, raw=["T2"], own=True), "GBP_USD", "T1", "long", "different trade"),
+            (Position("GBP_USD", "long", 250, 1.3, own=True), "EUR_USD", None, "long", "isn't one of this bot's"),
+            (Position("GBP_USD", "long", 250, 1.3, own=True), "GBP_USD", None, "long", "smallest step"),
+        ]
+        for position, symbol, ref, direction, why in cases:
+            with self.subTest(why):
+                bot, broker = self.dashboard_bot(position)
+                size = 0.4 if why == "smallest step" else None
+                with self.assertRaisesRegex(CommandError, why):
+                    bot.close_from_dashboard(symbol, ref, direction, size)
+                self.assertEqual(broker.closed, [])
+
+    def test_dashboard_close_on_a_dry_run_or_refused_by_the_broker(self):
+        from dashboard_reporter import CommandError
+        bot, broker = self.dashboard_bot(Position("GBP_USD", "long", 250, 1.3, own=True), dry_run=True)
+        with self.assertRaisesRegex(CommandError, "dry run"):
+            bot.close_from_dashboard("GBP_USD", None, "long", None)
+        self.assertEqual(broker.closed, [])
+
+        bot, broker = self.dashboard_bot(Position("GBP_USD", "long", 250, 1.3, own=True), refuse="MARKET_HALTED")
+        with self.assertRaisesRegex(CommandError, "Fake didn't close GBP_USD: MARKET_HALTED"):
+            bot.close_from_dashboard("GBP_USD", None, "long", None)
+        self.assertIn("GBP_USD", bot.state.positions)
+
+    def test_dashboard_names_ig_markets_by_name(self):
+        bot, broker = self.dashboard_bot(Position("CS.D.GBPUSD.TODAY.IP", "long", 1, 1.3, own=True))
+        bot.markets = {"CS.D.GBPUSD.TODAY.IP": Market("CS.D.GBPUSD.TODAY.IP", "GBP/USD", "GBP/USD", 1.0, 1.0)}
+        broker._positions = {"CS.D.GBPUSD.TODAY.IP": broker._positions["GBP_USD"]}
+        bot.close_from_dashboard("GBP/USD", None, "long", None)
+        self.assertEqual(broker.closed, [("CS.D.GBPUSD.TODAY.IP", "closed from the dashboard")])
 
 
 class FeedTests(unittest.TestCase):

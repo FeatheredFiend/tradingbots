@@ -310,22 +310,34 @@ class IGBroker(Broker):
                       f"-> {outcome}")
         return accepted
 
-    def close(self, market: Market, position: Position, reason: str) -> bool:
+    def close(self, market: Market, position: Position, reason: str, size: float = None) -> bool:
         all_closed = True
-        for deal_id, direction, size in position.raw or ():
+        left = size
+        for deal_id, direction, deal_size in position.raw or ():
+            if left is not None and left <= 0:
+                break
+            amount = deal_size if left is None else min(left, deal_size)
             try:
                 # By deal ID alone: IG rejects a close that also names the epic and expiry.
                 result = self._call(f"close {market.symbol}", IGService.close_open_position, paced=False,
                                     deal_id=deal_id, direction="SELL" if direction == "BUY" else "BUY", epic=None,
-                                    expiry=None, level=None, order_type="MARKET", quote_id=None, size=size)
+                                    expiry=None, level=None, order_type="MARKET", quote_id=None, size=amount)
             except BrokerError as e:
                 self.log.error(f"{market.symbol}: close failed ({reason}): {e}")
+                self.close_problem = str(e)
                 all_closed = False
                 continue
             closed, outcome = self._outcome(result)
-            self.log.info(f"CLOSE {market.symbol} {position.direction} ({reason}) -> {outcome}")
+            self.log.info(f"CLOSE {market.symbol} {position.direction} {amount:g} ({reason}) -> {outcome}")
+            if not closed:
+                self.close_problem = outcome
+            if left is not None:
+                left -= amount
             all_closed = all_closed and closed
         return all_closed
+
+    def refs(self, position: Position) -> set:
+        return {deal_id for deal_id, _, _ in position.raw or ()}
 
     # -- dashboard ------------------------------------------------------------------
     def _fetch_account(self):
@@ -348,7 +360,7 @@ class IGBroker(Broker):
                     continue
                 is_long = p["direction"] == "BUY"
                 report["positions"].append({
-                    "symbol": markets[p["epic"]].name, "direction": "long" if is_long else "short",
+                    "ref": p["dealId"], "symbol": markets[p["epic"]].name, "direction": "long" if is_long else "short",
                     "size": _number(p["size"]), "entryPrice": _number(p["level"]),
                     "currentPrice": _number(p["bid"] if is_long else p["offer"]),
                     "stopLoss": _number(p.get("stopLevel")), "takeProfit": _number(p.get("limitLevel")),

@@ -81,7 +81,7 @@ import time
 import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
-from dashboard_reporter import DashboardReporter  # noqa: E402 - needs the path above
+from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -377,6 +377,46 @@ def close_position(account_id: str, symbol: str, position: dict, reason: str) ->
     return filled
 
 
+def close_from_dashboard(account_id: str, markets: dict, symbol: str, ref, direction: str, size) -> str:
+    """A close asked for on the dashboard (DASHBOARD_COMMANDS=1): the trade
+    it showed as `ref` - all of it, or `size` units - if it's still open on
+    the same side. Answers what happened, or raises CommandError."""
+    if symbol not in markets:
+        raise CommandError(f"{symbol} isn't one of this bot's markets.")
+    if not ref:
+        raise CommandError("No OANDA trade ID came with it, so nothing was closed.")
+    try:
+        trade = oanda("GET", f"/v3/accounts/{account_id}/trades/{ref}")["trade"]
+    except OandaError as e:
+        raise CommandError(f"OANDA can't find trade {ref}: {e}") from None
+    units = float(trade.get("currentUnits") or 0)
+    if trade.get("state") != "OPEN" or trade.get("instrument") != symbol or units == 0:
+        raise CommandError(f"Trade {ref} isn't open any more - it may have closed already.")
+    side = "long" if units > 0 else "short"
+    if side != direction:
+        raise CommandError(f"Trade {ref} is {side}, not {direction}, so it was left alone.")
+
+    body = {}
+    if size is not None and size < abs(units):
+        precision = int(markets[symbol]["tradeUnitsPrecision"])
+        amount = math.floor(size * 10 ** precision + 1e-9) / 10 ** precision
+        if amount <= 0:
+            raise CommandError(f"{size:g} is less than the smallest amount OANDA trades in {symbol}.")
+        body = {"units": f"{amount:.{precision}f}"}
+    try:
+        reply = oanda("PUT", f"/v3/accounts/{account_id}/trades/{ref}/close", **({"json": body} if body else {}))
+    except OandaError as e:
+        raise CommandError(f"OANDA refused: {e}") from None
+    filled, outcome = fill_outcome(reply, "order")
+    log.info(f"CLOSE submitted (from the dashboard) -> {symbol} trade {ref} {side} "
+             f"{body.get('units', 'all')} units result={outcome}")
+    if not filled:
+        raise CommandError(f"OANDA didn't close it: {outcome}")
+    if not body:
+        CLOSE_REASONS[ref] = "closed from the dashboard"
+    return f"Closed {body.get('units', 'all')} of trade {ref} ({symbol} {side}): {outcome}."
+
+
 # ---------------------------------------------------------------------------
 # DASHBOARD
 # ---------------------------------------------------------------------------
@@ -518,6 +558,7 @@ def run_bot() -> None:
         "timeframe": TIMEFRAME, "streakLength": STREAK_LENGTH, "stopLossPercent": STOP_LOSS_PCT * 100,
         "takeProfitPercent": TAKE_PROFIT_PCT * 100,
     })
+    dashboard.accept_closes(lambda *command: close_from_dashboard(account_id, pool, *command))
 
     seen_bar = None  # symbol -> start time of the latest closed bar already dealt with
     consecutive_errors = 0

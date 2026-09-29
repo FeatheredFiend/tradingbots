@@ -66,7 +66,7 @@ import alpaca_trade_api as tradeapi
 from alpaca_trade_api.rest import APIError, TimeFrame, TimeFrameUnit
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
-from dashboard_reporter import DashboardReporter  # noqa: E402 - needs the path above
+from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -296,6 +296,34 @@ def close_open_position(api: tradeapi.REST, symbol: str, reason: str, position=N
         log.error(f"Unexpected error closing position for {symbol} ({reason}): {e}")
 
 
+def close_from_dashboard(api: tradeapi.REST, symbols, symbol: str, ref, direction: str, size) -> str:
+    """A close asked for on the dashboard (DASHBOARD_COMMANDS=1): all of the
+    position in `symbol`, or `size` of it. Answers what happened, or raises
+    CommandError."""
+    if symbol not in symbols:
+        raise CommandError(f"{symbol} isn't on this bot's watchlist.")
+    if direction != "long":
+        raise CommandError("This bot only buys, so it has no short to close.")
+    try:
+        position = api.get_position(symbol)
+    except APIError:
+        raise CommandError(f"There's no open {symbol} position now - it may have closed already.") from None
+    held = float(position.qty)
+    qty = None if size is None or size >= held else int(size * 1e9) / 1e9  # Alpaca takes up to 9 decimals
+    if qty is not None and qty <= 0:
+        raise CommandError(f"{size!r} is too small to sell.")
+    try:
+        order = api.close_position(symbol, qty=qty)
+    except (APIError, requests.exceptions.RequestException) as e:
+        raise CommandError(f"Alpaca refused: {e}") from None
+    log.info(f"CLOSE position submitted (from the dashboard) -> {symbol} {qty if qty else 'all'} order_id={order.id}")
+    report_closed_trade(order, position, "closed from the dashboard", qty)
+    answer = f"Sell order {order.id} sent for {f'{qty:g} of ' if qty else 'all '}{held:g} {symbol}."
+    if not is_crypto_symbol(symbol) and not api.get_clock().is_open:
+        answer += " The market is shut, so Alpaca fills it when it opens."
+    return answer
+
+
 # ---------------------------------------------------------------------------
 # DASHBOARD
 # ---------------------------------------------------------------------------
@@ -325,20 +353,21 @@ def report_to_dashboard(api: tradeapi.REST, symbols) -> None:
     )
 
 
-def report_closed_trade(order, position, reason: str) -> None:
-    """The trade this close ends, priced as Alpaca valued the position just
-    before the sell - the fill can differ by a cent or two."""
+def report_closed_trade(order, position, reason: str, qty=None) -> None:
+    """The trade this close ends (`qty` of it, if not all), priced as Alpaca
+    valued the position just before the sell - the fill can differ by a cent or two."""
     if position is None:
         return
+    share = 1.0 if qty is None else qty / float(position.qty)
     dashboard.trade({
         "ref": str(order.id),
         "symbol": position.symbol,
         "direction": "long",
-        "size": float(position.qty),
+        "size": float(position.qty) if qty is None else qty,
         "entryPrice": float(position.avg_entry_price),
         "exitPrice": float(position.current_price),
         "closedAt": datetime.now(timezone.utc).isoformat(),
-        "pnl": float(position.unrealized_pl),
+        "pnl": float(position.unrealized_pl) * share,
         "closeReason": reason.split(",")[0],
     })
 
@@ -477,6 +506,7 @@ def run_bot() -> None:
         "timeframe": TIMEFRAME, "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}",
         "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
     })
+    dashboard.accept_closes(lambda *command: close_from_dashboard(api, WATCHLIST, *command))
 
     consecutive_errors = 0
 
@@ -516,7 +546,7 @@ def run_bot() -> None:
                         f"Market is closed. Next open at {clock.next_open}. "
                         f"Sleeping {CLOSED_MARKET_SLEEP_SECONDS}s."
                     )
-                    time.sleep(CLOSED_MARKET_SLEEP_SECONDS)
+                    dashboard.sleep(CLOSED_MARKET_SLEEP_SECONDS, lambda: report_to_dashboard(api, WATCHLIST))
                     continue
 
         cycle_had_error = False

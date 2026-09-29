@@ -75,7 +75,7 @@ import time
 import MetaTrader5 as mt5
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
-from dashboard_reporter import DashboardReporter  # noqa: E402 - needs the path above
+from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -344,8 +344,9 @@ def submit_buy(symbol: str, info, currency: str) -> bool:
     return done
 
 
-def close_position(position, info, reason: str) -> bool:
-    """Close the whole (long) position at market. True if it filled."""
+def close_position(position, info, reason: str, volume: float = None) -> bool:
+    """Close the whole (long) position at market, or just `volume` lots of it. True if it filled."""
+    volume = volume or position.volume
     tick = mt5.symbol_info_tick(position.symbol)
     if tick is None:
         log.error(f"No live price for {position.symbol}; can't close it ({reason}).")
@@ -354,7 +355,7 @@ def close_position(position, info, reason: str) -> bool:
         "action": mt5.TRADE_ACTION_DEAL,
         "position": position.ticket,
         "symbol": position.symbol,
-        "volume": position.volume,
+        "volume": volume,
         "type": mt5.ORDER_TYPE_SELL,
         "price": tick.bid,
         "deviation": DEVIATION_POINTS,
@@ -364,10 +365,34 @@ def close_position(position, info, reason: str) -> bool:
         "type_filling": filling_type(info),
     }
     done, outcome = send(request)
-    log.info(f"CLOSE submitted ({reason}) -> {position.symbol} {position.volume:g} lots result={outcome}")
-    if done:
+    log.info(f"CLOSE submitted ({reason}) -> {position.symbol} {volume:g} lots result={outcome}")
+    if done and volume >= position.volume:
         CLOSE_REASONS[position.ticket] = reason
     return done
+
+
+def close_from_dashboard(markets: dict, symbol: str, ref, direction: str, size) -> str:
+    """A close asked for on the dashboard (DASHBOARD_COMMANDS=1): the bot's
+    position it showed as `ref` (its ticket) - all of it, or `size` lots -
+    if it's still open. Answers what happened, or raises CommandError."""
+    if symbol not in markets:
+        raise CommandError(f"{symbol} isn't on this bot's watchlist.")
+    if direction != "long":
+        raise CommandError("This bot only buys, so it has no short to close.")
+    own = [p for p in (mt5.positions_get(symbol=symbol) or ())
+           if p.magic == MAGIC and p.type == mt5.POSITION_TYPE_BUY and (not ref or str(p.ticket) == ref)]
+    if not own:
+        raise CommandError(f"The bot has no open {symbol} position" + (f" {ref}" if ref else "")
+                           + " now - it may have closed already.")
+    position, info = own[0], markets[symbol]
+    volume = position.volume
+    if size is not None and size < position.volume:
+        volume = round(math.floor(size / info.volume_step + 1e-9) * info.volume_step, 8)
+        if volume < info.volume_min:
+            raise CommandError(f"The smallest amount Pepperstone closes in {symbol} is {info.volume_min:g} lots.")
+    if not close_position(position, info, "closed from the dashboard", volume):
+        raise CommandError("Pepperstone didn't close it - the bot's log says why.")
+    return f"Closed {volume:g} of {position.volume:g} lots of the {symbol} long position."
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +473,7 @@ def report_to_dashboard(markets) -> None:
     dashboard.update(
         account={"balance": account.balance, "equity": account.equity, "unrealizedPl": account.profit},
         positions=[{
+            "ref": p.ticket,
             "symbol": p.symbol,
             "direction": "long" if p.type == mt5.POSITION_TYPE_BUY else "short",
             "size": p.volume,
@@ -534,6 +560,7 @@ def run_bot() -> None:
         "timeframe": TIMEFRAME, "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}",
         "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100, "magicNumber": MAGIC,
     })
+    dashboard.accept_closes(lambda *command: close_from_dashboard(watchlist, *command))
 
     seen_bar = None  # symbol -> start time of the latest closed bar already dealt with
     consecutive_errors = 0
