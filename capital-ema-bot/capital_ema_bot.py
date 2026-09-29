@@ -539,8 +539,8 @@ def closed_trades(markets, open_ids: set, quotes_rates: dict) -> list:
 
 def report_to_dashboard(markets, rates: dict) -> None:
     """Account, open positions and the last day's closed trades in this
-    bot's markets. Four requests, about once a minute; a failure only
-    skips it (and is logged once, not every minute)."""
+    bot's markets. Four requests, every 15 seconds or so; a failure only
+    skips it (and is logged once, not every time)."""
     global _last_report_problem
     try:
         account = fetch_account()
@@ -672,7 +672,7 @@ def run_bot() -> None:
             continue
 
         consecutive_errors = 0
-        time.sleep(LOOP_INTERVAL_SECONDS)
+        dashboard.sleep(LOOP_INTERVAL_SECONDS, lambda: report_to_dashboard(watchlist, rates))  # reports fall due while it waits
 
 
 if __name__ == "__main__":

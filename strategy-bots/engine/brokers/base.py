@@ -73,6 +73,7 @@ class Broker:
     fixed_min_size = False      # every trade is the market's minimum (IG)
     max_leverage = None         # a cap the broker imposes on this kind of account (Alpaca cash: 1)
     metered_history = False     # price history is rationed per bar (IG: 10,000 a week)
+    dashboard_every = None      # seconds between dashboard snapshots; None = the reporter's 15
 
     def __init__(self, settings, dashboard, log):
         self.settings = settings

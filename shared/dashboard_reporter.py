@@ -12,7 +12,8 @@ every REPORT_EVERY_SECONDS (which doubles as the "still running" heartbeat),
 a failed send just keeps the data for the next try, and the backlog is
 capped. Every log line the bot prints is forwarded; the bot itself calls
 describe() once at startup and update() with account, positions and recent
-trades whenever due() says so.
+trades whenever due() says so - including while it waits between passes,
+if it waits with sleep() instead of time.sleep().
 
 Standard library only, so it works in every bot's venv.
 """
@@ -32,8 +33,8 @@ from datetime import datetime, timezone
 URL = os.environ.get("DASHBOARD_URL", "").strip().rstrip("/")
 TOKEN = os.environ.get("DASHBOARD_TOKEN", "").strip()
 
-REPORT_EVERY_SECONDS = 20     # the dashboard calls a bot silent after 3 minutes without a report
-SNAPSHOT_EVERY_SECONDS = 60   # how often due() asks the bot for account/positions/trades
+REPORT_EVERY_SECONDS = 10     # the dashboard calls a bot silent after 3 minutes without a report
+SNAPSHOT_EVERY_SECONDS = 15   # how often due() asks the bot for account/positions/trades
 TIMEOUT_SECONDS = 10
 MAX_LOG_BACKLOG = 2000        # lines kept while the dashboard is unreachable
 MAX_LOGS_PER_REPORT = 500
@@ -83,13 +84,31 @@ class DashboardReporter:
             if config is not None:
                 self._bot["config"] = config
 
-    def due(self) -> bool:
-        """True about once a minute - time to gather a snapshot for update().
-        Always False when reporting is off, so the bot makes no extra calls."""
-        if not self.enabled or time.monotonic() - self._last_snapshot < SNAPSHOT_EVERY_SECONDS:
+    def due(self, every: float = None) -> bool:
+        """True every SNAPSHOT_EVERY_SECONDS (or `every`, for a broker that
+        rations requests) - time to gather a snapshot for update(). Always
+        False when reporting is off, so the bot makes no extra calls."""
+        if not self.enabled or time.monotonic() - self._last_snapshot < (every or SNAPSHOT_EVERY_SECONDS):
             return False
         self._last_snapshot = time.monotonic()
         return True
+
+    def sleep(self, seconds: float, report, every: float = None) -> None:
+        """time.sleep(seconds), but runs report() whenever due(every) comes
+        round meanwhile, so a bot whose loop sleeps longer than
+        SNAPSHOT_EVERY_SECONDS still keeps the dashboard fresh. A report()
+        that fails is logged, never raised - trading comes first."""
+        if not self.enabled:
+            time.sleep(seconds)
+            return
+        end = time.monotonic() + seconds
+        while (left := end - time.monotonic()) > 0:
+            time.sleep(min(left, 1.0))
+            if self.due(every):
+                try:
+                    report()
+                except Exception as e:
+                    logging.getLogger(__name__).warning(f"Couldn't gather the dashboard report: {e}")
 
     def update(self, account=None, positions=None, trades=None) -> None:
         """account: {"balance", "equity", "unrealizedPl"}; positions: the full

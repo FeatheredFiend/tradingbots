@@ -422,7 +422,7 @@ def server_offset(symbols) -> int | None:
 
 def report_to_dashboard(markets) -> None:
     """Account, this bot's open positions and its trades from the last week,
-    about once a minute. All local calls to the terminal; a failure just
+    every 15 seconds or so. All local calls to the terminal; a failure just
     skips it. Trades wait until the server's time offset is known, so their
     times are right."""
     try:
@@ -598,7 +598,7 @@ def run_bot() -> None:
             continue
 
         consecutive_errors = 0
-        time.sleep(LOOP_INTERVAL_SECONDS)
+        dashboard.sleep(LOOP_INTERVAL_SECONDS, lambda: report_to_dashboard(pool))  # reports fall due while it waits
 
 
 if __name__ == "__main__":

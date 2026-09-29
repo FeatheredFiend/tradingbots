@@ -300,7 +300,7 @@ def close_open_position(api: tradeapi.REST, symbol: str, reason: str, position=N
 # DASHBOARD
 # ---------------------------------------------------------------------------
 def report_to_dashboard(api: tradeapi.REST, symbols) -> None:
-    """Account and this bot's open positions, about once a minute (two
+    """Account and this bot's open positions, every 15 seconds or so (two
     requests); a failure just skips it. Closed trades are reported by
     close_open_position() as they happen. The stop/limit shown are the
     levels this bot enforces itself."""
@@ -535,7 +535,7 @@ def run_bot() -> None:
             continue
 
         consecutive_errors = 0
-        time.sleep(LOOP_INTERVAL_SECONDS)
+        dashboard.sleep(LOOP_INTERVAL_SECONDS, lambda: report_to_dashboard(api, WATCHLIST))  # reports fall due while it waits
 
 
 if __name__ == "__main__":

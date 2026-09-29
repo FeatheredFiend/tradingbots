@@ -88,6 +88,7 @@ class IGBroker(Broker):
     name = "IG"
     fixed_min_size = True
     metered_history = True
+    dashboard_every = 60        # each snapshot costs two of IG's ~30 requests a minute
 
     def __init__(self, settings, dashboard, log):
         super().__init__(settings, dashboard, log)

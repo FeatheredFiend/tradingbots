@@ -136,7 +136,7 @@ def default_config() -> dict:
         # What "Start all" starts. Not every bot at once: an EMA bot and a scanner on
         # the same OANDA or Alpaca account would close each other's trades.
         "start_all": [b.key for b in BOTS if "momentum" in b.key],
-        "filter": {"broker": "", "family": ""},  # the Bots tab's filter ("" = all)
+        "filter": {"broker": "", "family": "", "running": False},  # the Bots tab's filter ("" = all)
     }
 
 
@@ -692,6 +692,9 @@ class BotsTab:
         self.family_choice.set(FAMILIES.get(saved.get("family"), self.ALL))
         for choice in (self.broker_choice, self.family_choice):
             choice.bind("<<ComboboxSelected>>", lambda e: self.apply_filter(save=True))
+        self.running_only = tk.BooleanVar(value=bool(saved.get("running")))
+        ttk.Checkbutton(toolbar, text="Running only", variable=self.running_only,
+                        command=lambda: self.apply_filter(save=True)).pack(side="left", padx=(px(16), 0))
         ttk.Button(toolbar, text="Stop all", command=lambda: app.stop(BOTS)).pack(side="right")
         ttk.Button(toolbar, text="Start all ticked", style="Primary.TButton", command=self.start_all
                    ).pack(side="right", padx=(0, px(8)))
@@ -723,16 +726,17 @@ class BotsTab:
         return broker, family
 
     def shown(self) -> list:
+        """The bots the filter lets through. "Running only" keeps a bot that's
+        starting or stopping, so its status stays in view until it's done."""
         broker, family = self.chosen()
-        return [b for b in BOTS if (not broker or b.broker == broker) and (not family or b.family == family)]
+        active = set(self.app.running) | set(self.app.busy) if self.running_only.get() else None
+        return [b for b in BOTS if (not broker or b.broker == broker) and (not family or b.family == family)
+                and (active is None or b.key in active)]
 
     def apply_filter(self, save: bool = False) -> None:
-        shown = {b.key for b in self.shown()}
-        for key, row in self.rows.items():
-            row.show(key in shown)
         if save:
             broker, family = self.chosen()
-            self.app.config["filter"] = {"broker": broker, "family": family}
+            self.app.config["filter"] = {"broker": broker, "family": family, "running": self.running_only.get()}
             save_config(self.app.config)
         self.update()
 
@@ -740,14 +744,18 @@ class BotsTab:
         self.app.start([b for b in BOTS if b.key in self.app.config["start_all"]])
 
     def update(self) -> None:
+        """Every refresh, since "Running only" changes as bots start and stop."""
         running = sum(1 for b in BOTS if b.key in self.app.running)
         shown = self.shown()
         text = f"{running} of {len(BOTS)} bots running"
         if len(shown) != len(BOTS):
             text += f" - showing {len(shown)} ({sum(1 for b in shown if b.key in self.app.running)} running)"
         self.summary.configure(text=text)
+        shown_keys = {b.key for b in shown}
         for bot in BOTS:
-            self.rows[bot.key].update(self.app.running.get(bot.key), self.app.busy.get(bot.key))
+            row = self.rows[bot.key]
+            row.show(bot.key in shown_keys)
+            row.update(self.app.running.get(bot.key), self.app.busy.get(bot.key))
 
 
 class BotRow:
@@ -782,8 +790,12 @@ class BotRow:
         separator = ttk.Separator(parent)
         separator.grid(row=row + 1, column=0, columnspan=5, sticky="ew")
         self.widgets = [tick, self.dot, names, self.status, buttons, separator]
+        self.visible = True
 
     def show(self, visible: bool) -> None:
+        if visible == self.visible:
+            return
+        self.visible = visible
         for widget in self.widgets:
             widget.grid() if visible else widget.grid_remove()
 

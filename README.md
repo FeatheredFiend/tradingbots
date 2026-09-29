@@ -689,16 +689,16 @@ for new windows):
 ```
 
 then restart the bots. Each sends a heartbeat with its new log lines every
-20 seconds and, about once a minute, its account, positions and recent
-trades. If the dashboard is down, the bot keeps trading and holds back up
+10 seconds and, every 15 seconds, its account, positions and recent trades
+(the IG bots once a minute, since IG's request limit is tight). If the dashboard is down, the bot keeps trading and holds back up
 to 2,000 log lines to send later. What each broker can report:
 
 | Bots | Account, positions, trades | Extra broker calls |
 |---|---|---|
-| OANDA | yes - trades with why they closed (stop-loss, take-profit, reversal) | 3 a minute |
+| OANDA | yes - trades with why they closed (stop-loss, take-profit, reversal) | 12 a minute |
 | Pepperstone | yes - trades matched from MT5's deal history by the bot's magic number | none (local terminal) |
-| Capital.com | yes - trades pieced together from the activity and transaction history, with why they closed | 4 a minute |
-| Alpaca | yes - trades as the bot closes them, priced at Alpaca's value just before the sell | 2 a minute |
+| Capital.com | yes - trades pieced together from the activity and transaction history, with why they closed | 16 a minute |
+| Alpaca | yes - trades as the bot closes them, priced at Alpaca's value just before the sell | 8 a minute |
 | IG scanner | yes - but no profit per open position (IG's REST API doesn't give one; the account's unrealised total is exact); trades from the transaction history every 5 minutes | about 1.2 a minute, inside its pacing |
 | IG EMA bot | log and running status only | none |
 | Strategy bots | as their broker's bots above, but only the bot's own positions and trades; its Settings tab lists every setting it started with | as their broker's bots |
@@ -708,7 +708,7 @@ to 2,000 log lines to send later. What each broker can report:
 `TradingBots.exe` starts and stops the bots and edits their settings:
 
 - **Bots:** all 24 bots with their status - including ones started by hand -
-  filtered by broker and strategy, and Start / Stop / Restart per bot,
+  filtered by broker and strategy (and "Running only" to hide stopped ones), and Start / Stop / Restart per bot,
   "Start all ticked" and "Stop all", plus a link to each bot's dashboard
   page. Starting runs
   `launcher/start_bot.bat`, which opens the bot as a new tab in one

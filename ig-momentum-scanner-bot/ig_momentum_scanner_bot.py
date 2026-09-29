@@ -575,9 +575,11 @@ def close_position(ig_service: IGService, epic: str, name: str, position: dict, 
 # DASHBOARD
 # ---------------------------------------------------------------------------
 # Open positions come free with every pass. The account costs one request
-# about once a minute and closed trades one every TRADES_EVERY_SECONDS, both
-# through the same pacer as everything else, so a pass takes a little longer
-# but IG's limit still holds.
+# every ACCOUNT_EVERY_SECONDS and closed trades one every
+# TRADES_EVERY_SECONDS, both through the same pacer as everything else, so
+# a pass takes a little longer but IG's limit still holds. (Other brokers'
+# bots send their account every 15 seconds; IG's request limit is too tight.)
+ACCOUNT_EVERY_SECONDS = 60
 TRADES_EVERY_SECONDS = 300
 TRADES_LOOKBACK_DAYS = 7
 _last_trades_fetch = 0.0
@@ -685,7 +687,7 @@ def report_to_dashboard(ig_service: IGService, positions: Optional[pd.DataFrame]
         return
     try:
         report = {"positions": dashboard_positions(positions, pool)}
-        if dashboard.due():
+        if dashboard.due(ACCOUNT_EVERY_SECONDS):
             report["account"] = fetch_account(ig_service)
             if time.monotonic() - _last_trades_fetch >= TRADES_EVERY_SECONDS:
                 _last_trades_fetch = time.monotonic()

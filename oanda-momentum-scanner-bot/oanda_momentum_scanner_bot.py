@@ -419,7 +419,7 @@ def dashboard_trade(trade: dict) -> dict:
 
 def report_to_dashboard(account_id: str, markets) -> None:
     """Account, open trades and the last 50 closed trades in this bot's
-    markets. Three requests, about once a minute; a failure just skips it."""
+    markets. Three requests, every 15 seconds or so; a failure just skips it."""
     try:
         summary = oanda("GET", f"/v3/accounts/{account_id}/summary")["account"]
         open_trades = oanda("GET", f"/v3/accounts/{account_id}/openTrades").get("trades", [])
@@ -551,7 +551,7 @@ def run_bot() -> None:
             continue
 
         consecutive_errors = 0
-        time.sleep(LOOP_INTERVAL_SECONDS)
+        dashboard.sleep(LOOP_INTERVAL_SECONDS, lambda: report_to_dashboard(account_id, pool))  # reports fall due while it waits
 
 
 if __name__ == "__main__":

@@ -284,7 +284,15 @@ class StrategyBot:
                 self.log.info(f"Retrying in {backoff}s...")
                 time.sleep(backoff)
                 continue
-            time.sleep(LOOP_SECONDS)
+            self.dashboard.sleep(LOOP_SECONDS, self.report, self.broker.dashboard_every)
+
+    def report(self) -> None:
+        """Account, positions and trades for the dashboard - when due, which
+        can be in the middle of the wait between passes."""
+        try:
+            self.broker.report(self.markets, self.state.positions)
+        except Exception as e:
+            self.log.warning(f"Couldn't report to the dashboard this time: {e}")
 
     def refresh_feeds(self, now: float) -> None:
         for symbol, feeds in self.feeds.items():
@@ -302,11 +310,8 @@ class StrategyBot:
 
     def cycle(self) -> None:
         now = time.time()
-        if self.dashboard.due():
-            try:
-                self.broker.report(self.markets, self.state.positions)
-            except Exception as e:
-                self.log.warning(f"Couldn't report to the dashboard this time: {e}")
+        if self.dashboard.due(self.broker.dashboard_every):
+            self.report()
 
         self.refresh_feeds(now)
         new_bars = []
