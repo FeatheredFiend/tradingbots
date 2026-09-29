@@ -217,6 +217,13 @@ class CapitalBroker(Broker):
             market.raw = d  # keeps the overnight fee current
         return quotes
 
+    def min_stop_distance(self, market: Market, quote: Quote) -> float:
+        rule = ((market.raw or {}).get("dealingRules") or {}).get("minStopOrProfitDistance") or {}
+        value = float(rule.get("value") or 0)
+        # A percentage of the price (0.01% on the FX majors and the US 500), or
+        # "points", which on Capital.com are price units (EURUSD's step is 0.00001 points).
+        return value / 100 * quote.mid if rule.get("unit") == "PERCENTAGE" else value
+
     def swap_percent_per_night(self, market: Market, direction: str):
         fee = (market.raw or {}).get("instrument", {}).get("overnightFee") or {}
         rate = fee.get("longRate" if direction == "long" else "shortRate")

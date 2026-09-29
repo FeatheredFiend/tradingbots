@@ -1,7 +1,8 @@
 """
 The three CFD strategies, written once for every broker. Each looks at a
 market's closed bars and says what to do; runner.py checks the spread,
-swap and slots, sizes the trade and sends it.
+swap and slots, sizes the trade and sends it. (The fourth, the tick
+scalper, works on live price reads instead of bars: engine/scalper.py.)
 
 Every price here is the broker's own (mid) price; every time is UTC Unix
 seconds. "ATR" is the 14-bar average true range of the timeframe named.
@@ -110,6 +111,7 @@ def _fmt(price: float) -> str:
 class Strategy:
     key = ""
     holds_overnight = False
+    uses_prices = False          # True: trades on live price reads every few seconds, not closed bars (engine/scalper.py)
 
     def __init__(self, params: dict):
         self.p = params
@@ -512,4 +514,7 @@ STRATEGIES = {cls.key: cls for cls in (SessionBreakout, IndexReversion, Commodit
 
 
 def make_strategy(key: str, params: dict) -> Strategy:
+    if key == "scalper":  # 4. the tick scalper, in engine/scalper.py (which builds on this module)
+        from .scalper import Scalper
+        return Scalper(params)
     return STRATEGIES[key](params)

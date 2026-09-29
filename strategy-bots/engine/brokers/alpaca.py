@@ -38,6 +38,12 @@ MARKET_TZ = "America/New_York"
 SESSION_MINUTES = 390                          # 09:30-16:00
 TIMEFRAME_MINUTES = {"M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240}
 MIN_NOTIONAL_USD = 1.00
+CLOCK_SECONDS = 30                             # how long "is the market open?" is trusted
+
+
+def _two_sided(quote) -> bool:
+    bid, ask = float(quote.bp or 0), float(quote.ap or 0)
+    return bid > 0 and ask >= bid
 
 
 class AlpacaBroker(Broker):
@@ -50,6 +56,8 @@ class AlpacaBroker(Broker):
     def __init__(self, settings, dashboard, log):
         super().__init__(settings, dashboard, log)
         self.api = None
+        self._is_open = False
+        self._clock_until = 0.0
 
     def _call(self, what: str, fn, *args, **kwargs):
         try:
@@ -121,17 +129,25 @@ class AlpacaBroker(Broker):
         return bars[-count:]
 
     def quotes(self, markets: list) -> dict:
-        is_open = self._call("market clock", self.api.get_clock).is_open
+        """Every fund's latest quote in one request (the scalper asks every few
+        seconds); whether the market's open is asked at most every CLOCK_SECONDS."""
+        if time.monotonic() >= self._clock_until:
+            self._is_open = self._call("market clock", self.api.get_clock).is_open
+            self._clock_until = time.monotonic() + CLOCK_SECONDS
+        symbols = [m.symbol for m in markets]
+        latest = self._call("quotes", self.api.get_latest_quotes, symbols, feed=DATA_FEED) if symbols else {}
+        one_sided = [s for s in symbols if s not in latest or not _two_sided(latest[s])]
+        trades = self._call("last trades", self.api.get_latest_trades, one_sided, feed=DATA_FEED) if one_sided else {}
         quotes = {}
-        for market in markets:
-            quote = self._call(f"quote for {market.symbol}", self.api.get_latest_quote, market.symbol, feed=DATA_FEED)
-            bid, ask = float(quote.bp or 0), float(quote.ap or 0)
-            if bid <= 0 or ask <= 0 or ask < bid:  # IEX often shows one side only
-                last = float(self._call(f"last trade for {market.symbol}", self.api.get_latest_trade, market.symbol,
-                                        feed=DATA_FEED).p)
-                bid = ask = last
-            quotes[market.symbol] = Quote(bid, ask, is_open, unit_value=(bid + ask) / 2,
-                                          why_not="" if is_open else "the US market is closed")
+        for symbol in symbols:
+            if symbol in one_sided:  # IEX often shows one side only
+                if symbol not in trades:
+                    continue
+                bid = ask = float(trades[symbol].p)
+            else:
+                bid, ask = float(latest[symbol].bp), float(latest[symbol].ap)
+            quotes[symbol] = Quote(bid, ask, self._is_open, unit_value=(bid + ask) / 2,
+                                   why_not="" if self._is_open else "the US market is closed")
         return quotes
 
     def swap_percent_per_night(self, market: Market, direction: str):

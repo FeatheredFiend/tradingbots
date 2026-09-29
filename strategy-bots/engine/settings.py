@@ -5,9 +5,9 @@ default below.
 
 Two kinds:
 - Strategy settings, shared by that strategy on every broker (like the
-  scanners' STREAK_LENGTH): BREAKOUT_*, REVERSION_*, TREND_*.
+  scanners' STREAK_LENGTH): BREAKOUT_*, REVERSION_*, TREND_*, SCALPER_*.
 - Per-bot settings, one set per broker and strategy:
-  <BROKER>_<BREAKOUT|REVERSION|TREND>_MARKETS / _BUDGET / _MAX_POSITIONS,
+  <BROKER>_<BREAKOUT|REVERSION|TREND|SCALPER>_MARKETS / _BUDGET / _MAX_POSITIONS,
   plus _ACCOUNT_ID on OANDA and Capital.com (falling back to the broker's
   OANDA_ACCOUNT_ID / CAPITAL_ACCOUNT_ID).
 
@@ -24,8 +24,10 @@ STRATEGY_NAMES = {
     "session-breakout": "Forex session breakout",
     "index-reversion": "Index mean reversion",
     "commodity-trend": "Commodity trend (4H/15M)",
+    "scalper": "Tick scalper (HFT-style)",
 }
-STRATEGY_PREFIX = {"session-breakout": "BREAKOUT", "index-reversion": "REVERSION", "commodity-trend": "TREND"}
+STRATEGY_PREFIX = {"session-breakout": "BREAKOUT", "index-reversion": "REVERSION", "commodity-trend": "TREND",
+                   "scalper": "SCALPER"}
 
 # Default markets, in each broker's own names. IG's are search terms
 # ("term" or "term:EPIC"), resolved at startup like the IG scanner's pool.
@@ -48,6 +50,13 @@ DEFAULT_MARKETS = {
     # and the commodities, bought only (no fractional short selling).
     ("alpaca", "index-reversion"): "SPY,QQQ,DIA,IWM",
     ("alpaca", "commodity-trend"): "GLD,SLV,USO",
+    # The scalper wants the tightest spreads: FX majors and the S&P 500. IG's
+    # are named with their epics, so resolving them costs no searches.
+    ("oanda", "scalper"): "EUR_USD,GBP_USD,USD_JPY,SPX500_USD",
+    ("pepperstone", "scalper"): "EURUSD,GBPUSD,USDJPY,US500",
+    ("capital", "scalper"): "EURUSD,GBPUSD,USDJPY,US500",
+    ("ig", "scalper"): "EUR/USD:CS.D.EURUSD.MINI.IP,US 500:IX.D.SPTRD.IFS.IP",
+    ("alpaca", "scalper"): "SPY,QQQ",
 }
 
 # The budget each bot treats as its whole account, in the account's
@@ -60,12 +69,14 @@ DEFAULT_BUDGET = {
     ("capital", "session-breakout"): 100, ("capital", "index-reversion"): 200, ("capital", "commodity-trend"): 100,
     ("ig", "session-breakout"): 10000, ("ig", "index-reversion"): 10000, ("ig", "commodity-trend"): 10000,
     ("alpaca", "index-reversion"): 100, ("alpaca", "commodity-trend"): 100,
+    ("oanda", "scalper"): 100, ("pepperstone", "scalper"): 1000, ("capital", "scalper"): 100,
+    ("ig", "scalper"): 10000, ("alpaca", "scalper"): 100,
 }
-DEFAULT_MAX_POSITIONS = {"session-breakout": 2, "index-reversion": 2, "commodity-trend": 2}
+DEFAULT_MAX_POSITIONS = {"session-breakout": 2, "index-reversion": 2, "commodity-trend": 2, "scalper": 2}
 
 # MetaTrader 5 tags each bot's positions with its own number; the
 # Pepperstone scanner and EMA bot use 928001 and 928002.
-MT5_MAGIC = {"session-breakout": 928003, "index-reversion": 928004, "commodity-trend": 928005}
+MT5_MAGIC = {"session-breakout": 928003, "index-reversion": 928004, "commodity-trend": 928005, "scalper": 928006}
 
 TIMEFRAMES = {"M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400}
 
@@ -191,14 +202,43 @@ def strategy_params(strategy: str) -> dict:
         if TIMEFRAMES[params["higher_timeframe"]] <= TIMEFRAMES[params["timeframe"]]:
             raise SettingsError("TREND_HIGHER_TIMEFRAME must be longer than TREND_TIMEFRAME")
         return params
+    if strategy == "scalper":
+        p = "SCALPER_"
+        params = {
+            "poll_seconds": number(p + "POLL_SECONDS", 2, minimum=1, maximum=60),
+            "mode": choice(p + "MODE", "momentum", ("momentum", "reversion")),
+            "window_seconds": number(p + "WINDOW_SECONDS", 60, minimum=5, maximum=3600, whole=True),
+            "trigger_spreads": number(p + "TRIGGER_SPREADS", 4.0, minimum=0.5),
+            "stop_spreads": number(p + "STOP_SPREADS", 3.0, minimum=0.5),
+            "take_profit_spreads": number(p + "TAKE_PROFIT_SPREADS", 3.0, minimum=0.5),
+            "max_spread_ratio": number(p + "MAX_SPREAD_RATIO", 1.5, minimum=1),
+            "max_hold_seconds": number(p + "MAX_HOLD_SECONDS", 300, minimum=10, whole=True),
+            "cooldown_seconds": number(p + "COOLDOWN_SECONDS", 60, minimum=0, whole=True),
+            "session_start": clock_time(p + "SESSION_START", "07:00"),
+            "session_end": clock_time(p + "SESSION_END", "21:00"),
+            "max_trades_per_day": number(p + "MAX_TRADES_PER_DAY", 30, minimum=1, whole=True),
+            # The stop is only a few spreads away, so the spread is always a big
+            # share of it; MAX_SPREAD_RATIO is the scalper's real spread filter.
+            **_risk(p, risk=0.5, spread=60),
+        }
+        if params["session_start"] >= params["session_end"]:
+            raise SettingsError("SCALPER_SESSION_START must be before SCALPER_SESSION_END (London time)")
+        return params
     raise SettingsError(f"unknown strategy {strategy!r}")
 
 
-def _risk(prefix: str, risk: float) -> dict:
+def choice(name: str, default: str, options: tuple) -> str:
+    text = (_raw(name) or default).lower()
+    if text not in options:
+        raise SettingsError(f"{name}={text!r} must be one of {', '.join(options)}")
+    return text
+
+
+def _risk(prefix: str, risk: float, spread: float = 10) -> dict:
     return {
         "risk_percent": number(prefix + "RISK_PERCENT", risk, minimum=0.01, maximum=10),
         "max_leverage": number(prefix + "MAX_LEVERAGE", 5, minimum=0.1, maximum=30),
-        "max_spread_percent": number(prefix + "MAX_SPREAD_PERCENT", 10, minimum=0, maximum=100),
+        "max_spread_percent": number(prefix + "MAX_SPREAD_PERCENT", spread, minimum=0, maximum=100),
     }
 
 

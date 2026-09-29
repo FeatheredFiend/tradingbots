@@ -74,6 +74,7 @@ class Broker:
     max_leverage = None         # a cap the broker imposes on this kind of account (Alpaca cash: 1)
     metered_history = False     # price history is rationed per bar (IG: 10,000 a week)
     dashboard_every = None      # seconds between dashboard snapshots; None = the reporter's 15
+    min_poll_seconds = 1        # the scalper reads prices no more often than this (IG: its request allowance)
 
     def __init__(self, settings, dashboard, log):
         self.settings = settings
@@ -124,6 +125,11 @@ class Broker:
         """The broker refs of the trades making up the position, as the
         dashboard shows them (empty if it shows none)."""
         return set()
+
+    def min_stop_distance(self, market: Market, quote: Quote) -> float:
+        """The closest to the price the broker accepts a stop-loss or
+        take-profit, in price units (0 = no minimum)."""
+        return 0.0
 
     def swap_percent_per_night(self, market: Market, direction: str):
         """Overnight financing for holding `direction` one night, as a percent

@@ -161,6 +161,10 @@ class PepperstoneBroker(Broker):
             )
         return quotes
 
+    def min_stop_distance(self, market: Market, quote: Quote) -> float:
+        info = mt5.symbol_info(market.symbol) or market.raw
+        return info.trade_stops_level * info.point  # 0 on Pepperstone's FX and indices (29 September 2026)
+
     def swap_percent_per_night(self, market: Market, direction: str):
         info = mt5.symbol_info(market.symbol) or market.raw
         swap = info.swap_long if direction == "long" else info.swap_short

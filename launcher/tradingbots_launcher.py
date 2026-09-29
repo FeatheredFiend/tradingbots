@@ -65,6 +65,7 @@ FAMILIES = {
     "session-breakout": "Forex session breakout",
     "index-reversion": "Index mean reversion",
     "commodity-trend": "Commodity trend (4H/15M)",
+    "scalper": "Tick scalper (HFT-style)",
 }
 # The strategy bots in strategy-bots/: each of these on every broker, except
 # forex on Alpaca, which has none. (key, env prefix, default markets per broker).
@@ -78,6 +79,10 @@ STRATEGY_BOTS = {
     "commodity-trend": ("TREND", {
         "oanda": "XAU_USD, BCO_USD", "pepperstone": "XAUUSD, SpotBrent", "capital": "GOLD, OIL_BRENT",
         "ig": "Spot Gold, Oil - Brent Crude", "alpaca": "GLD, SLV, USO"}),
+    "scalper": ("SCALPER", {
+        "oanda": "EUR_USD, GBP_USD, USD_JPY, SPX500_USD", "pepperstone": "EURUSD, GBPUSD, USDJPY, US500",
+        "capital": "EURUSD, GBPUSD, USDJPY, US500", "ig": "EUR/USD:CS.D.EURUSD.MINI.IP, US 500:IX.D.SPTRD.IFS.IP",
+        "alpaca": "SPY, QQQ"}),
 }
 # Each strategy bot's own budget, when <BROKER>_<PREFIX>_BUDGET is empty (IG bots have none).
 STRATEGY_BOT_BUDGETS = {
@@ -86,6 +91,7 @@ STRATEGY_BOT_BUDGETS = {
     ("pepperstone", "commodity-trend"): 2000, ("capital", "session-breakout"): 100,
     ("capital", "index-reversion"): 200, ("capital", "commodity-trend"): 100,
     ("alpaca", "index-reversion"): 100, ("alpaca", "commodity-trend"): 100,
+    ("oanda", "scalper"): 100, ("pepperstone", "scalper"): 1000, ("capital", "scalper"): 100, ("alpaca", "scalper"): 100,
 }
 
 CLASSIC_BOTS = [
@@ -318,13 +324,13 @@ def _strategy_bot_settings(broker: str) -> list:
     return rows
 
 
-def _risk_settings(prefix: str, risk: str) -> list:
+def _risk_settings(prefix: str, risk: str, spread: str = "10") -> list:
     return [
         Sub("Risk"),
         Setting(prefix + "RISK_PERCENT", "Risk per trade %", f"Of the bot's budget, lost if the stop-loss is hit - default {risk}",
                 number=True),
         Setting(prefix + "MAX_LEVERAGE", "Max leverage", "Open trades worth at most budget x this - default 5", number=True),
-        Setting(prefix + "MAX_SPREAD_PERCENT", "Max spread", "As a % of the stop distance - default 10", number=True),
+        Setting(prefix + "MAX_SPREAD_PERCENT", "Max spread", f"As a % of the stop distance - default {spread}", number=True),
     ]
 
 
@@ -405,6 +411,26 @@ SETTING_GROUPS = [
         Setting("TREND_WEEKEND_FLAT", "Flat for the weekend", "1 = close Friday 20:00 UK (default), 0 = hold"),
         Setting("TREND_MAX_SWAP_PERCENT", "Max swap", "% of the trade's value per night - default 0.05", number=True),
         *_risk_settings("TREND_", "1"),
+    ]),
+    ("Tick scalper (HFT-style)", "Shared by the scalper on every broker. Reads live prices every few seconds and "
+                                 "trades short bursts, measured in the market's usual spread; out within minutes, "
+                                 "never overnight. Backtested, it loses about a spread a trade.", [
+        Setting("SCALPER_POLL_SECONDS", "Read prices every", "Seconds - default 2 (IG: 10 at the least)", number=True),
+        Setting("SCALPER_MODE", "Mode", "momentum = follow the burst (default), reversion = fade it"),
+        Setting("SCALPER_WINDOW_SECONDS", "Burst window", "Seconds - default 60", number=True),
+        Setting("SCALPER_TRIGGER_SPREADS", "Trigger", "A move of this many usual spreads in the window - default 4",
+                number=True),
+        Setting("SCALPER_MAX_SPREAD_RATIO", "Widest spread", "Times the usual spread - default 1.5", number=True),
+        Setting("SCALPER_SESSION_START", "Trade from", "London time - default 07:00"),
+        Setting("SCALPER_SESSION_END", "Trade until", "London time; anything still open closes then - default 21:00"),
+        Setting("SCALPER_COOLDOWN_SECONDS", "Cooldown", "Seconds after a signal before the next in that market - "
+                                                        "default 60", number=True),
+        Setting("SCALPER_MAX_TRADES_PER_DAY", "Trades per market per day", "Default 30", number=True),
+        Sub("Exits"),
+        Setting("SCALPER_STOP_SPREADS", "Stop-loss", "Usual spreads from the fill - default 3", number=True),
+        Setting("SCALPER_TAKE_PROFIT_SPREADS", "Take-profit", "Usual spreads from the fill - default 3", number=True),
+        Setting("SCALPER_MAX_HOLD_SECONDS", "Time stop", "Seconds - default 300", number=True),
+        *_risk_settings("SCALPER_", "0.5", spread="60"),
     ]),
     ("OANDA", "Practice account: hub > Tools > API > Generate. Give bots that trade the same markets "
               "sub-accounts of their own - OANDA nets a market's trades together.", [

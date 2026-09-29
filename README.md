@@ -2,9 +2,10 @@
 
 Small, paper/demo-only trading bots against different brokers' APIs.
 **Nothing in this repo trades real money.** The same strategies run on
-each broker - a momentum scanner and an EMA crossover bot, plus three CFD
+each broker - a momentum scanner and an EMA crossover bot, plus four
 [strategy bots](#strategy-bots-strategy-bots) (forex session breakout,
-index mean reversion, commodity trend) - 24 bots in all. What differs
+index mean reversion, commodity trend, and an "HFT-style" tick scalper) -
+29 bots in all. What differs
 between brokers is how small a trade can be:
 
 | Broker | API access | Smallest trade | Runs on |
@@ -376,18 +377,19 @@ take-profit closed it) and the transaction history (the realised profit).
 
 ## Strategy bots (`strategy-bots/`)
 
-Three CFD strategies, each on every broker - 14 bots, since Alpaca has no
+Four strategies, each on every broker - 19 bots, since Alpaca has no
 forex. Unlike the bots above, the strategies are written once
-(`strategy-bots/engine/strategies.py`), run by one loop
-(`engine/runner.py`) and reach each broker through a small adapter
-(`engine/brokers/`) built from that broker's existing bot. Each bot is a
-two-line script naming its broker and strategy:
+(`strategy-bots/engine/strategies.py`, and `engine/scalper.py` for the
+tick scalper), run by one loop (`engine/runner.py`) and reach each broker
+through a small adapter (`engine/brokers/`) built from that broker's
+existing bot. Each bot is a two-line script naming its broker and strategy:
 
 | | OANDA | Pepperstone | Capital.com | IG | Alpaca |
 |---|---|---|---|---|---|
 | Forex session breakout | `oanda_session_breakout_bot.py` | `pepperstone_…` | `capital_…` | `ig_…` | - (no forex) |
 | Index mean reversion | `oanda_index_reversion_bot.py` | `pepperstone_…` | `capital_…` | `ig_…` | SPY, QQQ, DIA, IWM |
 | Commodity trend (4H/15M) | `oanda_commodity_trend_bot.py` | `pepperstone_…` | `capital_…` | `ig_…` | GLD, SLV, USO |
+| Tick scalper (HFT-style) | `oanda_scalper_bot.py` | `pepperstone_…` | `capital_…` | `ig_…` | SPY, QQQ (buys only) |
 
 Run them from the launcher, or in the broker's Python environment (the same
 ones as the other bots - nothing new to install):
@@ -500,7 +502,60 @@ fee, MT5's swap settings; IG's isn't available). With `WEEKEND_FLAT` on
 closes Friday 20:00 - no weekend swap or Monday gap. Spread at most 10% of
 the stop distance.
 
-### Risk rules for all three
+### 4. Tick scalper - "HFT-style" (`SCALPER_*`)
+
+**What it is, and isn't.** Real high-frequency trading means reacting in
+microseconds from servers inside the exchange, reading the order book and
+being paid rebates for providing liquidity. None of that is possible through
+a retail broker's API: every price read and every order here is a web
+request taking a tenth of a second or more, and the broker sets its own
+spread. This bot is the nearest thing that is possible. It reads live
+bid/ask prices every few seconds instead of waiting for bars, trades short
+bursts, and is out again within minutes. **Backtested, it loses about one
+spread a trade** - see [What to expect](#what-to-expect). It's here to find
+out whether the demo accounts agree.
+
+**Concept.** A sharp move over the last minute sometimes keeps going for a
+few more seconds. Everything is measured in spreads, because the spread is
+what a scalper has to beat: "U", the usual spread, is the median bid/ask
+spread of the last five minutes' reads (at least one price step).
+
+**Reads and setup.** One read of every market's bid and ask every
+`POLL_SECONDS` (2; IG at least 10, because of its request allowance). No
+bars and no price history, so nothing is fetched at startup, and on IG none
+of the 10,000-points-a-week allowance is used. A gap in the reads (a slow
+broker, a sleeping PC) starts the history again. Trading starts once each
+market has `WINDOW_SECONDS` (60) of reads.
+
+**Entry and exit.**
+- Filter: weekdays from `SESSION_START` to `SESSION_END` (07:00-21:00
+  London - London and New York, never the thin Asian hours); no entry while
+  the spread is over `MAX_SPREAD_RATIO` (1.5) x U (spreads widen on news,
+  just when bursts show up); `COOLDOWN_SECONDS` (60) after a signal before
+  the next one in that market; at most `MAX_TRADES_PER_DAY` (30) per market.
+- Trigger: the mid price has moved at least `TRIGGER_SPREADS` (4) x U over
+  the last `WINDOW_SECONDS` (60) and is at the window's high (after a rise)
+  or low (after a fall) right now. `MODE` `momentum` (the default) goes
+  with the burst -> **long** after a rise, **short** after a fall;
+  `reversion` fades it.
+- Stop-loss `STOP_SPREADS` (3) x U and take-profit `TAKE_PROFIT_SPREADS` (3)
+  x U from the fill. The bot checks both on every read, and they also go on
+  the order as the broker's own stop-loss and take-profit, pushed out to
+  the broker's minimum distance where it has one (IG: 2 pips on EUR/USD,
+  1 point on the US 500; Capital.com: 0.01% of the price). Those keep the
+  trade protected if the bot stops.
+- Time exit: `MAX_HOLD_SECONDS` (300) after the entry, and anything still
+  open at `SESSION_END`. Never held overnight, so no swap.
+
+**CFD risk controls.** Sizing, slots and "own trades only" as below (MT5
+magic number 928006), with `RISK_PERCENT` 0.5. `MAX_SPREAD_PERCENT`
+defaults to 60 here, not 10: with the stop only 3 spreads away, the spread
+is always a third of it, and `MAX_SPREAD_RATIO` is the real spread filter.
+Markets: EUR/USD, GBP/USD, USD/JPY and the S&P 500 (IG: EUR/USD and the US
+500; Alpaca: SPY and QQQ, buys only, stops checked by the bot, US market
+hours only).
+
+### Risk rules for all four
 
 - **Sizing.** Each bot trades a budget (`<BROKER>_<STRATEGY>_BUDGET`) as if
   it were its whole account. A trade risks `RISK_PERCENT` of it between the
@@ -510,10 +565,11 @@ the stop distance.
   size the broker accepts. A market whose smallest trade is over that cap
   is skipped at startup; one where it would risk too much is skipped when
   it signals, with the sums in the log. The defaults are sized so every
-  default market fits: OANDA 100 / 1,000 / 300 (breakout / index /
-  commodity - OANDA's UK 100 minimum is ~£1,100 of exposure), Pepperstone
-  1,000 / 2,000 / 2,000 (MT5's 0.01-lot minimum), Capital.com 100 / 200 /
-  100, Alpaca $100 each (no leverage - fractional buys can't use margin).
+  default market fits: OANDA 100 / 1,000 / 300 / 100 (breakout / index /
+  commodity / scalper - OANDA's UK 100 minimum is ~£1,100 of exposure),
+  Pepperstone 1,000 / 2,000 / 2,000 / 1,000 (MT5's 0.01-lot minimum),
+  Capital.com 100 / 200 / 100 / 100, Alpaca $100 each (no leverage -
+  fractional buys can't use margin).
   **IG always trades each market's minimum size**, as its other bots do.
 - **Rollover.** No new trades from 15 minutes before to 45 minutes after
   the 17:00 New York rollover, when spreads blow out.
@@ -521,14 +577,15 @@ the stop distance.
   several markets signal on the same bar, the strongest goes first.
 - **Only its own trades.** A bot manages only the trades it opened - it
   remembers the broker's trade/deal ids (on MT5, its magic number:
-  928003 / 928004 / 928005). Any other position in one of its markets -
+  928003 / 928004 / 928005 / 928006). Any other position in one of its markets -
   another bot's, or yours - is left alone, and the bot doesn't trade that
   market while it's open, because OANDA, Capital.com (unless in hedging
   mode) and Alpaca would net the two together. To run a strategy bot
   alongside another bot in the same markets, give it a sub-account:
   `OANDA_<STRATEGY>_ACCOUNT_ID` / `CAPITAL_<STRATEGY>_ACCOUNT_ID`.
 - **New bars only.** Nothing is traded on a bar that closed before the bot
-  started, so after a start nothing opens until the next bar closes.
+  started, so after a start nothing opens until the next bar closes (the
+  scalper: until it has a full window of its own reads).
 - **Notes survive restarts.** Each bot keeps its trade ids, the entry /
   stop / best price of its open positions and the day's trade counts in
   `strategy-bots/state/<bot>.json` (not in git). Delete a bot's file and it
@@ -538,8 +595,8 @@ the stop distance.
 ### Settings
 
 Strategy settings are shared by that strategy on every broker - the
-names in the sections above, prefixed `BREAKOUT_`, `REVERSION_` or
-`TREND_`, plus `RISK_PERCENT`, `MAX_LEVERAGE` and `MAX_SPREAD_PERCENT` for
+names in the sections above, prefixed `BREAKOUT_`, `REVERSION_`, `TREND_`
+or `SCALPER_`, plus `RISK_PERCENT`, `MAX_LEVERAGE` and `MAX_SPREAD_PERCENT` for
 each. Each bot also has its own:
 
 | Setting | Meaning |
@@ -550,7 +607,7 @@ each. Each bot also has its own:
 | `<BROKER>_<STRATEGY>_ACCOUNT_ID` | OANDA and Capital.com: a sub-account of its own |
 
 `<BROKER>` is `OANDA`, `PEPPERSTONE`, `CAPITAL`, `IG` or `ALPACA`;
-`<STRATEGY>` is `BREAKOUT`, `REVERSION` or `TREND`. Every one of them is
+`<STRATEGY>` is `BREAKOUT`, `REVERSION`, `TREND` or `SCALPER`. Every one of them is
 on the launcher's Settings tab, with its default. A setting that doesn't
 make sense (a letter in a number, times out of order) stops the bot at
 startup, naming it.
@@ -570,6 +627,9 @@ startup, naming it.
   three alongside the backtest. The bot warns in its log when fewer than
   1,500 are left. (On 29 September 2026 only ~300 were left until 5 October.)
   Untested beyond logging in and reading markets, prices and positions.
+  The scalper uses no price history, but it does use IG's ~30 requests a
+  minute: two per read (prices, positions), so ~12 a minute at its 10-second
+  floor - leave that much of `IG_REQUESTS_PER_MINUTE` for it.
 - **Alpaca:** US-listed funds stand in for the indices and commodities;
   buys only (a short signal is logged and skipped); stop-loss and
   take-profit checked by the bot every 30 seconds, only while it runs and
@@ -592,6 +652,27 @@ no spread, and none of the trailing, VWAP or trend exits:
 In other words: they trade at sensible rates and do what they say, but
 there's no evidence of an edge yet - the same finding as the momentum
 scanner's backtest. Treat the demo accounts as the experiment.
+
+**The tick scalper** has a backtest of its own on real bid/ask prices,
+`backtest/scalper_backtest.py` (see [Scalper backtest](#scalper-backtest-backtestscalper_backtestpy)).
+For the week of 22-29 September 2026, 07:00-21:00 London, on EUR/USD,
+GBP/USD, USD/JPY and the S&P 500, with each broker's history adjusted to
+the spread its demo account quotes:
+
+| | OANDA (5-second prices) | Pepperstone (every tick, read every 2s) |
+|---|---|---|
+| Default settings (momentum, trigger 4, stop 3 / take-profit 3) | 432 trades, 33% won, -0.33R a trade | 506 trades, 32% won, -0.35R a trade |
+| ... in spreads per trade: after / before the spread | -1.00 / +0.03 | -1.04 / -0.01 |
+| All 24 settings tried (momentum or reversion, trigger 2-6, stop / take-profit 2-6 spreads) | every one lost: -0.85 to -1.20 spreads a trade | every one lost: -0.46 to -1.18 spreads a trade |
+| ... before the spread | -0.15 to +0.16 spreads | -0.16 to +0.55 spreads |
+
+The "before the spread" row says the signal predicts nothing: valued at
+mid prices, the trades come out at about zero, so each one loses what it
+paid to cross the spread. Fading bursts (`SCALPER_MODE=reversion`) came out
+a little less badly than following them on both brokers, but not by enough
+to matter. This fills every trade at the price the bot saw, with no delay,
+so the live bot should do slightly worse. IG and Capital.com have no fine
+enough price history to test.
 
 ### Tests
 
@@ -671,6 +752,30 @@ requests — stop the IG scanner first so the two don't overrun IG's
 did best, and a 0.5% take-profit was worst at every stop. The edge was
 tiny (~0.05% a trade) and assumes stops fill exactly at their level.
 
+## Scalper backtest (`backtest/scalper_backtest.py`)
+
+Replays the tick scalper - the bot's own code from
+`strategy-bots/engine/scalper.py` - over real bid/ask prices, for 24
+combinations of mode, trigger and stop / take-profit, and prints each one's
+trades, win rate, R and spreads per trade, before and after the spread:
+
+```powershell
+python backtest\scalper_backtest.py oanda         # ig-bot-env: OANDA's 5-second bid/ask candles
+python backtest\scalper_backtest.py pepperstone   # pepperstone-bot-env: every MT5 tick (the terminal must be running)
+```
+
+Options: `--days 7`, `--markets EUR_USD,GBP_USD`, `--windows 30,60,120`
+(other `SCALPER_WINDOW_SECONDS`), `--delay 1` (fill a read late). The
+other `SCALPER_*` settings come from the environment, as for the bot.
+Prices are cached in `backtest/data/`. Neither broker's history quite
+matches what its demo account pays: MT5's tick history is Pepperstone's
+raw feed (EUR/USD 0.0-0.1 pips, while the Standard demo account quotes
+1.0), and OANDA's candles show EUR/USD at 1.6 pips against 0.8 live. So
+the fetch compares each market's live spread with the history's last few
+minutes and widens or narrows every price by the difference, printing it.
+**Fetch while the markets are open**, or the history is used as it is.
+Results: [What to expect](#what-to-expect).
+
 ## Dashboard (`shared/dashboard_reporter.py`)
 
 Every bot can report to the
@@ -728,7 +833,7 @@ who can sign in to the dashboard as an admin can close trades.
 
 `TradingBots.exe` starts and stops the bots and edits their settings:
 
-- **Bots:** all 24 bots with their status - including ones started by hand -
+- **Bots:** all 29 bots with their status - including ones started by hand -
   filtered by broker and strategy (and "Running only" to hide stopped ones), and Start / Stop / Restart per bot,
   "Start all ticked" and "Stop all", plus a link to each bot's dashboard
   page. Starting runs

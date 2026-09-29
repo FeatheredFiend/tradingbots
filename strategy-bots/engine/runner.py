@@ -37,6 +37,12 @@ restart carries on where it stopped.
 
 With DASHBOARD_COMMANDS=1, the dashboard can close (part of) the bot's own
 positions too - see close_from_dashboard().
+
+The tick scalper (engine/scalper.py) has no bars: every SCALPER_POLL_SECONDS
+the runner reads every market's price, hands it to the strategy, checks the
+scalper's own stop-loss / take-profit (the broker's may sit further out, at
+its minimum distance) and looks for entries - read_prices() and on_prices().
+The same risk rules apply.
 """
 
 import json
@@ -47,7 +53,7 @@ import sys
 import time
 
 from . import clock
-from .brokers.base import BrokerError
+from .brokers.base import BrokerError, Quote
 from .settings import BROKER_NAMES, STRATEGY_NAMES, TIMEFRAMES, SettingsError, bot_settings
 from .strategies import make_strategy
 
@@ -63,6 +69,8 @@ FILL_GRACE_SECONDS = 180         # a position just opened may take this long to 
 ERROR_BACKOFF_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
 ROLLOVER_QUIET = (15, 45)        # minutes before / after the rollover without new trades
+PRICE_CLOSE_RETRY_SECONDS = 20   # the scalper holds for minutes, so a failed close is retried sooner
+STATUS_EVERY_SECONDS = 300       # the scalper logs each market's state this often (it reads every few seconds)
 
 
 def make_broker(key: str, settings, dashboard, log):
@@ -181,6 +189,13 @@ class StrategyBot:
         leverage_cap = broker.max_leverage if broker.max_leverage is not None else float("inf")
         self.leverage = min(self.p["max_leverage"], leverage_cap)
         broker.own_ids = set(self.state.own_ids)
+        # The scalper reads prices every few seconds (not faster than the broker
+        # allows); the bar strategies look every LOOP_SECONDS.
+        self.loop_seconds = (max(self.p["poll_seconds"], broker.min_poll_seconds) if strategy.uses_prices
+                             else LOOP_SECONDS)
+        self.quiet_until = {}    # symbol -> no new price signals there before this time (the scalper's cooldown)
+        self.status = {}         # symbol -> the latest read's state, logged every STATUS_EVERY_SECONDS
+        self.next_status = 0.0
 
     # -- startup --------------------------------------------------------------------
     def start(self) -> None:
@@ -234,14 +249,19 @@ class StrategyBot:
             config["magicNumber"] = self.broker.magic
         self.dashboard.describe(account=account.id, currency=self.currency, config=config)
 
-        for symbol, market in self.markets.items():
-            self.feeds[symbol] = {role: Feed(self.broker, market, tf, keep)
-                                  for role, (tf, keep) in self.strategy.feeds().items()}
+        if not self.strategy.uses_prices:
+            for symbol, market in self.markets.items():
+                self.feeds[symbol] = {role: Feed(self.broker, market, tf, keep)
+                                      for role, (tf, keep) in self.strategy.feeds().items()}
         self.started_at = time.time()
         self.refresh_feeds(self.started_at)
         self.seen = {s: (f["exec"].bars[-1].time if f["exec"].bars else 0.0) for s, f in self.feeds.items()}
         self.dashboard.accept_closes(self.close_from_dashboard)
-        log.info(f"Waiting for the next {self.strategy.timeframe} bar to close before trading.")
+        if self.strategy.uses_prices:
+            log.info(f"Reading prices every {self.loop_seconds:g}s; trading starts once each market has "
+                     f"{self.p['window_seconds']}s of them.")
+        else:
+            log.info(f"Waiting for the next {self.strategy.timeframe} bar to close before trading.")
 
     def slice_cap(self) -> float:
         return self.settings.budget * self.leverage / self.settings.max_positions
@@ -288,7 +308,7 @@ class StrategyBot:
                 self.log.info(f"Retrying in {backoff}s...")
                 time.sleep(backoff)
                 continue
-            self.dashboard.sleep(LOOP_SECONDS, self.report, self.broker.dashboard_every)
+            self.dashboard.sleep(self.loop_seconds, self.report, self.broker.dashboard_every)
 
     def report(self) -> None:
         """Account, positions and trades for the dashboard - when due, which
@@ -330,9 +350,12 @@ class StrategyBot:
 
         own, others = self.split_positions(self.markets)
         self.reconcile(own, others, now)
-        self.time_exits(own, now)
+        quotes = self.read_prices(now) if self.strategy.uses_prices else None
+        self.time_exits(own, now, quotes)
         if new_bars:
             self.on_new_bars(new_bars, own, others, now)
+        if quotes is not None:
+            self.on_prices(own, others, quotes, now)
 
     def split_positions(self, markets: dict) -> tuple:
         """({symbol: the bot's own position}, {symbol: anyone else's}) in these markets."""
@@ -415,21 +438,24 @@ class StrategyBot:
         if changed:
             self.state.save()
 
-    def time_exits(self, positions: dict, now: float) -> None:
-        quotes = None
-        if positions and not self.broker.native_stops:
+    def time_exits(self, positions: dict, now: float, quotes: dict = None) -> None:
+        # The scalper checks its own stop-loss / take-profit on every read too:
+        # the broker's may sit further out, at its minimum distance.
+        check_levels = not self.broker.native_stops or self.strategy.uses_prices
+        if positions and check_levels and quotes is None:
             quotes = self.broker.quotes([self.markets[s] for s in positions])
         for symbol, position in list(positions.items()):
             market, notes = self.markets[symbol], self.state.positions.get(symbol, {})
             reason = self.strategy.exit_on_time(market, position, notes, now)
-            if not reason and quotes is not None:
+            if not reason and check_levels:
                 reason = self.bot_side_stop(position, notes, quotes.get(symbol))
             if reason and self.close(market, position, reason, now):
                 del positions[symbol]
 
     @staticmethod
     def bot_side_stop(position, notes: dict, quote):
-        """The stop-loss / take-profit, checked here for brokers that can't hold them."""
+        """The stop-loss / take-profit, checked here for brokers that can't
+        hold them (and by the scalper, whose broker ones may sit further out)."""
         if quote is None or not quote.tradeable:
             return None
         long = position.direction == "long"
@@ -444,17 +470,18 @@ class StrategyBot:
     def close(self, market, position, reason: str, now: float) -> bool:
         if now < self.close_retry_at.get(market.symbol, 0):
             return False
+        retry = PRICE_CLOSE_RETRY_SECONDS if self.strategy.uses_prices else CLOSE_RETRY_SECONDS
         if self.settings.dry_run:
             self.log.info(f"DRY RUN: would close {market.symbol} {position.direction} {position.size:g} ({reason}).")
-            self.close_retry_at[market.symbol] = now + CLOSE_RETRY_SECONDS
+            self.close_retry_at[market.symbol] = now + retry
             return False
         if self.broker.close(market, position, reason):
             self.state.positions.pop(market.symbol, None)
             self.state.save()
             self.close_retry_at.pop(market.symbol, None)
             return True
-        self.close_retry_at[market.symbol] = now + CLOSE_RETRY_SECONDS
-        self.log.warning(f"{market.symbol}: will try closing again in {CLOSE_RETRY_SECONDS // 60} minutes.")
+        self.close_retry_at[market.symbol] = now + retry
+        self.log.warning(f"{market.symbol}: will try closing again in {retry}s.")
         return False
 
     def on_new_bars(self, symbols: list, positions: dict, others: dict, now: float) -> None:
@@ -484,14 +511,61 @@ class StrategyBot:
         if signals:
             self.enter(signals, positions, now)
 
+    # -- the scalper: every read of the prices ------------------------------------------
+    def read_prices(self, now: float) -> dict:
+        """One read of every market's bid and ask, handed to the strategy."""
+        quotes = self.broker.quotes(list(self.markets.values()))
+        for symbol, market in self.markets.items():
+            quote = quotes.get(symbol)
+            self.strategy.on_price(market, quote or Quote(0.0, 0.0, False), now)
+        return quotes
+
+    def on_prices(self, positions: dict, others: dict, quotes: dict, now: float) -> None:
+        """Look for entries on this read. Quiet in the log: each market's
+        state is logged every STATUS_EVERY_SECONDS, and signals when they come."""
+        s, p = self.settings, self.p
+        signals = []
+        for symbol, market in self.markets.items():
+            position = positions.get(symbol)
+            if position is not None:
+                pnl = f", P/L {position.pnl:+.2f}" if position.pnl is not None else ""
+                self.status[symbol] = f"holding {position.direction} {position.size:g} @ {position.entry:g}{pnl}"
+                continue
+            if symbol in others:
+                self.status[symbol] = "not trading it - someone else's position is open"
+                continue
+            quote = quotes.get(symbol)
+            if quote is None or not quote.tradeable:
+                self.status[symbol] = (quote.why_not if quote is not None else "") or "no price right now"
+                continue
+            assessment = self.strategy.assess_price(market, now)
+            self.status[symbol] = assessment.note
+            signal = assessment.signal
+            if signal is None or now < self.quiet_until.get(symbol, 0):
+                continue
+            if signal.direction == "short" and not self.broker.can_short:
+                continue  # Alpaca: buys only - not worth a log line every minute
+            day = self.strategy.trade_day(market, now)
+            if self.state.trades_on(symbol, day) >= p["max_trades_per_day"]:
+                continue
+            self.quiet_until[symbol] = now + p["cooldown_seconds"]
+            signals.append((signal.score, symbol, signal))
+        if now >= self.next_status:
+            self.next_status = now + STATUS_EVERY_SECONDS
+            for symbol, note in self.status.items():
+                self.log.info(f"{symbol} | {note}")
+        if signals and len(positions) < s.max_positions:
+            self.enter(signals, positions, now, quotes)
+
     # -- entries ------------------------------------------------------------------------
-    def enter(self, signals: list, positions: dict, now: float) -> None:
+    def enter(self, signals: list, positions: dict, now: float, quotes: dict = None) -> None:
         s, p, log = self.settings, self.p, self.log
         if clock.near_rollover(now, *ROLLOVER_QUIET):
             for _, symbol, signal in signals:
                 log.info(f"{symbol}: {signal.direction} signal skipped - too close to the daily rollover (spreads widen).")
             return
-        quotes = self.broker.quotes([self.markets[symbol] for _, symbol, _ in signals])
+        if quotes is None:
+            quotes = self.broker.quotes([self.markets[symbol] for _, symbol, _ in signals])
         held = len(positions)
         for _, symbol, signal in sorted(signals, key=lambda item: item[0], reverse=True):
             market, quote, direction = self.markets[symbol], quotes.get(symbol), signal.direction
@@ -547,10 +621,11 @@ class StrategyBot:
                 continue
             log.info(f"{symbol}: {signal.why} | entry ~{entry:g}, stop {signal.stop:g}, take-profit "
                      f"{f'{take_profit:g}' if take_profit is not None else 'none'} | {sizing}")
+            broker_stop, broker_target = self.broker_levels(market, quote, sign, entry, signal.stop, take_profit)
             if s.dry_run:
                 log.info(f"DRY RUN: would open {direction} {symbol} size {size:g}.")
                 continue
-            if not self.broker.open(market, direction, size, signal.stop, take_profit, quote):
+            if not self.broker.open(market, direction, size, broker_stop, broker_target, quote):
                 continue
             held += 1
             notes = {"direction": direction, "opened_at": now, "entry": entry, "stop": signal.stop,
@@ -560,6 +635,24 @@ class StrategyBot:
             self.state.own_ids = sorted(self.broker.own_ids)
             self.state.count_trade(symbol, day)
             self.state.save()
+
+    def broker_levels(self, market, quote, sign: int, entry: float, stop: float, take_profit) -> tuple:
+        """The stop-loss / take-profit to put on the order. The scalper's are
+        only a few spreads away - inside some brokers' minimum distance - so
+        those go at the minimum instead and the bot closes at its own levels."""
+        least = self.broker.min_stop_distance(market, quote) * 1.1 if self.strategy.uses_prices else 0.0
+        if not least:
+            return stop, take_profit
+        broker_stop = stop if (entry - stop) * sign >= least else entry - sign * least
+        broker_target = take_profit
+        if take_profit is not None and (take_profit - entry) * sign < least:
+            broker_target = entry + sign * least
+        if (broker_stop, broker_target) != (stop, take_profit):
+            self.log.info(f"{market.symbol}: {self.broker.name}'s minimum stop distance is {least / 1.1:g}, so its "
+                          f"stop-loss / take-profit go at {broker_stop:g} / "
+                          f"{f'{broker_target:g}' if broker_target is not None else 'none'}; the bot closes at its "
+                          f"own levels itself.")
+        return broker_stop, broker_target
 
     def size(self, market, quote, distance: float) -> tuple:
         """(size, how it was worked out) - (0, why not) if nothing fits."""

@@ -89,6 +89,7 @@ class IGBroker(Broker):
     fixed_min_size = True
     metered_history = True
     dashboard_every = 60        # each snapshot costs two of IG's ~30 requests a minute
+    min_poll_seconds = 10       # the scalper's read (prices + positions) costs two of them too
 
     def __init__(self, settings, dashboard, log):
         super().__init__(settings, dashboard, log)
@@ -226,22 +227,38 @@ class IGBroker(Broker):
         return bars[-count:]
 
     def quotes(self, markets: list) -> dict:
+        """Every market's snapshot in one request (up to 50), matched by epic -
+        IG doesn't return them in the order asked."""
         quotes = {}
-        for market in markets:
+        for i in range(0, len(markets), 50):
+            batch = markets[i:i + 50]
+            epics = ",".join(m.symbol for m in batch)
             try:
-                details = self._call(f"market details for {market.symbol}", IGService.fetch_market_by_epic, market.symbol)
+                found = self._call(f"prices for {epics}", IGService.fetch_markets_by_epics, epics, detailed=False)
             except BrokerError as e:
                 self.log.warning(str(e))
                 continue
-            snapshot = details["snapshot"]
-            bid, offer = _number(snapshot.get("bid")), _number(snapshot.get("offer"))
-            if bid is None or offer is None:
-                continue
-            status = snapshot.get("marketStatus")
-            market.raw = details
-            quotes[market.symbol] = Quote(bid, offer, status == "TRADEABLE",
-                                          why_not="" if status == "TRADEABLE" else f"IG says it's {status}")
+            snapshots = {(item.get("instrument") or {}).get("epic"): item.get("snapshot") or {} for item in found or ()}
+            for market in batch:
+                snapshot = snapshots.get(market.symbol)
+                if snapshot is None:
+                    continue
+                bid, offer = _number(snapshot.get("bid")), _number(snapshot.get("offer"))
+                if bid is None or offer is None:
+                    continue
+                status = snapshot.get("marketStatus")
+                market.raw["snapshot"] = snapshot  # the rest of market.raw (dealing rules, currencies) stays as resolved
+                quotes[market.symbol] = Quote(bid, offer, status == "TRADEABLE",
+                                              why_not="" if status == "TRADEABLE" else f"IG says it's {status}")
         return quotes
+
+    def min_stop_distance(self, market: Market, quote: Quote) -> float:
+        rule = (market.raw.get("dealingRules") or {}).get("minNormalStopOrLimitDistance") or {}
+        value = _number(rule.get("value")) or 0.0
+        if rule.get("unit") == "PERCENTAGE":
+            return value / 100 * quote.mid
+        # IG's points: 1 pip on currencies (scaling factor 10,000), 1.0 on indices.
+        return value / (_number(market.raw["snapshot"].get("scalingFactor")) or 1.0)
 
     # -- positions / orders -------------------------------------------------------
     def _open_positions(self):
