@@ -34,6 +34,12 @@ Followers
   on. So is a short on Alpaca (buys only), and a share the broker doesn't
   offer (<BROKER>_SURGE_SYMBOL: "{}" - the ticker as it is - on Alpaca and
   Capital.com, "{}.US" on Pepperstone).
+- Within those 20s, a signal whose share has no price yet, or whose spread
+  is too wide (below), is tried again every 2 seconds.
+- Some brokers start quoting US shares after the open - Pepperstone's share
+  CFDs at 09:31 New York. A signal from the first FIRST_PRICE_WAIT (90)
+  seconds after the open whose share has had no price since waits until
+  then for its first one, and its 20s count from that price.
 - Stop-loss: back where the surge started - the surge's size, as a % of
   the follower's own entry price. Take-profit: REWARD_RISK (2) x that.
   Checked by the bot every few seconds, as well as sitting at the broker.
@@ -62,7 +68,7 @@ from .strategies import Signal, Strategy
 
 PRE_OPEN_SECONDS = 60            # the scanner starts reading this long before the open, for a first price
 SIGNAL_CHECK_SECONDS = 1         # how often a follower reads the signals file (on this PC - costs nothing)
-PENDING_RETRY_SECONDS = 2        # a signal whose share has no price yet is looked at again this often
+PENDING_RETRY_SECONDS = 2        # a signal whose share has no price yet, or too wide a spread, is looked at again this often
 HOLD_CHECK_SECONDS = 5           # while holding, the follower checks its stop / target / time stop this often
 FORGET_AFTER_SECONDS = 3600      # a share not held or signalled for this long drops off the follower's list
 FLAT_BEFORE_CLOSE_MINUTES = 15
@@ -231,8 +237,21 @@ class SurgeFollower(Strategy):
     def summary(self) -> str:
         p = self.p
         return (f"Follows the surge scanner | stop where the surge started | take-profit {p['reward_risk']:g}R | "
-                f"out after {p['max_hold_minutes']} min | signals older than {p['max_signal_age']}s dropped | "
+                f"out after {p['max_hold_minutes']} min | signals older than {p['max_signal_age']}s dropped "
+                f"(a share with no price yet at the open is waited for up to {p['first_price_wait']}s after it) | "
                 f"{p['max_trades_per_day']} trade(s)/day per share")
+
+
+@dataclass
+class Waiting:
+    """A signal the follower hasn't acted on yet: its share has no price
+    yet, or too wide a spread for now."""
+    signal: dict
+    market: object
+    since: float                 # its MAX_SIGNAL_AGE counts from here: when it was sent, or its share's first price
+    opening: bool = False        # waited for the broker's first price after the open
+    priced: bool = False         # has had a price
+    noted: str = ""              # what was last logged about it, so a retry every 2s doesn't log it again
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +267,7 @@ class FollowerBot(runner.StrategyBot):
         self.loop_seconds = SIGNAL_CHECK_SECONDS
         self.hold_check_seconds = max(HOLD_CHECK_SECONDS, broker.min_poll_seconds)
         self.reader = SignalReader(log)
-        self.pending = []            # [(signal, market)]: signals waiting for their share's first price
+        self.pending = []            # [Waiting]: signals not acted on yet
         self.next_retry = 0.0
         self.lookups = {}            # ticker -> Market, or None if the broker doesn't offer it
         self.lookup_day = None
@@ -352,35 +371,81 @@ class FollowerBot(runner.StrategyBot):
             self.used_at[market.symbol] = now
             log.info(f"{ticker}: {direction} surge signal ({float(signal['move_percent']):.2f}%, "
                      f"{now - sent:.1f}s ago) -> {market.symbol}")
-            self.pending.append((signal, market))
+            self.pending.append(Waiting(signal, market, since=sent))
         if not self.pending:
             return
 
-        markets = {market.symbol: market for _, market in self.pending}
+        markets = {w.market.symbol: w.market for w in self.pending}
         quotes = self.broker.quotes(list(markets.values()))
         own, others = self.split_positions(self.markets)
         signals, waiting = [], []
-        for signal, market in self.pending:
-            symbol, direction = market.symbol, signal["direction"]
+        for w in self.pending:
+            symbol, direction = w.market.symbol, w.signal["direction"]
             quote = quotes.get(symbol)
             if quote is None or not quote.tradeable:
-                if now - float(signal["time"]) <= max_age:
-                    waiting.append((signal, market))  # e.g. just added to MT5's Market Watch - no tick yet
+                why = (quote.why_not if quote is not None else "") or "no price"
+                until = self.first_price_until(w)
+                if now < until:
+                    w.opening = True
+                    self.note(w, "first price", f"{symbol}: no price yet ({why}) - {self.broker.name} may start "
+                              f"quoting it after the open, so the {direction} surge signal waits for its first "
+                              f"price until {clock.local('london', until).strftime('%H:%M:%S')} UK.")
+                    waiting.append(w)
+                elif now - w.since <= max_age:
+                    waiting.append(w)  # e.g. just added to MT5's Market Watch - no tick yet
+                elif w.opening and not w.priced:
+                    log.info(f"{symbol}: {direction} surge signal dropped - still no price {p['first_price_wait']}s "
+                             f"after the open ({why}).")
                 else:
-                    why = (quote.why_not if quote is not None else "") or "no price"
                     log.info(f"{symbol}: {direction} surge signal dropped - {why} within {max_age}s.")
                 continue
+            if not w.priced:
+                w.priced = True
+                if w.opening:  # its MAX_SIGNAL_AGE starts from the share's first price
+                    w.since = now
+                    log.info(f"{symbol}: first price {quote.bid:g} / {quote.ask:g}, "
+                             f"{now - float(w.signal['time']):.0f}s after its {direction} surge signal.")
             if symbol in others:
                 log.info(f"{symbol}: {direction} surge signal skipped - someone else's position is open in it.")
-            elif symbol in own:
+                continue
+            if symbol in own:
                 log.info(f"{symbol}: {direction} surge signal skipped - already holding it.")
-            elif all(symbol != taken for _, taken, _ in signals):
-                signals.append((float(signal["move_percent"]), symbol, self.strategy.signal_for(signal, quote)))
+                continue
+            if any(symbol == taken for _, taken, _ in signals):
+                continue
+            signal = self.strategy.signal_for(w.signal, quote)
+            entry = quote.ask if direction == "long" else quote.bid
+            too_wide = self.spread_problem(quote, abs(entry - signal.stop))
+            if too_wide:
+                if now - w.since < max_age:  # spreads jump about at the open - it may narrow in a few seconds
+                    self.note(w, "spread", f"{symbol}: {direction} surge signal waiting - {too_wide}; trying "
+                              f"again every {PENDING_RETRY_SECONDS}s for up to {max_age - (now - w.since):.0f}s.")
+                    waiting.append(w)
+                else:
+                    log.info(f"{symbol}: {direction} surge signal skipped - {too_wide}, still {max_age}s on.")
+                continue
+            signals.append((signal.score, symbol, signal))
         self.pending = waiting
         self.next_retry = now + PENDING_RETRY_SECONDS
         if signals:
             self.enter(signals, own, now, quotes)
             self.next_pass = min(self.next_pass, now + self.hold_check_seconds)
+
+    def first_price_until(self, w: Waiting) -> float:
+        """Until when a signal that came just after the open may wait for its
+        share's first price - Pepperstone's US share CFDs quote from 09:31
+        New York - or 0 if it may not (it's had a price, or came later)."""
+        sent, wait = float(w.signal["time"]), self.p["first_price_wait"]
+        bounds = US.bounds_at(sent)
+        if w.priced or not wait or bounds is None or not bounds[0] <= sent < bounds[0] + wait:
+            return 0.0
+        return bounds[0] + wait
+
+    def note(self, w: Waiting, what: str, text: str) -> None:
+        """Logs `text` the first time a waiting signal waits for `what`."""
+        if w.noted != what:
+            w.noted = what
+            self.log.info(text)
 
     def forget_idle(self, own: dict, now: float) -> None:
         """Drop shares it no longer holds and hasn't had a signal for in a

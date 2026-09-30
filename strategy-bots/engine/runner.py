@@ -608,9 +608,9 @@ class StrategyBot:
             if distance <= 0:
                 skip(f"the price {entry:g} is already through the stop {signal.stop:g}")
                 continue
-            if quote.spread > p["max_spread_percent"] / 100 * distance:
-                skip(f"the spread {quote.spread:g} is {quote.spread / distance:.0%} of the stop distance "
-                     f"(max {p['max_spread_percent']:g}%)")
+            too_wide = self.spread_problem(quote, distance)
+            if too_wide:
+                skip(too_wide)
                 continue
             if signal.take_profit is not None:
                 take_profit = signal.take_profit
@@ -648,6 +648,14 @@ class StrategyBot:
             self.state.count_trade(symbol, day)
             self.state.save()
             self.dashboard.report_soon(TRADE_REPORT_DELAYS[0])
+
+    def spread_problem(self, quote, distance: float) -> str:
+        """Why the spread is too wide for a stop `distance` from the entry, or
+        "" if it isn't (the surge follower asks this before enter() does)."""
+        most = self.p["max_spread_percent"]
+        if quote.spread > most / 100 * distance:
+            return f"the spread {quote.spread:g} is {quote.spread / distance:.0%} of the stop distance (max {most:g}%)"
+        return ""
 
     def broker_levels(self, market, quote, sign: int, entry: float, stop: float, take_profit) -> tuple:
         """The stop-loss / take-profit to put on the order. The scalper's (and

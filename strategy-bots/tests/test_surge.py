@@ -178,7 +178,9 @@ class ShareBroker(Broker):
         super().__init__(settings, mock.Mock(), mock.Mock())
         self.offered = set(offered)
         self.prices = {"NVDA.US": 180.0, "AMD.US": 150.0}
+        self.spreads = {}            # symbol -> spread (default 0.02)
         self.no_price = set()
+        self.stale = set()           # yesterday's last price, as MT5 gives before Pepperstone's shares open
         self.positions_open, self.opened, self.closed, self.resolved = {}, [], [], []
         for k, v in attributes.items():
             setattr(self, k, v)
@@ -191,9 +193,15 @@ class ShareBroker(Broker):
         return {n: Market(n, n, n, 1.0, 1.0, digits=2) for n in names if n in self.offered}
 
     def quotes(self, markets):
-        return {m.symbol: Quote(self.prices[m.symbol] - 0.01, self.prices[m.symbol] + 0.01, True,
-                                unit_value=self.prices[m.symbol])
-                for m in markets if m.symbol not in self.no_price}
+        quotes = {}
+        for m in markets:
+            if m.symbol in self.no_price:
+                continue
+            price, half = self.prices[m.symbol], self.spreads.get(m.symbol, 0.02) / 2
+            stale = m.symbol in self.stale
+            quotes[m.symbol] = Quote(price - half, price + half, not stale, unit_value=price,
+                                     why_not="no price for 1052 min - market closed?" if stale else "")
+        return quotes
 
     def positions(self, markets):
         return {s: p for s, p in self.positions_open.items() if s in markets}
@@ -294,11 +302,78 @@ class FollowerTests(TempState):
         self.cycle(bot, SIGNAL_AT + 3)
         self.assertEqual(len(broker.opened), 1)
         broker.no_price.add("AMD.US")
-        self.signal("AMD", at=SIGNAL_AT + 4)
-        for t in range(5, 30):
-            self.cycle(bot, SIGNAL_AT + t)
+        late = OPEN + 200                                   # past the opening wait for a first price
+        self.signal("AMD", at=late)
+        for t in range(1, 25):
+            self.cycle(bot, late + t)
         self.assertEqual(len(broker.opened), 1)             # no price within 20s: dropped
-        self.assertTrue(self.logged(bot, "dropped"))
+        self.assertTrue(self.logged(bot, "dropped - no price within 20s"))
+
+    def test_waits_for_the_brokers_first_price_after_the_open(self):
+        broker = ShareBroker(self.settings())
+        broker.stale.add("NVDA.US")                         # Pepperstone: no quotes until 09:31 New York
+        bot, broker = self.bot(broker)
+        self.signal(at=OPEN + 10)
+        for t in range(11, 60):
+            self.cycle(bot, OPEN + t)
+        self.assertEqual(broker.opened, [])
+        self.assertEqual(len([c for c in bot.log.info.call_args_list if "waits for its first price" in str(c)]), 1)
+        broker.stale.clear()
+        broker.spreads["NVDA.US"] = 0.5                     # 35% of the 1.44 stop at first...
+        for t in range(60, 62):
+            self.cycle(bot, OPEN + t)
+        self.assertTrue(self.logged(bot, "first price 179.75 / 180.25"))
+        self.assertEqual(broker.opened, [])
+        broker.spreads["NVDA.US"] = 0.1                     # ...then it narrows, within 20s of the first price
+        for t in range(62, 80):
+            self.cycle(bot, OPEN + t)
+        self.assertEqual(len(broker.opened), 1)
+        self.assertAlmostEqual(broker.opened[0][3], 180.05 * (1 - 0.008))   # the stop, from its own entry
+
+    def test_gives_up_on_a_first_price_after_the_wait(self):
+        broker = ShareBroker(self.settings())
+        broker.stale.add("NVDA.US")
+        bot, broker = self.bot(broker)
+        self.signal(at=OPEN + 10)
+        for t in range(11, 95):
+            self.cycle(bot, OPEN + t)
+        self.assertTrue(self.logged(bot, "still no price 90s after the open"))
+        broker.stale.clear()
+        self.cycle(bot, OPEN + 96)
+        self.assertEqual(broker.opened, [])
+
+        with env(SURGE_FIRST_PRICE_WAIT="0"):               # switched off: 20s, as for any signal
+            s = self.settings()
+            s.params = strategy_params("surge-follower")
+        broker = ShareBroker(s)
+        broker.stale.add("NVDA.US")
+        bot = surge.FollowerBot(s, make_strategy("surge-follower", s.params), broker, mock.Mock(), mock.Mock())
+        with mock.patch("time.time", return_value=OPEN - 600):
+            bot.start()                                     # reads the same signal from the file
+        for t in range(11, 35):
+            self.cycle(bot, OPEN + t)
+        self.assertTrue(self.logged(bot, "dropped - no price for 1052 min - market closed? within 20s"))
+
+    def test_tries_a_wide_spread_again_for_20s(self):
+        broker = ShareBroker(self.settings())
+        broker.spreads["NVDA.US"] = 0.5                     # 35% of the 1.44 stop - max 25%
+        bot, broker = self.bot(broker)
+        self.signal()
+        for t in range(1, 25):
+            self.cycle(bot, SIGNAL_AT + t)
+        self.assertEqual(broker.opened, [])
+        info = [str(c) for c in bot.log.info.call_args_list]
+        self.assertEqual(len([c for c in info if "trying again" in c]), 1)
+        self.assertEqual(len([c for c in info if "still 20s on" in c]), 1)
+
+        broker = ShareBroker(self.settings())
+        broker.spreads["NVDA.US"] = 0.5
+        bot, broker = self.bot(broker)
+        self.signal("NVDA", at=SIGNAL_AT + 100)
+        self.cycle(bot, SIGNAL_AT + 101)
+        broker.spreads["NVDA.US"] = 0.2                     # 14%: fine
+        self.cycle(bot, SIGNAL_AT + 103)
+        self.assertEqual(len(broker.opened), 1)
 
     def test_leaves_other_positions_alone(self):
         broker = ShareBroker(self.settings())

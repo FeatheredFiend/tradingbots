@@ -479,7 +479,10 @@ SETTING_GROUPS = [
         Setting("SURGE_MAX_SHARES", "Shares watched", "The most traded that qualify - default 1500", number=True),
         Setting("SURGE_FEED", "Price feed", "iex (free plan, default) or sip (Alpaca's paid plan)"),
         Sub("Followers"),
-        Setting("SURGE_MAX_SIGNAL_AGE", "Signal too old after", "Seconds - default 20", number=True),
+        Setting("SURGE_MAX_SIGNAL_AGE", "Signal too old after", "Seconds - default 20. Until then, no price or too "
+                                                                 "wide a spread is tried again every 2s", number=True),
+        Setting("SURGE_FIRST_PRICE_WAIT", "Wait for a first price", "Seconds after the open a signal may wait for "
+                "its share's first price (Pepperstone's start at 14:31 UK) - default 90, 0 = off", number=True),
         Setting("SURGE_MAX_TRADES_PER_DAY", "Trades per share per day", "Default 1", number=True),
         Setting("SURGE_REWARD_RISK", "Take-profit", "Times the stop distance (the stop is where the surge "
                                                     "started) - default 2", number=True),

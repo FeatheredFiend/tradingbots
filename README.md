@@ -803,7 +803,18 @@ shows every surge it sends) and e.g. `capital-surge-follower`.
   `SURGE_MAX_SIGNAL_AGE` (20s) is dropped - the surge has moved on - as is
   a short on Alpaca, and a share its broker doesn't offer (looked up once a
   day; `<BROKER>_SURGE_SYMBOL` says how the broker writes a ticker: `{}` on
-  Alpaca and Capital.com, `{}.US` on Pepperstone).
+  Alpaca and Capital.com, `{}.US` on Pepperstone). Within those 20s, a
+  signal whose share has no price yet, or whose spread is too wide (below),
+  is tried again every 2 seconds - spreads jump about at the open.
+- Pepperstone's US share CFDs only start quoting at 09:31 New York (14:31
+  UK), a minute after the open. A signal from the first
+  `SURGE_FIRST_PRICE_WAIT` (90) seconds after the open whose share has had
+  no price since waits until then for its first one, and its 20s count
+  from that price (`0` turns this off). On 30 September 2026 that would
+  have added MDB, INTC and CRCL - which then filled all 3 positions, so
+  CLSK and CRWV, both winners, were turned away (a replay against
+  Pepperstone's ticks: +10 GBP, vs +29 with 5 positions and +31 with this
+  off; one day, so no conclusion).
 - Stop-loss: back where the surge started - the surge's size, as a % of the
   follower's own entry price. Take-profit: `SURGE_REWARD_RISK` (2) x that.
   Both go on the order (pushed out to the broker's minimum distance if

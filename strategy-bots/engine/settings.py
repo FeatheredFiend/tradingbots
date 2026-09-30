@@ -242,6 +242,8 @@ def strategy_params(strategy: str) -> dict:
             "reward_risk": number(p + "REWARD_RISK", 2.0, minimum=0.1),
             "max_hold_minutes": number(p + "MAX_HOLD_MINUTES", 15, minimum=1, maximum=360, whole=True),
             "max_signal_age": number(p + "MAX_SIGNAL_AGE", 20, minimum=2, maximum=600, whole=True),
+            # Pepperstone's US share CFDs start quoting at 09:31 New York, a minute after the open.
+            "first_price_wait": number(p + "FIRST_PRICE_WAIT", 90, minimum=0, maximum=600, whole=True),
             "max_trades_per_day": number(p + "MAX_TRADES_PER_DAY", 1, minimum=1, whole=True),
             # The stop is only the surge's own size away, and spreads are wide
             # at the open, so this is looser than the bar strategies' 10%.
