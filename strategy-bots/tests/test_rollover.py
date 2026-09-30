@@ -74,6 +74,15 @@ class RolloverTimingTests(unittest.TestCase):
             self.assertTrue(rollover.entries_paused(self.ROLLOVER - 10 * 60))
             self.assertFalse(rollover.entries_paused(self.ROLLOVER - 30 * 60))
 
+    def test_trading_day_starts_at_the_last_rollover(self):
+        self.assertEqual(rollover.trading_day_start(utc(2026, 9, 30, 12, 0)), self.ROLLOVER)
+        self.assertEqual(rollover.trading_day_start(self.ROLLOVER), self.ROLLOVER)
+        self.assertEqual(rollover.trading_day_start(self.ROLLOVER - 1), utc(2026, 9, 28, 21, 0))
+        # 1 November: US clocks go back, so that day's rollover is 22:00 UTC, 25 hours after the last.
+        self.assertEqual(rollover.trading_day_start(utc(2026, 11, 1, 21, 30)), utc(2026, 10, 31, 21, 0))
+        self.assertEqual(rollover.trading_day_start(utc(2026, 11, 1, 22, 30)), utc(2026, 11, 1, 22, 0))
+        self.assertEqual(rollover.next_rollover_uk(utc(2026, 9, 30, 12, 0)), "22:00")
+
     def test_describe_gives_tonights_uk_times(self):
         with minutes(15, 60):
             self.assertEqual(rollover.describe(utc(2026, 9, 29, 12, 0)),
@@ -219,7 +228,7 @@ class IGScannerTests(ScannerTestCase):
 
     def test_remembers_what_it_opens(self):
         own = self.own()
-        details = {"min_deal_size": 0.5, "scaling_factor": 1, "currency": "GBP", "expiry": "-"}
+        details = {"min_deal_size": 0.5, "contract_size": 1, "scaling_factor": 1, "currency": "GBP", "expiry": "-"}
         service = mock.Mock()
         service.create_open_position.return_value = {"dealStatus": "ACCEPTED", "dealId": "DINEW",
                                                      "affectedDeals": [{"dealId": "DINEW", "status": "OPENED"}]}

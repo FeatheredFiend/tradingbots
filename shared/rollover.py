@@ -63,6 +63,20 @@ def entries_paused(now: float = None) -> bool:
     return clock.near_rollover(time.time() if now is None else now, before, RESUME_MINUTES)
 
 
+def trading_day_start(now: float = None) -> float:
+    """When the current trading day began: the last rollover at or before `now`."""
+    now = time.time() if now is None else now
+    upcoming = clock.next_rollover(now)
+    # The one before is 23 to 25 hours earlier (the clocks change in between).
+    return now if upcoming == now else clock.next_rollover(upcoming - 26 * 3600)
+
+
+def next_rollover_uk(now: float = None) -> str:
+    """The next rollover in UK time, e.g. "22:00"."""
+    upcoming = clock.next_rollover(time.time() if now is None else now)
+    return clock.local("london", upcoming).strftime("%H:%M")
+
+
 def describe(now: float = None) -> str:
     """One line for the startup log, with tonight's times in UK time."""
     now = time.time() if now is None else now

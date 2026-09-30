@@ -155,6 +155,32 @@ request limit stretches a pass to about 35 seconds for the default pool,
 so a 1-minute bar gets a sample or two, and one a slow pass misses is skipped. Use 5 minutes or
 longer here; the bot warns at startup when the bars are too short.
 
+**Loss limits.** Every IG trade is the market's minimum size, and that is
+still big (see [IG position sizing](#ig-position-sizing-both-ig-bots)): a
+0.5% stop on gold loses about £200, one on Japan 225 about £125. With a
+position in every one of 15 markets, the account swings hard. So three
+limits sit on top of the percentage stop. They're in the account's
+currency, and 0 switches one off:
+
+- `IG_MAX_TRADE_LOSS` (default `25`): where a stop-out would lose more than
+  this, the stop is pulled in closer. On gold that's 2.5 points instead
+  of 20.8, and on Japan 225 about 66 instead of 337. FX Minis and US crude
+  are too small to be affected. If even IG's closest allowed stop would
+  lose more, the trade isn't opened, and the log says why.
+- `IG_MAX_POSITIONS` (default `5`): at most this many positions open at
+  once in the pool's markets, whoever opened them.
+- `IG_DAILY_LOSS_LIMIT` (default `250`): the day's closed trades in the
+  pool's markets plus the bot's open positions are checked each pass. Once
+  that's down this much, the bot closes its own positions and opens
+  nothing until the next daily rollover (22:00 UK), which starts a new day.
+  A restart doesn't reset it, because the day is re-read from IG's history.
+  That history doesn't say who opened a trade, so a trade you close by hand
+  in those markets counts too, just as it does on the dashboard.
+
+A tighter stop cuts each loss sooner, but the market's normal wiggle then
+hits it more often. The limits make the losses smaller and more even. They
+don't give the streak signal an edge (see the backtest below).
+
 **Resolution is intentionally looser here than `ig-cfd-ema-bot/`:** that bot
 hard-exits on any ambiguous or unresolved name, because getting one specific
 hand-picked symbol wrong matters. This bot's whole point is breadth, not
@@ -714,7 +740,9 @@ Clock and DST rules, indicators, each strategy's signals on made-up bars,
 and the runner's sizing, spread, rollover, slots, dry run and
 other-people's-positions rules against a fake broker. `test_rollover.py`
 covers the CFD scanners' close before the rollover: its timing, and that
-each closes only its own trades. `test_surge.py` covers the opening surge:
+each closes only its own trades. `test_ig_loss_limits.py` covers the IG
+scanner's loss limits: the stop pulled in per market, the position cap, and
+the daily limit's close, stop and reset. `test_surge.py` covers the opening surge:
 the surge rule, the signals file, the scanner on made-up Alpaca data and
 the followers against a fake broker. No broker is contacted. Run them in
 `ig-bot-env`, which has everything they import.
@@ -815,8 +843,10 @@ markets land in the same ballpark. Check a market's deal ticket on IG for
 its exact minimum and margin.
 
 **The bots never look at the account balance.** On a 10,000 demo balance
-they work, but the scanner holding trades in many of its 15 markets at
-once could tie up several thousand in margin. On 100 or less, IG would
+they work, but the scanner holding trades in all 15 of its markets at
+once tied up about 7,500 in margin on 30 Sep 2026. That's why it now keeps
+to 5 open positions and caps each trade's and each day's loss (see its
+section above). On 100 or less, IG would
 reject trades for insufficient funds, or a single stop-loss could wipe the
 account out. **These bots can't be scaled down to small amounts** — IG's
 minimum trade size is the floor. For genuinely small trades, see the
