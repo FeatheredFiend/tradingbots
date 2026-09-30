@@ -34,6 +34,8 @@ from tkinter import filedialog, messagebox, ttk
 
 import psutil
 
+import bot_clashes
+
 APP_NAME = "Trading Bots"
 CONFIG_PATH = Path(os.environ.get("APPDATA", Path.home())) / "TradingBots" / "launcher.json"
 DEFAULT_REPO = r"\\wsl.localhost\Ubuntu\home\martyn\projects\tradingbots"
@@ -783,6 +785,18 @@ class LauncherApp:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def start_checked(self, bots) -> None:
+        """start(), after a warning if the bots would get in each other's way
+        or in the way of bots already running."""
+        env = read_user_env()
+        notes = bot_clashes.problems(bot_clashes.footprints(BOTS, env, STRATEGY_BOTS), env,
+                                     [b.key for b in bots if b.key not in self.running], self.running)
+        if notes and not messagebox.askyesno(
+                APP_NAME, "These would get in each other's way:\n\n" + "\n\n".join("• " + n for n in notes)
+                + "\n\nStart anyway?", icon="warning", default="no"):
+            return
+        self.start(bots)
+
     def stop(self, bots, then=None) -> None:
         targets = [(b, self.running[b.key]) for b in bots if b.key in self.running and b.key not in self.busy]
         for bot, _ in targets:
@@ -842,12 +856,14 @@ class BotsTab:
         ttk.Button(toolbar, text="Stop all", command=lambda: app.stop(BOTS)).pack(side="right")
         ttk.Button(toolbar, text="Start all ticked", style="Primary.TButton", command=self.start_all
                    ).pack(side="right", padx=(0, px(8)))
+        ttk.Button(toolbar, text="Tick safe set", command=self.tick_safe_set).pack(side="right", padx=(0, px(8)))
         self.summary = ttk.Label(self.frame, text="", style="Muted.TLabel")
         self.summary.pack(fill="x", pady=(0, px(8)))
 
         hint = ttk.Label(self.frame, style="Hint.TLabel", wraplength=px(900), justify="left", text=(
-            "Tick the bots that \"Start all ticked\" starts (whatever the filter shows) - not an EMA bot and a scanner "
-            "on the same OANDA or Alpaca account, they'd close each other's trades. The strategy bots only manage their "
+            "Tick the bots that \"Start all ticked\" starts (whatever the filter shows). \"Tick safe set\" ticks the most "
+            "bots that can run at once without touching each other's trades, going by the accounts and markets set on "
+            "the Settings tab, and Start warns before starting a bot that would. The strategy bots only manage their "
             "own trades and keep out of markets where another position is open. Bots started by hand show up here too. "
             "Each bot opens as a tab in the \"TradingBots\" terminal window, and Stop presses Ctrl+C in its tab, so it "
             "shuts down cleanly. Closing that window stops every bot; closing this app leaves them running."
@@ -885,7 +901,31 @@ class BotsTab:
         self.update()
 
     def start_all(self) -> None:
-        self.app.start([b for b in BOTS if b.key in self.app.config["start_all"]])
+        self.app.start_checked([b for b in BOTS if b.key in self.app.config["start_all"]])
+
+    def tick_safe_set(self) -> None:
+        """Tick the most bots that can all run at once under the current
+        settings, and say what was left out and why."""
+        env = read_user_env()
+        chosen, left_out = bot_clashes.pick(bot_clashes.footprints(BOTS, env, STRATEGY_BOTS), env,
+                                            running=self.app.running, ticked=self.app.config["start_all"])
+        self.app.config["start_all"] = [b.key for b in BOTS if b.key in chosen]
+        save_config(self.app.config)
+        for bot in BOTS:
+            self.rows[bot.key].in_start_all.set(bot.key in chosen)
+
+        lines = [f"Ticked {len(chosen)} of {len(BOTS)} bots: with the accounts and markets set now, none of them "
+                 "touches another's trades."]
+        reasons = {}
+        for bot in BOTS:
+            if bot.key in left_out:
+                reasons.setdefault(left_out[bot.key], []).append(bot.name)
+        if reasons:
+            lines += ["", "Left out:"] + [f"• {', '.join(names)}: {why}" for why, names in reasons.items()]
+        stop_first = [b.name for b in BOTS if b.key in self.app.running and b.key not in chosen]
+        if stop_first:
+            lines += ["", "Running but not in the set - stop before \"Start all ticked\": " + ", ".join(stop_first)]
+        messagebox.showinfo(APP_NAME, "\n".join(lines))
 
     def update(self) -> None:
         """Every refresh, since "Running only" changes as bots start and stop."""
@@ -953,7 +993,7 @@ class BotRow:
         if self.bot.key in self.app.running:
             self.app.stop([self.bot])
         else:
-            self.app.start([self.bot])
+            self.app.start_checked([self.bot])
 
     def update(self, process, busy) -> None:
         if busy:
