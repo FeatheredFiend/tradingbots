@@ -204,7 +204,7 @@ during regular market hours (9:30–16:00 New York, 14:30–21:00 UK):
 - Buy: 3 consecutive higher closes in a row
 - Sell (close): 3 consecutive lower closes in a row, a 2% stop-loss or a 5%
   take-profit (adjustable with `STOP_LOSS_PERCENT` / `TAKE_PROFIT_PERCENT`,
-  in percent — e.g. `0.5` for 0.5%)
+  in percent — e.g. `0.5` for 0.5%), or closing time (below)
 
 **Buys only.** Fractional shares can't be sold short on Alpaca, and short
 selling needs a $2,000+ margin account, so a falling streak only ever closes
@@ -234,11 +234,24 @@ Differences from the IG scanner worth knowing:
 - **Closed bars only.** The signal is judged on completed bars, so it can't
   flicker on and off within a bar, and a share is bought at most once per
   bar — a stop-loss doesn't immediately re-buy on the same streak.
-- **Stop-loss and take-profit are checked by the bot** (every minute, or
-  every 15 seconds on 1-minute bars), not
-  the broker: Alpaca can't attach them to fractional orders. They only work
-  while the bot is running and the market is open, and positions are held
-  overnight, so a gap at the next open can go well past 2%.
+- **The stop-loss is a stop order at Alpaca.** Alpaca can't attach a
+  stop or take-profit to a fractional order (no brackets), and won't keep a
+  fractional stop order past the day (no GTC), but it does take a plain day
+  stop order. So each position gets one for all its shares as soon as it
+  shows up, and it works between the bot's checks and while the bot isn't
+  running. Its client order ID starts `scanner-stop-`, so the bot never
+  touches anyone else's orders. Alpaca won't sell shares a stop order is
+  holding, so the bot cancels the stop before any sell of its own (and a
+  dashboard close cancels it too; the next loop puts one back on what's
+  left). If Alpaca refuses a stop order, the bot watches that stop itself,
+  as it used to. Stops filled at Alpaca are reported to the dashboard as
+  "stop-loss". The take-profit is still checked by the bot every loop.
+- **Nothing is held overnight.** It sells everything `ALPACA_FLAT_MINUTES`
+  (10) before the market closes, and buys nothing from
+  `ALPACA_LAST_ENTRY_MINUTES` (30) before it; Alpaca's clock knows the half
+  days. An overnight gap jumps straight past a stop: on 28–30 Sep 2026 the
+  8 positions it held overnight lost 2.6% between them, about a third of
+  what its 79 trades lost. 0 switches either part off.
 
 Don't run it alongside `alpaca-ema-bot/` on the same paper account — both
 trade AAPL, MSFT and friends, and each would close the other's positions.
@@ -959,6 +972,50 @@ on the shares that move fast, and 1.29x wider than usual at the moment of
 entry) all but 1 of the 192 settings lost, and that one (249 trades, good in
 one half only) is what chance alone would throw up.
 
+## Stocks in play backtest (`backtest/stocks_in_play_backtest.py`)
+
+Tests the best-documented intraday strategy for small accounts before any
+bot is built: the opening-range breakout on "stocks in play" from Zarattini,
+Barbon & Aziz (2024), "A Profitable Day Trading Strategy For The U.S. Equity
+Market". At 09:35 New York time it takes the 20 US shares trading the most
+volume in their first 5 minutes compared with their own usual first 5
+minutes, and trades each one's breakout in the direction of that first bar:
+a buy stop at its high if it rose, a sell stop at its low if it fell.
+Stop-loss 10% of the share's ATR, otherwise out at the close. It replays
+consolidated (SIP) 1-minute bars, so stops fill where they would have.
+
+```powershell
+python backtest\stocks_in_play_backtest.py --per-minute 140   # alpaca-bot-env; Jan 2024 to yesterday
+```
+
+Options: `--start 2024-01-02` (the paper's data ended in 2023, so all of
+this is out of sample for it), `--top 20`, `--spread-samples 400`, and
+`--per-minute 190`. Alpaca allows 200 requests a minute per account, shared
+with any Alpaca bot running on the same keys, so use ~140 while they run.
+Shares delisted since are included, found from Alpaca's corporate actions
+(merger targets, shares written off), because its asset list forgets most
+of them. Costs are the bid/ask spread looked up at the moment of 400 sampled
+entries and exits. Everything is cached a month at a time in `backtest/data/`.
+
+First run (2 Jan 2024 - 29 Sep 2026: 688 sessions, ~1,300 shares passing
+the paper's screen a day, 467 of them since delisted, 10,959 trades):
+
+- **Before costs the rule has an edge:** +0.38R (+0.19%) a trade, where R
+  is the amount risked.
+- **The spread eats all of it.** It enters in the first minutes after the
+  open, on shares with news, when their spreads are at their widest: 0.34-0.51%
+  on average (median 0.25%). That's about as much as the 10%-ATR stop risks.
+- **After costs it lost 0.69R a trade (t -13), in every year.** Wider stops,
+  no stop, the top 5 or 10 only, longs only (all a small fractional account
+  can do) and shorts only all lost too. Even at the median spread it's about
+  break-even at best.
+- **Sizing is a second problem:** at the paper's stop, risking $1 takes $321
+  of shares, so 20 trades a day at 1% risk each need ~64x the account.
+
+No stocks-in-play bot is worth building. The surge followers trade the same
+minutes after the open, so the same spreads apply to them (plus Pepperstone's
+$0.02 a share commission each way on share CFDs).
+
 ## Dashboard (`shared/dashboard_reporter.py`)
 
 Every bot can report to the
@@ -986,7 +1043,7 @@ to 2,000 log lines to send later. What each broker can report:
 | OANDA | yes - trades with why they closed (stop-loss, take-profit, reversal) | 12 a minute |
 | Pepperstone | yes - trades matched from MT5's deal history by the bot's magic number | none (local terminal) |
 | Capital.com | yes - trades pieced together from the activity and transaction history, with why they closed | 16 a minute |
-| Alpaca | yes - trades as the bot closes them, priced at Alpaca's value just before the sell | 8 a minute |
+| Alpaca | yes - trades as the bot closes them, priced at Alpaca's value just before the sell; the scanner's stop orders filled at Alpaca at their fill price | 8 a minute |
 | IG scanner | yes - each open position's profit is worked out by the bot (IG's REST API doesn't give one: move x size x contract size, converted at IG's own rate); trades from the transaction history every 5 minutes | about 1.2 a minute, inside its pacing |
 | IG EMA bot | log and running status only | none |
 | Strategy bots | as their broker's bots above, but only the bot's own positions and trades; its Settings tab lists every setting it started with | as their broker's bots |

@@ -534,6 +534,10 @@ SETTING_GROUPS = [
         Setting("BOT_BUDGET_USD", "Scanner budget ($)", "Default 100", number=True),
         Setting("BOT_MAX_POSITIONS", "Scanner max positions", "Default 5", number=True),
         Setting("BOT_POOL", "Scanner shares", "Comma-separated tickers - empty for the default 30"),
+        Setting("ALPACA_FLAT_MINUTES", "Scanner: sell before close", "Minutes before the market closes - default 10, "
+                "0 = hold overnight", number=True),
+        Setting("ALPACA_LAST_ENTRY_MINUTES", "Scanner: no buys before close", "Minutes before the market closes - "
+                "default 30, 0 = off", number=True),
         Setting("BOT_SYMBOLS", "EMA bot shares", "Comma-separated - default AAPL,MSFT,AMZN,GOOGL,TSLA"),
         *_strategy_bot_settings("alpaca"),
         *_surge_follower_settings("alpaca"),
