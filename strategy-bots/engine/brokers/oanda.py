@@ -19,7 +19,7 @@ from ..indicators import Bar
 
 BASE_URL = "https://api-fxpractice.oanda.com"  # Practice (demo) only - do not change.
 REQUEST_TIMEOUT_SECONDS = 20
-GRANULARITY = {"M5": "M5", "M15": "M15", "M30": "M30", "H1": "H1", "H4": "H4"}
+GRANULARITY = {"M5": "M5", "M15": "M15", "M30": "M30", "H1": "H1", "H4": "H4", "D": "D"}  # D: 17:00-17:00 New York
 
 
 class OandaBroker(Broker):

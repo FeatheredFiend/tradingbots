@@ -67,7 +67,12 @@ FAMILIES = {
     "commodity-trend": "Commodity trend (4H/15M)",
     "scalper": "Tick scalper (HFT-style)",
     "surge": "Opening surge (scanner + followers)",
+    "slow-trend": "Slow trend (daily, commodities)",
+    "etf-rotation": "Monthly ETF rotation",
 }
+# Portfolio bots (strategy-bots/engine/rebalancer.py) hold all their markets
+# at once, so they have no max positions.
+PORTFOLIO_FAMILIES = ("slow-trend", "etf-rotation")
 # The strategy bots in strategy-bots/: each of these on every broker, except
 # forex on Alpaca, which has none. (key, env prefix, default markets per broker).
 STRATEGY_BOTS = {
@@ -84,6 +89,9 @@ STRATEGY_BOTS = {
         "oanda": "EUR_USD, GBP_USD, USD_JPY, SPX500_USD", "pepperstone": "EURUSD, GBPUSD, USDJPY, US500",
         "capital": "EURUSD, GBPUSD, USDJPY, US500", "ig": "EUR/USD:CS.D.EURUSD.MINI.IP, US 500:IX.D.SPTRD.IFS.IP",
         "alpaca": "SPY, QQQ"}),
+    "slow-trend": ("SLOW_TREND", {
+        "oanda": "BCO_USD, WTICO_USD, NATGAS_USD, XAU_USD, XAG_USD, XCU_USD, CORN_USD, WHEAT_USD, SOYBN_USD, SUGAR_USD"}),
+    "etf-rotation": ("ROTATION", {"alpaca": "VOO, EFA, IEF, DBC, VNQ"}),
 }
 # Each strategy bot's own budget, when <BROKER>_<PREFIX>_BUDGET is empty (IG bots have none).
 STRATEGY_BOT_BUDGETS = {
@@ -93,6 +101,7 @@ STRATEGY_BOT_BUDGETS = {
     ("capital", "index-reversion"): 200, ("capital", "commodity-trend"): 100,
     ("alpaca", "index-reversion"): 100, ("alpaca", "commodity-trend"): 100,
     ("oanda", "scalper"): 100, ("pepperstone", "scalper"): 1000, ("capital", "scalper"): 100, ("alpaca", "scalper"): 100,
+    ("oanda", "slow-trend"): 5000, ("alpaca", "etf-rotation"): 100,
 }
 
 CLASSIC_BOTS = [
@@ -119,7 +128,8 @@ CLASSIC_BOTS = [
 
 def _strategy_bot(broker: str, family: str) -> Bot:
     label = FAMILIES[family]
-    return Bot(f"{broker}-{family}", f"{BROKERS[broker]} {label.split(' (')[0].lower()}", broker, label,
+    short = label.split(" (")[0]
+    return Bot(f"{broker}-{family}", f"{BROKERS[broker]} {short[0].lower()}{short[1:]}", broker, label,
                rf"strategy-bots\{broker}_{family.replace('-', '_')}_bot.py", family)
 
 
@@ -131,11 +141,13 @@ SURGE_BOTS = [Bot("surge-scanner", "Surge scanner", "alpaca", "Opening surge sca
     Bot(f"{broker}-surge-follower", f"{BROKERS[broker]} surge follower", broker, "Opening surge follower",
         rf"strategy-bots\{broker}_surge_follower_bot.py", "surge") for broker in SURGE_FOLLOWERS]
 
-BOTS = [bot for broker in BROKERS for bot in (
-    [b for b in CLASSIC_BOTS if b.broker == broker]
-    + [_strategy_bot(broker, family) for family, (_, markets) in STRATEGY_BOTS.items() if broker in markets]
-    + [b for b in SURGE_BOTS if b.broker == broker]
-)]
+# Every bot, listed by name on the Bots tab.
+BOTS = sorted(
+    CLASSIC_BOTS
+    + [_strategy_bot(broker, family) for broker in BROKERS
+       for family, (_, markets) in STRATEGY_BOTS.items() if broker in markets]
+    + SURGE_BOTS,
+    key=lambda bot: bot.name.lower())
 
 
 def default_config() -> dict:
@@ -327,7 +339,8 @@ def _strategy_bot_settings(broker: str) -> list:
         if broker != "ig":  # IG's always trade the minimum size
             rows.append(Setting(p + "BUDGET", "Budget", "Its own money, in the account's currency - default "
                                 f"{STRATEGY_BOT_BUDGETS[(broker, family)]:,}", number=True))
-        rows.append(Setting(p + "MAX_POSITIONS", "Max positions", "Open at once - default 2", number=True))
+        if family not in PORTFOLIO_FAMILIES:
+            rows.append(Setting(p + "MAX_POSITIONS", "Max positions", "Open at once - default 2", number=True))
         if broker in ("oanda", "capital"):
             rows.append(Setting(p + "ACCOUNT_ID", "Account ID", f"Its own sub-account - empty for the "
                                                                 f"{broker.upper()}_ACCOUNT_ID one"))
@@ -489,7 +502,39 @@ SETTING_GROUPS = [
         Setting("SURGE_MAX_HOLD_MINUTES", "Time stop", "Minutes - default 15", number=True),
         *_risk_settings("SURGE_", "0.5", spread="25"),
     ]),
-    ("OANDA", "Practice account: hub > Tools > API > Generate. Give bots that trade the same markets "
+    ("Slow trend (OANDA)", "Daily trend following on commodity CFDs: each market long, flat or short by its 50/200-day "
+                           "EMAs and its move on a year ago, sized by its volatility, rebalanced once a weekday. "
+                           "Backtested 2008-2026 it has an edge before costs, mostly eaten by OANDA's financing - "
+                           "expect little. Give it an OANDA sub-account of its own (OANDA section).", [
+        Setting("SLOW_TREND_TRADE_TIME", "Rebalance at", "London time, weekdays - default 15:00, when all its "
+                                                          "markets are open"),
+        Setting("SLOW_TREND_TARGET_VOLATILITY", "Target volatility", "% of the budget a year, all its markets "
+                                                                      "together - default 10", number=True),
+        Setting("SLOW_TREND_REBALANCE_BAND", "Rebalance band", "Resize a position only when it's this % off its "
+                                                                "target - default 25", number=True),
+        Setting("SLOW_TREND_FAST_EMA", "Fast EMA", "Days - default 50", number=True),
+        Setting("SLOW_TREND_SLOW_EMA", "Slow EMA", "Days - default 200", number=True),
+        Setting("SLOW_TREND_MOMENTUM_DAYS", "Momentum look-back", "Calendar days - default 365", number=True),
+        Setting("SLOW_TREND_VOLATILITY_BARS", "Volatility span", "Daily bars - default 60", number=True),
+        Sub("Risk"),
+        Setting("SLOW_TREND_MAX_MARKET_LEVERAGE", "Max a market", "Exposure, times the budget - default 1", number=True),
+        Setting("SLOW_TREND_MAX_LEVERAGE", "Max in all", "Exposure, times the budget - default 3", number=True),
+        Setting("SLOW_TREND_SAFETY_STOP", "Safety stop", "Months of usual movement from the entry, for when the bot "
+                                                         "isn't running - default 3", number=True),
+        Setting("SLOW_TREND_MAX_SPREAD_PERCENT", "Max spread", "% of the price - default 0.3", number=True),
+    ]),
+    ("Monthly ETF rotation (Alpaca)", "Splits its budget equally between funds. Once a month, each is held if its "
+                                      "month-end close is above its 10-month average, else its share goes to a cash "
+                                      "fund. Buys only, no leverage - an investment, not a trading edge.", [
+        Setting("ROTATION_SMA_MONTHS", "Average of", "Month-end closes - default 10", number=True),
+        Setting("ROTATION_CASH_FUND", "Cash fund", "Ticker - default SHY (1-3 year US Treasuries)"),
+        Setting("ROTATION_MINUTES_AFTER_OPEN", "Trade at", "Minutes into the month's first session - default 30",
+                number=True),
+        Setting("ROTATION_REBALANCE_BAND", "Rebalance band", "Drift under this % of a fund's share is left alone - "
+                                                             "default 5", number=True),
+        Setting("ROTATION_MAX_SPREAD_PERCENT", "Max spread", "% of the price - default 0.5", number=True),
+    ]),
+    ("OANDA","Practice account: hub > Tools > API > Generate. Give bots that trade the same markets "
               "sub-accounts of their own - OANDA nets a market's trades together.", [
         Setting("OANDA_API_TOKEN", "API token", secret=True),
         Setting("OANDA_ACCOUNT_ID", "Account ID", "Only needed if the token sees several accounts"),

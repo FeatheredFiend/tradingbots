@@ -58,6 +58,7 @@ class AlpacaBroker(Broker):
         self.api = None
         self._is_open = False
         self._clock_until = 0.0
+        self._session = (None, None)  # (New York date, that day's opening time), from Alpaca's calendar
 
     def _call(self, what: str, fn, *args, **kwargs):
         try:
@@ -128,12 +129,45 @@ class AlpacaBroker(Broker):
                             float(row["volume"])))
         return bars[-count:]
 
-    def quotes(self, markets: list) -> dict:
-        """Every fund's latest quote in one request (the scalper asks every few
-        seconds); whether the market's open is asked at most every CLOCK_SECONDS."""
+    def daily_bars(self, market: Market, count: int) -> list:
+        """Consolidated (SIP) daily bars, adjusted for dividends and splits,
+        up to 20 minutes ago (the free plan's limit); IEX's if SIP is refused."""
+        now = pd.Timestamp.now(tz="UTC")
+        start = (now - pd.Timedelta(days=math.ceil(count * 7 / 5) + 10)).isoformat()
+        end = (now - pd.Timedelta(minutes=20)).isoformat()
+        try:
+            frame = self._call(f"daily bars for {market.symbol}", self.api.get_bars, market.symbol, TimeFrame.Day,
+                               start=start, end=end, adjustment="all", feed="sip").df
+        except BrokerError:
+            frame = self._call(f"daily bars for {market.symbol}", self.api.get_bars, market.symbol, TimeFrame.Day,
+                               start=start, end=end, adjustment="all", feed=DATA_FEED).df
+        if frame is None or frame.empty:
+            return []
+        return [Bar(t.timestamp(), float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"]),
+                    float(r["volume"])) for t, r in frame.iterrows()][-count:]
+
+    def session_opened_at(self, now: float):
+        self._check_clock()
+        if not self._is_open:
+            return None
+        day = pd.Timestamp(now, unit="s", tz="UTC").tz_convert(MARKET_TZ).date()
+        if self._session[0] != day:
+            days = self._call("market calendar", self.api.get_calendar, start=day.isoformat(), end=day.isoformat())
+            opens = str(days[0].open)[:5] if days else "09:30"  # "09:30", or a time on newer library versions
+            opened = pd.Timestamp(f"{day.isoformat()} {opens}").tz_localize(MARKET_TZ).timestamp()
+            self._session = (day, opened)
+        return self._session[1]
+
+    def _check_clock(self) -> None:
+        """Whether the market's open, asked at most every CLOCK_SECONDS."""
         if time.monotonic() >= self._clock_until:
             self._is_open = self._call("market clock", self.api.get_clock).is_open
             self._clock_until = time.monotonic() + CLOCK_SECONDS
+
+    def quotes(self, markets: list) -> dict:
+        """Every fund's latest quote in one request (the scalper asks every few
+        seconds); whether the market's open is asked at most every CLOCK_SECONDS."""
+        self._check_clock()
         symbols = [m.symbol for m in markets]
         latest = self._call("quotes", self.api.get_latest_quotes, symbols, feed=DATA_FEED) if symbols else {}
         one_sided = [s for s in symbols if s not in latest or not _two_sided(latest[s])]
@@ -172,9 +206,10 @@ class AlpacaBroker(Broker):
         except (APIError, requests.exceptions.RequestException) as e:
             self.log.error(f"{market.symbol}: buy refused: {e}")
             return False
-        self.log.info(f"BUY {market.symbol} ${notional:.2f} (stop {stop:.2f}, take-profit "
-                      f"{f'{take_profit:.2f}' if take_profit is not None else 'none'}, enforced by the bot) "
-                      f"-> order {order.id} {order.status}")
+        levels = "" if stop is None else (
+            f" (stop {stop:.2f}, take-profit {f'{take_profit:.2f}' if take_profit is not None else 'none'}, "
+            f"enforced by the bot)")
+        self.log.info(f"BUY {market.symbol} ${notional:.2f}{levels} -> order {order.id} {order.status}")
         return True
 
     def close(self, market: Market, position: Position, reason: str, size: float = None) -> bool:

@@ -6,7 +6,8 @@ default below.
 Two kinds:
 - Strategy settings, shared by that strategy on every broker (like the
   scanners' STREAK_LENGTH): BREAKOUT_*, REVERSION_*, TREND_*, SCALPER_*,
-  SURGE_* (the opening surge scanner and its followers).
+  SURGE_* (the opening surge scanner and its followers), and the two
+  portfolio bots' SLOW_TREND_* (OANDA) and ROTATION_* (Alpaca).
 - Per-bot settings, one set per broker and strategy:
   <BROKER>_<BREAKOUT|REVERSION|TREND|SCALPER>_MARKETS / _BUDGET / _MAX_POSITIONS,
   plus _ACCOUNT_ID on OANDA and Capital.com (falling back to the broker's
@@ -29,9 +30,16 @@ STRATEGY_NAMES = {
     "commodity-trend": "Commodity trend (4H/15M)",
     "scalper": "Tick scalper (HFT-style)",
     "surge-follower": "Opening surge follower",
+    "slow-trend": "Slow trend (daily, commodities)",
+    "etf-rotation": "Monthly ETF rotation",
 }
 STRATEGY_PREFIX = {"session-breakout": "BREAKOUT", "index-reversion": "REVERSION", "commodity-trend": "TREND",
-                   "scalper": "SCALPER", "surge-follower": "SURGE"}
+                   "scalper": "SCALPER", "surge-follower": "SURGE", "slow-trend": "SLOW_TREND",
+                   "etf-rotation": "ROTATION"}
+# The portfolio bots (engine/rebalancer.py): they hold every one of their
+# markets at a target size and rebalance on a schedule, rather than trading
+# one signal at a time.
+REBALANCERS = ("slow-trend", "etf-rotation")
 
 # The surge followers trade the US shares the surge scanner finds, on the
 # brokers that offer them: how each writes a ticker ("{}" is the ticker).
@@ -66,6 +74,14 @@ DEFAULT_MARKETS = {
     ("capital", "scalper"): "EURUSD,GBPUSD,USDJPY,US500",
     ("ig", "scalper"): "EUR/USD:CS.D.EURUSD.MINI.IP,US 500:IX.D.SPTRD.IFS.IP",
     ("alpaca", "scalper"): "SPY,QQQ",
+    # Commodities whose smallest OANDA trade fits the default budget
+    # (platinum and palladium need about 15,000; bonds pay too much
+    # financing for their small moves - see the README).
+    ("oanda", "slow-trend"): "BCO_USD,WTICO_USD,NATGAS_USD,XAU_USD,XAG_USD,XCU_USD,CORN_USD,WHEAT_USD,SOYBN_USD,"
+                             "SUGAR_USD",
+    # US shares, the rest of the world's, US Treasuries, commodities and US
+    # property. VOO rather than SPY, which the Alpaca index bot trades.
+    ("alpaca", "etf-rotation"): "VOO,EFA,IEF,DBC,VNQ",
 }
 
 # The budget each bot treats as its whole account, in the account's
@@ -81,9 +97,11 @@ DEFAULT_BUDGET = {
     ("oanda", "scalper"): 100, ("pepperstone", "scalper"): 1000, ("capital", "scalper"): 100,
     ("ig", "scalper"): 10000, ("alpaca", "scalper"): 100,
     ("alpaca", "surge-follower"): 100, ("capital", "surge-follower"): 200, ("pepperstone", "surge-follower"): 1000,
+    ("oanda", "slow-trend"): 5000, ("alpaca", "etf-rotation"): 100,
 }
+# The portfolio bots hold all their markets at once, so theirs isn't used.
 DEFAULT_MAX_POSITIONS = {"session-breakout": 2, "index-reversion": 2, "commodity-trend": 2, "scalper": 2,
-                         "surge-follower": 3}
+                         "surge-follower": 3, "slow-trend": 50, "etf-rotation": 50}
 
 # MetaTrader 5 tags each bot's positions with its own number; the
 # Pepperstone scanner and EMA bot use 928001 and 928002.
@@ -249,6 +267,40 @@ def strategy_params(strategy: str) -> dict:
             # at the open, so this is looser than the bar strategies' 10%.
             **_risk(p, risk=0.5, spread=25),
         }
+    if strategy == "slow-trend":
+        p = "SLOW_TREND_"
+        params = {
+            "fast_ema": number(p + "FAST_EMA", 50, minimum=2, whole=True),
+            "slow_ema": number(p + "SLOW_EMA", 200, minimum=3, whole=True),
+            "momentum_days": number(p + "MOMENTUM_DAYS", 365, minimum=20, maximum=1000, whole=True),
+            "volatility_bars": number(p + "VOLATILITY_BARS", 60, minimum=10, maximum=500, whole=True),
+            "target_volatility": number(p + "TARGET_VOLATILITY", 10, minimum=1, maximum=50),
+            "max_market_leverage": number(p + "MAX_MARKET_LEVERAGE", 1, minimum=0.05, maximum=10),
+            "max_leverage": number(p + "MAX_LEVERAGE", 3, minimum=0.1, maximum=30),
+            "rebalance_band": number(p + "REBALANCE_BAND", 25, minimum=0, maximum=100),
+            "trade_time": clock_time(p + "TRADE_TIME", "15:00"),
+            "max_spread_percent": number(p + "MAX_SPREAD_PERCENT", 0.3, minimum=0.01, maximum=10),
+            "safety_stop": number(p + "SAFETY_STOP", 3, minimum=1, maximum=20),
+        }
+        if params["fast_ema"] >= params["slow_ema"]:
+            raise SettingsError("SLOW_TREND_FAST_EMA must be shorter than SLOW_TREND_SLOW_EMA")
+        if not "01:00" <= params["trade_time"] <= "20:00":
+            raise SettingsError("SLOW_TREND_TRADE_TIME must be between 01:00 and 20:00 London time, before the "
+                                "rollover")
+        return params
+    if strategy == "etf-rotation":
+        p = "ROTATION_"
+        cash_fund = (_raw(p + "CASH_FUND") or "SHY").upper()
+        if not cash_fund.replace(".", "").isalnum():
+            raise SettingsError(f"{p}CASH_FUND={cash_fund!r} must be one ticker, e.g. SHY")
+        return {
+            "sma_months": number(p + "SMA_MONTHS", 10, minimum=2, maximum=24, whole=True),
+            "cash_fund": cash_fund,
+            "minutes_after_open": number(p + "MINUTES_AFTER_OPEN", 30, minimum=0, maximum=360, whole=True),
+            "rebalance_band": number(p + "REBALANCE_BAND", 5, minimum=0, maximum=100),
+            "max_spread_percent": number(p + "MAX_SPREAD_PERCENT", 0.5, minimum=0.01, maximum=10),
+            "max_leverage": 1.0,  # bought outright, never on margin
+        }
     raise SettingsError(f"unknown strategy {strategy!r}")
 
 
@@ -326,11 +378,12 @@ def bot_settings(broker: str, strategy: str) -> BotSettings:
     account_id = ""
     if broker in ("oanda", "capital"):
         account_id = _raw(prefix + "ACCOUNT_ID") or _raw(f"{broker.upper()}_ACCOUNT_ID")
+    label = STRATEGY_NAMES[strategy].split(" (")[0]
     return BotSettings(
         broker=broker,
         strategy=strategy,
         slug=f"{broker}-{strategy}",
-        name=f"{BROKER_NAMES[broker]} {STRATEGY_NAMES[strategy].split(' (')[0].lower()}",
+        name=f"{BROKER_NAMES[broker]} {label[0].lower()}{label[1:]}",  # "Alpaca monthly ETF rotation"
         markets=markets,
         budget=number(prefix + "BUDGET", DEFAULT_BUDGET[(broker, strategy)], minimum=1),
         max_positions=number(prefix + "MAX_POSITIONS", DEFAULT_MAX_POSITIONS[strategy], minimum=1, whole=True),

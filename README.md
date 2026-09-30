@@ -5,10 +5,13 @@ Small, paper/demo-only trading bots against different brokers' APIs.
 each broker - a momentum scanner and an EMA crossover bot, plus four
 [strategy bots](#strategy-bots-strategy-bots) (forex session breakout,
 index mean reversion, commodity trend, and an "HFT-style" tick scalper),
-and an [opening surge](#opening-surge-strategy-botssurge_) scanner that
+an [opening surge](#opening-surge-strategy-botssurge_) scanner that
 watches the whole US stock market at the open and passes what it finds to
-a follower bot on each broker with US shares - 33 bots in all. What differs
-between brokers is how small a trade can be:
+a follower bot on each broker with US shares, and two
+[portfolio bots](#portfolio-bots-slow-trend-and-monthly-etf-rotation) that
+hold a whole portfolio and rebalance it on a schedule (slow trend on OANDA
+commodities, a monthly ETF rotation on Alpaca) - 35 bots in all. What
+differs between brokers is how small a trade can be:
 
 | Broker | API access | Smallest trade | Runs on |
 |---|---|---|---|
@@ -757,7 +760,10 @@ each closes only its own trades. `test_ig_loss_limits.py` covers the IG
 scanner's loss limits: the stop pulled in per market, the position cap, and
 the daily limit's close, stop and reset. `test_surge.py` covers the opening surge:
 the surge rule, the signals file, the scanner on made-up Alpaca data and
-the followers against a fake broker. No broker is contacted. Run them in
+the followers against a fake broker. `test_rebalancer.py` covers the
+portfolio bots: the slow trend's signal, volatility and sizing, the
+rotation's month-end average, both schedules, the orders that take a
+position to its target, and a rebalance against a fake broker. No broker is contacted. Run them in
 `ig-bot-env`, which has everything they import.
 
 ## Opening surge (`strategy-bots/surge_*`)
@@ -845,6 +851,119 @@ tested a close cousin - chasing the whole market's fastest 5-60 minute
 movers - over six months and found nothing before costs and a loss after
 the spread, which is widest just when prices move fast. This tries it
 second by second, right at the open; treat the demo accounts as the test.
+
+## Portfolio bots: slow trend and monthly ETF rotation
+
+**Concept.** Every other bot here trades one signal at a time, with a stop
+and a target. These two hold all of their markets at a target size and
+move each position towards it on a schedule - once a day, once a month
+(`strategy-bots/engine/rebalancer.py`). They came out of a study of bonds
+and commodities on 30 September 2026 (below): the only approach tested
+in this repo with an edge before costs is slow, daily trend following
+spread over many markets.
+
+| Bot | Runs in | Holds |
+|---|---|---|
+| `oanda_slow_trend_bot.py` (**OANDA slow trend**) | ig-bot-env | 10 commodity CFDs, long, flat or short: Brent, WTI, natural gas, gold, silver, copper, corn, wheat, soybeans, sugar (budget 5,000) |
+| `alpaca_etf_rotation_bot.py` (**Alpaca monthly ETF rotation**) | alpaca-bot-env | 5 funds, bought outright: VOO (US shares), EFA (other developed markets), IEF (7-10 year Treasuries), DBC (commodities), VNQ (US property) - or SHY (1-3 year Treasuries) in their place (budget $100) |
+
+```powershell
+python strategy-bots\oanda_slow_trend_bot.py       # ig-bot-env
+python strategy-bots\alpaca_etf_rotation_bot.py    # alpaca-bot-env
+```
+
+Both run on the strategy bots' runner, so `STRATEGY_DRY_RUN`, the
+own-trades-only rule, the saved notes in `strategy-bots/state/` and
+closing from the dashboard all work as there (a position closed from the
+dashboard is put back at the next rebalance). On starting, each logs where
+every market stands and what it would hold. Neither compounds: the budget
+stays the budget.
+
+**Slow trend (`SLOW_TREND_*`).**
+- Signal, per market, on OANDA's daily candles (17:00 New York close):
+  the 50-day EMA (`FAST_EMA`) above or below the 200-day (`SLOW_EMA`), and
+  the price above or below where it was `MOMENTUM_DAYS` (365) ago. Both up
+  = **long**, both down = **short**, one each = **flat**.
+- Size: each market's usual daily move (exponentially weighted over
+  `VOLATILITY_BARS`, 60 days) is scaled so it adds `TARGET_VOLATILITY`
+  (10%) / √(markets) of the budget a year - quiet markets get bigger
+  positions. With 10 markets that's ~3.2% each, ~10% a year for the lot if
+  they moved independently (Brent and WTI don't). At most
+  `MAX_MARKET_LEVERAGE` (1) x the budget in one market, `MAX_LEVERAGE` (3) x
+  in all, rounded down to OANDA's steps. A market whose smallest trade is
+  more than its share says so in the log - platinum and palladium would need
+  a budget of ~15,000, so they're not in the default list.
+- When: weekdays from `TRADE_TIME` (15:00 London, when all ten are open -
+  US grains trade 14:30-19:20 UK) to 15 minutes before the rollover. A
+  market that's shut, or whose spread is over `MAX_SPREAD_PERCENT` (0.3%)
+  of the price, is tried again every 10 minutes until then. A position is
+  only resized when it's `REBALANCE_BAND` (25%) off its target, or its
+  signal changes - most days nothing trades.
+- Safety stop: each trade carries a stop-loss `SAFETY_STOP` (3) months'
+  usual movement away (~35% for natural gas, ~14% for soybeans), only for
+  when the bot isn't running; the signal does the real exits.
+- Financing is paid or received every night. For commodities it includes
+  the futures curve: on 30 September 2026 OANDA *paid* ~44-49% a year to
+  hold oil long and ~50% to hold natural gas short, and charged the same
+  the other way. The startup log shows each market's rates.
+- Give it an OANDA sub-account of its own (`OANDA_SLOW_TREND_ACCOUNT_ID`).
+  OANDA nets a market's trades together, so on a shared account it won't
+  trade a market where another bot has a position (the commodity trend
+  bot's gold and Brent, say) - it logs that and looks again the next day.
+
+**Monthly ETF rotation (`ROTATION_*`).**
+- Each fund gets an equal share of the budget ($20 of $100). Once a month -
+  `MINUTES_AFTER_OPEN` (30) into the month's first session, or the first
+  time the bot runs in the month - each fund is held if its last month-end
+  close (from Alpaca's daily bars, adjusted for dividends) is above the
+  average of the last `SMA_MONTHS` (10) month-end closes. Otherwise its
+  share goes into `CASH_FUND` (SHY).
+- Sells first, then buys. A fund less than `REBALANCE_BAND` (5%) of its
+  share off target is left alone (and never an order under Alpaca's $1).
+- Buys only, no leverage, no overnight costs. It won't trade a fund
+  someone else holds on the account - VOO rather than SPY, which the
+  Alpaca index bot trades.
+
+**Backtest (30 September 2026; research scripts, not in the repo).** Daily,
+2008-2026, textbook rules, no tuning. OANDA's commodity and bond prices
+leave out the futures roll - its natural gas was 11.06 in 2005 and 2.89
+now, the spot price - and it pays or charges that as financing instead, so
+a test on its prices alone is wrong by the carry. Returns here come from
+ETFs that hold the futures (USO, UNG, CORN, ... and IEF, TLT, ... for
+bonds), less the cash rate, less OANDA's spread and its 2.5%-a-year
+financing charge. 18 bonds and commodities, each at equal risk:
+
+| | EMA 50/200 | 12-month momentum |
+|---|---|---|
+| Before costs (Sharpe) | 0.59 | 0.56 |
+| Spread only | 0.55 | 0.53 |
+| Financing like futures (0.5% a year) | 0.43 | 0.42 |
+| **OANDA's financing (2.5% a year)** | **-0.04** | **-0.02** |
+
+The charge is on every position every night, so bonds - quiet, needing
+~2x leverage for the same risk - lose most (the 2-year Treasury goes from
+0.82 to -0.93). This bot's version - commodities only, both signals
+averaged, on OANDA's own prices - came out at a Sharpe of 0.19 after costs
+(0.47 before), losing in 10 of 19 years, with a worst fall of ~36% at 10%
+volatility. The variants tried (signals from the ETFs, bonds capped at 1x,
+no platinum/palladium) all came out between 0.1 and 0.3, within the ±0.23
+a 19-year Sharpe can be off by chance. Stock index CFDs (US, Europe, Asia)
+lost after costs, and so did trading the commodities' carry itself.
+
+The rotation, monthly, 2007-2026, 5 bps a trade:
+
+| | A year | Volatility | Worst fall | 2008 | 2022 | 2022-26, a year |
+|---|---|---|---|---|---|---|
+| Rotation (10-month average) | 5.2% | 6.6% | -11% | -2% | -8% | 4.3% |
+| All five, held | 5.9% | 12.3% | -44% | -27% | -11% | 6.5% |
+| SPY alone | 10.8% | 15.5% | -51% | -37% | -18% | 12.1% |
+
+**What to expect.** Slow trend: about nothing after OANDA's costs, with
+long flat or losing stretches and falls of a third of the budget at the
+default size. It trades a few times a week, so a demo run needs months
+to show anything. The rotation is an investment that mostly sidesteps
+big falls, not a trading edge: since 2022 it has only just beaten cash,
+and holding US shares made twice as much.
 
 ## IG position sizing (both IG bots)
 
@@ -1073,7 +1192,7 @@ who can sign in to the dashboard as an admin can close trades.
 
 `TradingBots.exe` starts and stops the bots and edits their settings:
 
-- **Bots:** all 33 bots with their status - including ones started by hand -
+- **Bots:** all 35 bots with their status - including ones started by hand -
   filtered by broker and strategy (and "Running only" to hide stopped ones), and Start / Stop / Restart per bot,
   "Start all ticked" and "Stop all", plus a link to each bot's dashboard
   page. Starting runs
@@ -1116,8 +1235,8 @@ e.g. `start_bot.bat oanda-momentum-scanner`.
 Each momentum scanner and EMA bot lives in its own folder with its own
 `requirements.txt`; the shared pieces are `shared/dashboard_reporter.py`
 and `shared/rollover.py` (standard library only; the latter uses the
-strategy engine's `clock.py`). The strategy bots, and the opening surge
-scanner and followers, share `strategy-bots/engine/` and need nothing
+strategy engine's `clock.py`). The strategy bots, the opening surge
+scanner and followers, and the portfolio bots share `strategy-bots/engine/` and need nothing
 beyond their broker's existing requirements.
 Virtual environments (`*-bot-env/`) are gitignored — create your own per
 broker (all of a broker's bots share the same requirements).

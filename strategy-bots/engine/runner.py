@@ -48,6 +48,11 @@ The opening surge followers (engine/surge.py: FollowerBot, built on this
 one) have no market list: they trade the US shares the surge scanner
 signals, looked up on their broker as the signals arrive, through the same
 entry, sizing and exit code as here.
+
+The portfolio bots - slow trend on OANDA, monthly ETF rotation on Alpaca
+(engine/rebalancer.py: RebalanceBot, built on this one) - hold all their
+markets at a target size and rebalance on a schedule instead; they keep
+this one's saved notes, own-trades-only rule and dashboard handling.
 """
 
 import json
@@ -59,7 +64,7 @@ import time
 
 from . import clock
 from .brokers.base import BrokerError, Quote
-from .settings import BROKER_NAMES, STRATEGY_NAMES, TIMEFRAMES, SettingsError, bot_settings
+from .settings import BROKER_NAMES, REBALANCERS, STRATEGY_NAMES, TIMEFRAMES, SettingsError, bot_settings
 from .strategies import make_strategy
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "shared"))
@@ -708,12 +713,19 @@ def main(broker_key: str, strategy_key: str) -> None:
     broker = None
     try:
         settings = bot_settings(broker_key, strategy_key)
-        strategy = make_strategy(strategy_key, settings.params)
+        if strategy_key in REBALANCERS:  # the portfolio bots, in engine/rebalancer.py (built on this module)
+            from .rebalancer import make_portfolio_strategy
+            strategy = make_portfolio_strategy(strategy_key, settings.params)
+        else:
+            strategy = make_strategy(strategy_key, settings.params)
         # Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
         dashboard = DashboardReporter(settings.slug, settings.name, broker=BROKER_NAMES[broker_key],
                                       strategy=STRATEGY_NAMES[strategy_key])
         broker = make_broker(broker_key, settings, dashboard, log)
-        if strategy.uses_signals:
+        if strategy_key in REBALANCERS:
+            from .rebalancer import RebalanceBot  # needs this module, so imported here
+            bot_class = RebalanceBot
+        elif strategy.uses_signals:
             from .surge import FollowerBot  # needs this module, so imported here
             bot_class = FollowerBot
         else:

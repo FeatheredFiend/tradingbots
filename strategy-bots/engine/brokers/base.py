@@ -100,6 +100,18 @@ class Broker:
         indicators.Bar with UTC start times and mid prices."""
         raise NotImplementedError
 
+    def daily_bars(self, market: Market, count: int) -> list:
+        """Up to `count` of the market's latest CLOSED daily bars, oldest first
+        (the portfolio bots, engine/rebalancer.py). Share funds' are adjusted
+        for dividends and splits."""
+        return self.bars(market, "D", count)
+
+    def session_opened_at(self, now: float):
+        """When today's regular session opened (Unix seconds) if the market
+        is open at `now`, else None - for brokers with one daily session
+        (Alpaca)."""
+        return None
+
     def quotes(self, markets: list) -> dict:
         """{symbol: Quote} for these markets, right now."""
         raise NotImplementedError

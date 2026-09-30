@@ -62,6 +62,9 @@ if /i "%BOT%"=="surge-scanner" (set "SCRIPT=strategy-bots\surge_scanner_bot.py" 
 if /i "%BOT%"=="alpaca-surge-follower" (set "SCRIPT=strategy-bots\alpaca_surge_follower_bot.py" & set "VENV=%TRADINGBOTS_ALPACA_ENV%")
 if /i "%BOT%"=="capital-surge-follower" (set "SCRIPT=strategy-bots\capital_surge_follower_bot.py" & set "VENV=%TRADINGBOTS_CAPITAL_ENV%")
 if /i "%BOT%"=="pepperstone-surge-follower" (set "SCRIPT=strategy-bots\pepperstone_surge_follower_bot.py" & set "VENV=%TRADINGBOTS_PEPPERSTONE_ENV%")
+rem The portfolio bots: slow trend on OANDA, monthly ETF rotation on Alpaca.
+if /i "%BOT%"=="oanda-slow-trend" (set "SCRIPT=strategy-bots\oanda_slow_trend_bot.py" & set "VENV=%TRADINGBOTS_OANDA_ENV%")
+if /i "%BOT%"=="alpaca-etf-rotation" (set "SCRIPT=strategy-bots\alpaca_etf_rotation_bot.py" & set "VENV=%TRADINGBOTS_ALPACA_ENV%")
 
 if not defined SCRIPT (
     echo Unknown bot "%BOT%". Choose one of:
@@ -75,6 +78,7 @@ if not defined SCRIPT (
     echo   strategies: session-breakout ^(not on alpaca^) index-reversion commodity-trend scalper
     echo or the opening surge: surge-scanner, and alpaca-surge-follower
     echo   capital-surge-follower  pepperstone-surge-follower
+    echo or a portfolio bot: oanda-slow-trend  alpaca-etf-rotation
     exit /b 2
 )
 if not exist "%VENV%\Scripts\python.exe" (
