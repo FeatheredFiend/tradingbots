@@ -31,6 +31,15 @@ Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
   hour before it to 45 minutes after (SCANNER_FLAT_MINUTES /
   SCANNER_LAST_ENTRY_MINUTES, 0 = off; see shared/rollover.py). Only
   positions with its magic number are closed.
+- Stagnancy : one of its positions that has gone nowhere for a while is
+  logged (shadow, the default) or closed with the reason TIMEOUT_STAGNANT,
+  freeing its slot (SCANNER_STAGNANT_* settings; see shared/stagnancy.py).
+- Broadcasts: with DASHBOARD_BROADCAST=1 it takes broadcast trades from the
+  dashboard (shared/broadcast.py) - the admin's market and side, its own
+  slice size (or less), stop-loss, take-profit and limits, the order's
+  comment naming the broadcast. A market outside the pool is managed until
+  its trade closes (brackets, the pre-rollover close, the stagnancy timeout)
+  but never traded on a streak.
 
 Sizing
 ------
@@ -87,7 +96,10 @@ import MetaTrader5 as mt5
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
+import broadcast  # noqa: E402 - needs the path above
 import rollover  # noqa: E402 - needs the path above
+import stagnancy  # noqa: E402 - needs the path above
+import symbols  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -130,6 +142,8 @@ BAR_SECONDS = BAR_MINUTES[TIMEFRAME] * 60
 LOOP_INTERVAL_SECONDS = min(30, BAR_SECONDS // 4)  # how often to look for newly closed bars
 ERROR_BACKOFF_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
+ACCOUNT_MODE = "demo"  # connect() exits unless MT5 says the account is a demo one
+BROADCASTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "broadcasts.json")
 
 assert STREAK_LENGTH >= 2, "STREAK_LENGTH must be at least 2 to mean anything"
 assert MAX_OPEN_POSITIONS >= 1, "PEPPERSTONE_MAX_POSITIONS must be at least 1"
@@ -149,6 +163,7 @@ log = logging.getLogger("pepperstone_momentum_bot")
 
 # Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
 dashboard = DashboardReporter("pepperstone-momentum-scanner", "Pepperstone momentum scanner", broker="Pepperstone", strategy="Momentum streak")
+broadcasts = broadcast.Book(path=BROADCASTS_FILE, log=log)  # the broadcast trades it acted on (shared/broadcast.py)
 
 
 # ---------------------------------------------------------------------------
@@ -330,21 +345,33 @@ def send(request: dict) -> tuple:
     return False, f"REJECTED ({result.retcode}: {result.comment})"
 
 
-def open_position(symbol: str, info, direction: str, currency: str) -> bool:
-    """Market order with the stop-loss and take-profit attached. True if it filled."""
+_open_problem = ""  # why the last open_position() didn't fill, for a broadcast's answer
+
+
+def open_position(symbol: str, info, direction: str, currency: str, volume: float = None,
+                  comment: str = None) -> bool:
+    """Market order with the stop-loss and take-profit attached: one budget
+    slice, or `volume` lots (a broadcast's), its comment `comment` if given.
+    True if it filled."""
+    global _open_problem
+    _open_problem = ""
     if rollover.entries_paused():
         log.info(f"{symbol}: {direction} signal, but it's too near the daily rollover to open a trade; skipping.")
+        _open_problem = "too near the daily rollover"
         return False
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         log.error(f"No live price for {symbol}; can't {direction}.")
+        _open_problem = "no live price"
         return False
     buy = direction == "BUY"
     price = tick.ask if buy else tick.bid
     value = lot_value(symbol, price)
-    volume = volume_for_slice(info, value) if value else 0.0
+    if volume is None:
+        volume = volume_for_slice(info, value) if value else 0.0
     if volume == 0:
         log.info(f"{symbol}: {direction} signal, but its smallest trade is now worth more than a slice; skipping.")
+        _open_problem = "its smallest trade is worth more than a slice"
         return False
     sign = 1 if buy else -1
     request = {
@@ -357,13 +384,15 @@ def open_position(symbol: str, info, direction: str, currency: str) -> bool:
         "tp": to_tick(info, price * (1 + sign * TAKE_PROFIT_PCT)),
         "deviation": DEVIATION_POINTS,
         "magic": MAGIC,
-        "comment": ORDER_COMMENT,
+        "comment": (comment or ORDER_COMMENT)[:31],
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": filling_type(info),
     }
     done, outcome = send(request)
     log.info(f"{direction} submitted -> {symbol} volume={volume:g} (~{volume * value:,.2f} {currency}) "
              f"stop={request['sl']} limit={request['tp']} result={outcome}")
+    if not done:
+        _open_problem = outcome
     return done
 
 
@@ -407,6 +436,65 @@ def close_before_rollover(pool: dict) -> None:
             close_position(position, pool.get(position.symbol) or mt5.symbol_info(position.symbol), rollover.REASON)
 
 
+# ---------------------------------------------------------------------------
+# STAGNANCY TIMEOUT (shared/stagnancy.py)
+# ---------------------------------------------------------------------------
+watch = None  # the timeout, set up in run_bot()
+STALE_TICK_SECONDS = 300  # no tick for this long = market closed
+
+
+def stagnancy_pass(pool: dict) -> None:
+    """The stagnancy timeout over this bot's positions (its magic number): one
+    that has gone nowhere for a while is logged (shadow) or closed
+    (enforce). Its slot is free once MT5 no longer lists it - the next bar's
+    count of positions doesn't include it. Mid prices come from MT5's ticks
+    (its bars are built from the bid)."""
+    now = time.time()
+    positions = mt5.positions_get()
+    if positions is None:
+        raise RuntimeError(f"couldn't read positions: {mt5.last_error()}")
+    own = [p for p in positions if p.magic == MAGIC and p.symbol in pool]
+    offset = server_offset(pool)  # MT5 stamps ticks and positions with the server's clock
+    for symbol in {p.symbol for p in own}:
+        tick = mt5.symbol_info_tick(symbol)
+        fresh = bool(tick and tick.bid and tick.ask and offset is not None
+                     and now - (tick.time - offset) <= STALE_TICK_SECONDS)
+        watch.observe(symbol, now, tick.bid if fresh else None, tick.ask if fresh else None, fresh)
+    held = []
+    for p in own:
+        # MT5's profit is at the closing price (net of the spread); add the swap, the
+        # opening deal's commission (share CFDs: $0.02 a share each way) and as much again to close.
+        paid = sum(2 * d.commission + d.fee for d in mt5.history_deals_get(position=p.ticket) or ()
+                   if d.entry == mt5.DEAL_ENTRY_IN)
+        value = lot_value(p.symbol, p.price_open)  # one lot's worth in the account's currency
+        distance = abs(p.price_open - p.sl) if p.sl else p.price_open * STOP_LOSS_PCT
+        held.append((stagnancy.Held(
+            key=str(p.ticket), symbol=p.symbol, direction="long" if p.type == mt5.POSITION_TYPE_BUY else "short",
+            size=p.volume, entry=p.price_open, opened_at=p.time - offset if offset is not None else None,
+            pnl=p.profit + p.swap + paid, risk=p.volume * distance * value / p.price_open if value else None,
+            refs=(str(p.ticket),),
+        ), watch.last_mid(p.symbol) is not None))
+    watch.run(held, now, lambda h: close_ticket_now(h, pool))
+
+
+def close_ticket_now(held, pool: dict) -> dict:
+    """Close one of the bot's positions at market for the stagnancy timeout,
+    by its ticket. What it filled at and made come from its deals."""
+    position = next(iter(mt5.positions_get(ticket=int(held.key)) or ()), None)
+    if position is None:
+        # Its stop-loss or take-profit closed it a moment before: the next pass finds it gone.
+        return {"done": False, "problem": "MT5 no longer lists it"}
+    # A part fill (TRADE_RETCODE_DONE_PARTIAL) isn't done: the timeout closes the rest next pass.
+    if not close_position(position, pool.get(position.symbol) or mt5.symbol_info(position.symbol),
+                          stagnancy.TIMEOUT_REASON):
+        return {"done": False, "problem": "Pepperstone didn't close it (see the line above)"}
+    deals = mt5.history_deals_get(position=position.ticket) or ()
+    outs = [d for d in deals if d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY)]
+    volume = sum(d.volume for d in outs)
+    return {"done": True, "price": sum(d.price * d.volume for d in outs) / volume if volume else None,
+            "pnl": round(sum(d.profit + d.swap + d.commission + d.fee for d in deals), 2) if outs else None}
+
+
 def close_from_dashboard(markets: dict, symbol: str, ref, direction: str, size) -> str:
     """A close asked for on the dashboard (DASHBOARD_COMMANDS=1): the bot's
     position it showed as `ref` (its ticket) - all of it, or `size` lots -
@@ -431,6 +519,140 @@ def close_from_dashboard(markets: dict, symbol: str, ref, direction: str, size) 
     if not close_position(position, info, "closed from the dashboard", volume):
         raise CommandError("Pepperstone didn't close it - the bot's log says why.")
     return f"Closed {volume:g} of {position.volume:g} lots of the {symbol} {side} position."
+
+
+# ---------------------------------------------------------------------------
+# BROADCAST TRADES FROM THE DASHBOARD (shared/broadcast.py)
+# ---------------------------------------------------------------------------
+guests = {}  # symbol -> MT5 symbol info: a broadcast trade's market outside the pool, managed but never traded
+
+
+def managed(pool: dict) -> dict:
+    """The pool, plus the markets outside it holding a broadcast trade."""
+    return {**guests, **pool}
+
+
+def symbol_details(name: str):
+    """(MT5 symbol, its info) for a symbol open for new trades on this account, or (None, why not)."""
+    symbol, why = find_symbol(name, [s.name for s in (mt5.symbols_get() or ())])
+    if symbol is None:
+        return None, why
+    if not mt5.symbol_select(symbol, True):  # Market Watch, which prices need
+        return None, f"couldn't add it to Market Watch ({mt5.last_error()})"
+    info = mt5.symbol_info(symbol)
+    if info is None or info.trade_mode in (mt5.SYMBOL_TRADE_MODE_DISABLED, mt5.SYMBOL_TRADE_MODE_CLOSEONLY):
+        return None, "not open for new trades on this account"
+    return symbol, info
+
+
+def restore_guests(pool: dict) -> None:
+    """After a restart: look up the markets outside the pool its open broadcast trades are in."""
+    for name in sorted(broadcasts.open_symbols() - set(pool)):
+        symbol, info = symbol_details(name)
+        if symbol is None:
+            log.warning(f"{name}: couldn't look up its broadcast trade's market ({info}); Pepperstone still holds its "
+                        f"stop-loss and take-profit.")
+            continue
+        guests[symbol] = info
+        log.info(f"{symbol}: managing its broadcast trade (not in the pool).")
+
+
+def broadcast_plan(pool: dict, currency: str, request, now: float, most: float = None) -> dict:
+    """The trade this bot would make for a broadcast, every limit applied -
+    or broadcast.Declined saying why not."""
+    found = symbols.candidates("pepperstone", request.symbol)
+    symbol = info = candidate = None
+    for candidate in found:
+        known = next((s for s in managed(pool) if s.upper() == candidate.code.upper()), None)
+        symbol, info = (known, managed(pool)[known]) if known else symbol_details(candidate.code)
+        if symbol is not None:
+            break
+    if symbol is None:
+        raise broadcast.Declined(broadcast.UNAVAILABLE, f"{request.symbol} isn't available on Pepperstone"
+                                 + (f" (looked for {', '.join(c.code for c in found)})." if found else "."))
+    if rollover.entries_paused(now):
+        raise broadcast.Declined(broadcast.CLOSED, f"{symbol}: too near the daily rollover to open a trade.")
+    positions = fetch_positions()
+    if symbol in positions:
+        raise broadcast.Declined(broadcast.NO_SLOT, f"The bot already holds {symbol}.")
+    held = [s for s in positions if s in pool or s in guests]
+    if len(held) >= MAX_OPEN_POSITIONS:
+        raise broadcast.Declined(broadcast.NO_SLOT, f"{len(held)} positions are already open (max {MAX_OPEN_POSITIONS}).")
+    if watch is not None and watch.cooling(symbol, now):
+        raise broadcast.Declined(broadcast.RISK, f"{symbol}: the stagnancy timeout closed it lately (cooldown).")
+    tick = mt5.symbol_info_tick(symbol)
+    offset = server_offset([symbol, *pool])  # MT5 stamps ticks with the server's clock
+    if not (tick and tick.bid and tick.ask and offset is not None and now - (tick.time - offset) <= STALE_TICK_SECONDS):
+        raise broadcast.Declined(broadcast.CLOSED, f"{symbol}: no fresh price - the market looks closed.")
+
+    sign = 1 if request.side == "buy" else -1
+    entry = tick.ask if sign > 0 else tick.bid
+    value = lot_value(symbol, entry)
+    if not value:
+        raise broadcast.Declined(broadcast.UNAVAILABLE, f"{symbol}: MT5 couldn't value a trade in it ({mt5.last_error()}).")
+    exposure, capped = broadcast.exposure_for(request, TRADE_EXPOSURE, currency, "budget slice")
+    volume = math.floor(exposure / value / info.volume_step + 1e-9) * info.volume_step
+    if most is not None:
+        volume = min(volume, math.floor(most / info.volume_step + 1e-9) * info.volume_step)
+    volume = min(round(volume, 8), info.volume_max)
+    if volume < info.volume_min or volume <= 0:
+        raise broadcast.Declined(broadcast.RISK, f"{symbol}: its smallest trade ({info.volume_min:g} lots) is worth "
+                                                 f"about {info.volume_min * value:,.2f} {currency}, more than the "
+                                                 f"{exposure:,.2f} it may trade.")
+    rule = watch.book.rule(symbol) if watch is not None else None
+    exits = (f"stop-loss {STOP_LOSS_PCT * 100:g}% / take-profit {TAKE_PROFIT_PCT * 100:g}% at Pepperstone; "
+             + (f"closed {rollover.FLAT_MINUTES} min before the rollover" if rollover.FLAT_MINUTES else "held overnight")
+             + ("; streak reversal" if symbol in pool else "; managed until it closes (not in the pool)")
+             + (f"; stagnancy timeout ({rule.mode})" if rule and rule.mode != "off" else ""))
+    return {"symbol": symbol, "info": info, "volume": volume, "direction": "BUY" if sign > 0 else "SELL",
+            "capped": capped,
+            "figures": broadcast.figures(
+                symbol=symbol, name=info.description or None, size=volume, sizeUnit="lots",
+                exposure=round(volume * value, 2), risk=round(volume * value * STOP_LOSS_PCT, 2), currency=currency,
+                entry=entry, stopLoss=to_tick(info, entry * (1 - sign * STOP_LOSS_PCT)),
+                takeProfit=to_tick(info, entry * (1 + sign * TAKE_PROFIT_PCT)), accountMode=ACCOUNT_MODE, exits=exits,
+                capped=capped or None, standIn=candidate.canonical if candidate.stand_in else None, previewedAt=now)}
+
+
+def broadcast_preview(pool: dict, currency: str, command: dict) -> tuple:
+    """What this bot would do with a broadcast trade: (a line, {figures})."""
+    request = broadcast.Request.parse(command)
+    plan = broadcast_plan(pool, currency, request, time.time())
+    f = plan["figures"]
+    line = (f"Would {request.side} {f['size']:g} lots of {f['symbol']} at ~{f['entry']:g}: stop-loss {f['stopLoss']:g}, "
+            f"take-profit {f['takeProfit']:g}" + (f" ({plan['capped']})" if plan["capped"] else ""))
+    log.info(f"Broadcast #{request.id}: {line}")
+    return line + ".", f
+
+
+def broadcast_open(pool: dict, currency: str, command: dict) -> tuple:
+    """Open a broadcast trade the admin confirmed - every limit checked again
+    on fresh prices, never bigger than previewed. (a line, {figures})."""
+    now = time.time()
+    request = broadcast.Request.parse(command)
+    broadcasts.check_new(request)
+    request.check_age(now)
+    plan = broadcast_plan(pool, currency, request, now, most=request.size)
+    symbol = plan["symbol"]
+    broadcasts.opening(request, symbol, (plan["info"].description,), now)
+    if not open_position(symbol, plan["info"], plan["direction"], currency, volume=plan["volume"],
+                         comment=f"broadcast-{request.id}"):
+        broadcasts.failed(request)
+        raise CommandError(f"Pepperstone didn't fill it: {_open_problem or 'see the bot log'}.")
+    # Its rows are matched by market and opening time: MT5 names the position by a ticket the order doesn't return here.
+    broadcasts.opened(request, (), now)
+    if symbol not in pool:
+        guests[symbol] = plan["info"]
+        log.info(f"{symbol}: not in the pool - managing its broadcast trade until it closes, never trading it on a streak.")
+    entry = plan["figures"]["entry"]
+    verb = "Bought" if request.side == "buy" else "Sold"
+    return f"{verb} {plan['volume']:g} lots of {symbol} at ~{entry:g}.", \
+        {"symbol": symbol, "size": plan["volume"], "price": entry}
+
+
+def broadcast_symbols(pool: dict) -> list:
+    """The instrument names the dashboard can offer for this bot."""
+    return sorted(set(symbols.names("pepperstone")) | {symbols.canonical(s) or s for s in pool})
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +704,11 @@ def report_to_dashboard(markets) -> None:
         return
     if account is None:
         return
+    # Broadcast trades no longer open have closed; their markets outside the pool stop being managed.
+    broadcasts.sync(set(positions), now)
+    broadcasts.prune(now)
+    for symbol in set(guests) - broadcasts.open_symbols():
+        del guests[symbol]
     utc = (lambda server_time: server_time - offset) if offset is not None else (lambda server_time: None)
 
     opened = {d.position_id: d for d in deals if d.entry == mt5.DEAL_ENTRY_IN and d.magic == MAGIC}
@@ -506,6 +733,7 @@ def report_to_dashboard(markets) -> None:
             "pnl": sum(d.profit + d.swap + d.commission + d.fee for d in outs) + entry.commission + entry.fee,
             "closeReason": (CLOSE_REASONS.get(position_id) if outs[-1].reason == mt5.DEAL_REASON_EXPERT else None)
             or DEAL_REASONS.get(outs[-1].reason, "closed"),
+            **(watch.fields_for(position_id) if watch is not None else {}),  # the stagnancy timeout's, if any
         })
 
     dashboard.update(
@@ -532,7 +760,7 @@ def report_to_dashboard(markets) -> None:
 def trade_new_bars(pool: dict, new_bars: dict, positions: dict, currency: str) -> None:
     """Act on the markets whose bar just closed. `new_bars` maps symbol ->
     (bar time, closes); `positions` is this bot's open positions."""
-    held = [s for s in positions if s in pool]
+    held = [s for s in positions if s in pool or s in guests]  # a broadcast trade outside the pool holds a slot too
 
     # Reversals first, so any slot they free is available to this bar's entries.
     candidates = []
@@ -544,7 +772,9 @@ def trade_new_bars(pool: dict, new_bars: dict, positions: dict, currency: str) -
         if position is None:
             candidates.append((abs(streak_move(closes)), symbol, "BUY" if signal == "bullish" else "SELL"))
         elif (position.type == mt5.POSITION_TYPE_SELL) == (signal == "bullish"):
-            if close_position(position, pool[symbol], f"{signal} reversal"):
+            if watch is not None and watch.closing_in(symbol):
+                log.info(f"{symbol}: {signal} reversal, but its {stagnancy.TIMEOUT_REASON} close is under way.")
+            elif close_position(position, pool[symbol], f"{signal} reversal"):
                 held.remove(symbol)
 
     # Biggest streak first, while slots last.
@@ -552,6 +782,9 @@ def trade_new_bars(pool: dict, new_bars: dict, positions: dict, currency: str) -
         if len(held) >= MAX_OPEN_POSITIONS:
             log.info(f"{symbol}: {direction} streak ({move:.2%}), but {MAX_OPEN_POSITIONS} positions "
                      f"are already open; skipping this bar.")
+        elif watch is not None and watch.cooling(symbol, time.time()):  # only with SCANNER_STAGNANT_COOLDOWN set
+            log.info(f"{symbol}: {direction} streak, but the stagnancy timeout closed it lately (cooldown); "
+                     f"skipping this bar.")
         elif open_position(symbol, pool[symbol], direction, currency):
             held.append(symbol)
 
@@ -608,13 +841,22 @@ def run_bot() -> None:
         f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe={TIMEFRAME}"
     )
     log.info(rollover.describe())
+    global watch
+    watch = stagnancy.start_watch("scanner", "pepperstone", "pepperstone-momentum-scanner", "Pepperstone", log,
+                                  bar_seconds=BAR_SECONDS, loop_seconds=LOOP_INTERVAL_SECONDS, currency=currency)
     log.info("=" * 78)
-    dashboard.describe(account=f"{account.login} on {account.server}", currency=currency, config={
+    dashboard.describe(account=f"{account.login} on {account.server}", currency=currency, account_mode=ACCOUNT_MODE,
+                       config={
         "markets": list(pool), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
         "timeframe": TIMEFRAME, "streakLength": STREAK_LENGTH, "stopLossPercent": STOP_LOSS_PCT * 100,
-        "takeProfitPercent": TAKE_PROFIT_PCT * 100, "magicNumber": MAGIC,
+        "takeProfitPercent": TAKE_PROFIT_PCT * 100, "magicNumber": MAGIC, **watch.book.config(),
     })
-    dashboard.accept_closes(lambda *command: close_from_dashboard(pool, *command))
+    dashboard.accept_closes(lambda *command: close_from_dashboard(managed(pool), *command))
+    restore_guests(pool)
+    dashboard.tag_rows(broadcasts.tags)
+    dashboard.accept_broadcasts(lambda command: broadcast_preview(pool, currency, command),
+                                lambda command: broadcast_open(pool, currency, command),
+                                broadcast_symbols(pool))
 
     seen_bar = None  # symbol -> start time of the latest closed bar already dealt with
     consecutive_errors = 0
@@ -622,9 +864,11 @@ def run_bot() -> None:
     while True:
         try:
             if dashboard.due():
-                report_to_dashboard(pool)
+                report_to_dashboard(managed(pool))
             if rollover.flat_due():
-                close_before_rollover(pool)
+                close_before_rollover(managed(pool))
+            if watch.book.active:
+                stagnancy_pass(managed(pool))
 
             latest = {}
             for symbol in pool:
@@ -650,7 +894,7 @@ def run_bot() -> None:
             continue
 
         consecutive_errors = 0
-        dashboard.sleep(LOOP_INTERVAL_SECONDS, lambda: report_to_dashboard(pool))  # reports fall due while it waits
+        dashboard.sleep(LOOP_INTERVAL_SECONDS, lambda: report_to_dashboard(managed(pool)))  # reports fall due while it waits
 
 
 if __name__ == "__main__":

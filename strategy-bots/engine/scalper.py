@@ -44,7 +44,7 @@ from collections import deque
 from dataclasses import dataclass
 
 from . import clock
-from .strategies import Assessment, Signal, Strategy
+from .strategies import Assessment, Signal, Skip, Strategy
 
 SPREAD_LOOKBACK_SECONDS = 300    # "the usual spread" is the median over this long
 GAP_SECONDS = 30                 # reads further apart than this (or 5 polls) start the history again
@@ -69,6 +69,7 @@ class Scalper(Strategy):
     holds_overnight = False
     uses_prices = True           # trades on every read of the live prices, not on closed bars
     checks_own_levels = True     # its stop is a few spreads away - inside some brokers' minimum distance
+    takes_broadcasts = True
 
     def __init__(self, params: dict):
         # No bars, so none of the base class's timeframe set-up.
@@ -163,6 +164,27 @@ class Scalper(Strategy):
         if not self.in_session(now):
             return f"session over ({self.p['session_end']} London) - scalps are never held past it"
         return None
+
+    def manual_signal(self, market, bars: dict, quote, direction: str, now: float) -> Signal:
+        """Its stop and take-profit, in usual spreads - measured over the last
+        five minutes' reads, or on a market it hasn't been reading (a
+        broadcast's guest), the spread right now."""
+        p = self.p
+        history = self.prices.get(market.symbol)
+        step = 10.0 ** -market.digits if market.digits is not None else 0.0
+        unit = self.usual_spread(market, history) if history else max(quote.spread, step)
+        if unit <= 0:
+            raise Skip("closed", "no spread to measure its stop-loss by")
+        sign = 1 if direction == "long" else -1
+        entry = quote.ask if sign > 0 else quote.bid
+        return Signal(direction, stop=entry - sign * p["stop_spreads"] * unit,
+                      reward_risk=p["take_profit_spreads"] / p["stop_spreads"],
+                      why=f"broadcast {direction}: stop {p['stop_spreads']:g} spreads ({unit:.5g} each)")
+
+    def exits(self) -> str:
+        p = self.p
+        return (f"take-profit {p['take_profit_spreads']:g} spreads; out after {p['max_hold_seconds']}s, or at "
+                f"{p['session_end']} London")
 
     def summary(self) -> str:
         p = self.p

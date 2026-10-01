@@ -22,6 +22,10 @@ Strategy
 - Exit      : 9-period EMA crosses BELOW the 21-period EMA -> close the long
 - Risk mgmt : 2% stop-loss / 5% take-profit, attached to the order, so
               Pepperstone enforces them even while the bot is stopped.
+- Stagnancy : one of its positions (its magic number) that has gone nowhere
+              for a while is logged (shadow, the default) or closed with the
+              reason TIMEOUT_STAGNANT, freeing its slot (EMA_STAGNANT_*
+              settings; see shared/stagnancy.py).
 
 Sizing
 ------
@@ -76,6 +80,7 @@ import MetaTrader5 as mt5
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
+import stagnancy  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -371,6 +376,65 @@ def close_position(position, info, reason: str, volume: float = None) -> bool:
     return done
 
 
+# ---------------------------------------------------------------------------
+# STAGNANCY TIMEOUT (shared/stagnancy.py)
+# ---------------------------------------------------------------------------
+watch = None  # the timeout, set up in run_bot()
+STALE_TICK_SECONDS = 300  # no tick for this long = market closed
+
+
+def stagnancy_pass(watchlist: dict) -> None:
+    """The stagnancy timeout over this bot's positions (its magic number): one
+    that has gone nowhere for a while is logged (shadow) or closed
+    (enforce). Its slot is free once MT5 no longer lists it - the next bar's
+    count of positions doesn't include it. Mid prices come from MT5's ticks
+    (its bars are built from the bid)."""
+    now = time.time()
+    positions = mt5.positions_get()
+    if positions is None:
+        raise RuntimeError(f"couldn't read positions: {mt5.last_error()}")
+    own = [p for p in positions if p.magic == MAGIC and p.symbol in watchlist]
+    offset = server_offset(watchlist)  # MT5 stamps ticks and positions with the server's clock
+    for symbol in {p.symbol for p in own}:
+        tick = mt5.symbol_info_tick(symbol)
+        fresh = bool(tick and tick.bid and tick.ask and offset is not None
+                     and now - (tick.time - offset) <= STALE_TICK_SECONDS)
+        watch.observe(symbol, now, tick.bid if fresh else None, tick.ask if fresh else None, fresh)
+    held = []
+    for p in own:
+        # MT5's profit is at the closing price (net of the spread); add the swap, the
+        # opening deal's commission (share CFDs: $0.02 a share each way) and as much again to close.
+        paid = sum(2 * d.commission + d.fee for d in mt5.history_deals_get(position=p.ticket) or ()
+                   if d.entry == mt5.DEAL_ENTRY_IN)
+        value = lot_value(p.symbol, p.price_open)  # one lot's worth in the account's currency
+        distance = abs(p.price_open - p.sl) if p.sl else p.price_open * STOP_LOSS_PCT
+        held.append((stagnancy.Held(
+            key=str(p.ticket), symbol=p.symbol, direction="long" if p.type == mt5.POSITION_TYPE_BUY else "short",
+            size=p.volume, entry=p.price_open, opened_at=p.time - offset if offset is not None else None,
+            pnl=p.profit + p.swap + paid, risk=p.volume * distance * value / p.price_open if value else None,
+            refs=(str(p.ticket),),
+        ), watch.last_mid(p.symbol) is not None))
+    watch.run(held, now, lambda h: close_ticket_now(h, watchlist))
+
+
+def close_ticket_now(held, watchlist: dict) -> dict:
+    """Close one of the bot's positions at market for the stagnancy timeout,
+    by its ticket. What it filled at and made come from its deals."""
+    position = next(iter(mt5.positions_get(ticket=int(held.key)) or ()), None)
+    if position is None:
+        # Its stop-loss or take-profit closed it a moment before: the next pass finds it gone.
+        return {"done": False, "problem": "MT5 no longer lists it"}
+    # A part fill (TRADE_RETCODE_DONE_PARTIAL) isn't done: the timeout closes the rest next pass.
+    if not close_position(position, watchlist.get(position.symbol) or mt5.symbol_info(position.symbol),
+                          stagnancy.TIMEOUT_REASON):
+        return {"done": False, "problem": "Pepperstone didn't close it (see the line above)"}
+    deals = mt5.history_deals_get(position=position.ticket) or ()
+    outs = [d for d in deals if d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY)]
+    volume = sum(d.volume for d in outs)
+    return {"done": True, "price": sum(d.price * d.volume for d in outs) / volume if volume else None,
+            "pnl": round(sum(d.profit + d.swap + d.commission + d.fee for d in deals), 2) if outs else None}
+
+
 def close_from_dashboard(markets: dict, symbol: str, ref, direction: str, size) -> str:
     """A close asked for on the dashboard (DASHBOARD_COMMANDS=1): the bot's
     position it showed as `ref` (its ticket) - all of it, or `size` lots -
@@ -468,6 +532,7 @@ def report_to_dashboard(markets) -> None:
             "pnl": sum(d.profit + d.swap + d.commission + d.fee for d in outs) + entry.commission + entry.fee,
             "closeReason": (CLOSE_REASONS.get(position_id) if outs[-1].reason == mt5.DEAL_REASON_EXPERT else None)
             or DEAL_REASONS.get(outs[-1].reason, "closed"),
+            **(watch.fields_for(position_id) if watch is not None else {}),  # the stagnancy timeout's, if any
         })
 
     dashboard.update(
@@ -513,10 +578,15 @@ def trade_new_bars(watchlist: dict, new_bars: dict, currency: str) -> None:
             elif len(held) >= MAX_OPEN_POSITIONS:
                 log.info(f"{symbol}: bullish crossover, but {MAX_OPEN_POSITIONS} positions are already open; "
                          f"skipping buy.")
+            elif watch is not None and watch.cooling(symbol, time.time()):  # only with EMA_STAGNANT_COOLDOWN set
+                log.info(f"{symbol}: bullish crossover, but the stagnancy timeout closed it lately (cooldown); "
+                         f"skipping buy.")
             elif submit_buy(symbol, watchlist[symbol], currency):
                 held.append(symbol)
         elif signal == "bearish" and position is not None:
-            if close_position(position, watchlist[symbol], "EMA bearish crossover"):
+            if watch is not None and watch.closing_in(symbol):
+                log.info(f"{symbol}: bearish crossover, but its {stagnancy.TIMEOUT_REASON} close is under way.")
+            elif close_position(position, watchlist[symbol], "EMA bearish crossover"):
                 held.remove(symbol)
 
 
@@ -554,11 +624,16 @@ def run_bot() -> None:
         f"Stop-loss={STOP_LOSS_PCT:.0%} | Take-profit={TAKE_PROFIT_PCT:.0%} | "
         f"Timeframe={TIMEFRAME} | EMA periods={EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}"
     )
+    global watch
+    watch = stagnancy.start_watch("ema", "pepperstone", "pepperstone-ema-bot", "Pepperstone", log,
+                                  bar_seconds=BAR_MINUTES[TIMEFRAME] * 60, loop_seconds=LOOP_INTERVAL_SECONDS,
+                                  currency=currency)
     log.info("=" * 78)
     dashboard.describe(account=f"{account.login} on {account.server}", currency=currency, config={
         "watchlist": list(watchlist), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
         "timeframe": TIMEFRAME, "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}",
         "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100, "magicNumber": MAGIC,
+        **watch.book.config(),
     })
     dashboard.accept_closes(lambda *command: close_from_dashboard(watchlist, *command))
 
@@ -569,6 +644,8 @@ def run_bot() -> None:
         try:
             if dashboard.due():
                 report_to_dashboard(watchlist)
+            if watch.book.active:
+                stagnancy_pass(watchlist)
 
             latest = {}
             for symbol in watchlist:

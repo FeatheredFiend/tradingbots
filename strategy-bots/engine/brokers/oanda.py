@@ -25,6 +25,7 @@ GRANULARITY = {"M5": "M5", "M15": "M15", "M30": "M30", "H1": "H1", "H4": "H4", "
 class OandaBroker(Broker):
     key = "oanda"
     name = "OANDA"
+    account_mode = "demo" if "fxpractice" in BASE_URL else "live"
 
     def __init__(self, settings, dashboard, log):
         super().__init__(settings, dashboard, log)
@@ -144,7 +145,10 @@ class OandaBroker(Broker):
                     raw=[], own=is_own)
             held.entry = (held.entry * held.size + float(t["price"]) * abs(units)) / (held.size + abs(units))
             held.size += abs(units)
+            # OANDA values an open trade at the price it would close at, so its
+            # P/L is net of the spread; the financing it has paid is apart.
             held.pnl += float(t.get("unrealizedPL") or 0)
+            held.fees += float(t.get("financing") or 0)
             held.opened_at = min(held.opened_at, float(t["openTime"]))
             held.raw.append((t["id"], abs(units)))
         return {**others, **own}
@@ -165,12 +169,17 @@ class OandaBroker(Broker):
         }
         if take_profit is not None:
             order["takeProfitOnFill"] = {"price": f"{take_profit:.{market.digits}f}"}
+        if self.order_tag:  # on the order and on the trade it opens, as OANDA shows them
+            order["clientExtensions"] = order["tradeClientExtensions"] = {"tag": "broadcast", "comment": self.order_tag}
         try:
             body = self._call("POST", f"/v3/accounts/{self.account_id}/orders", json={"order": order})
         except BrokerError as e:
             self.log.error(f"{market.symbol}: {direction} order refused: {e}")
+            self.open_problem = str(e)
             return False
         filled, outcome = _fill_outcome(body, "order")
+        if not filled:
+            self.open_problem = outcome
         opened = (body.get("orderFillTransaction") or {}).get("tradeOpened") or {}
         if opened.get("tradeID"):
             self.own_ids.add(opened["tradeID"])
@@ -185,6 +194,7 @@ class OandaBroker(Broker):
         all_closed = True
         left = size
         precision = int(market.raw["tradeUnitsPrecision"])
+        units_filled = value_filled = pnl = 0.0
         for trade_id, units in position.raw or ():
             if left is not None and left <= 0:
                 break
@@ -195,6 +205,8 @@ class OandaBroker(Broker):
                 reply = self._call("PUT", f"/v3/accounts/{self.account_id}/trades/{trade_id}/close",
                                    **({"json": body} if body else {}))
             except BrokerError as e:
+                # A trade its stop-loss or take-profit closed a moment before is
+                # refused here (TRADE_DOESNT_EXIST): the next read shows it gone.
                 self.log.error(f"{market.symbol}: close of trade {trade_id} refused ({reason}): {e}")
                 self.close_problem = str(e)
                 all_closed = False
@@ -204,11 +216,22 @@ class OandaBroker(Broker):
                           f"{body.get('units', 'all')} ({reason}) -> {outcome}")
             if filled and not body:
                 self.close_reasons[trade_id] = reason
+            if filled:
+                # The fill says what it closed at and what the trade made, financing in.
+                fill = reply.get("orderFillTransaction") or {}
+                done = abs(float(fill.get("units") or 0))
+                units_filled += done
+                value_filled += done * float(fill.get("fullVWAP") or fill.get("price") or 0)
+                pnl += sum(float(c.get("realizedPL") or 0) + float(c.get("financing") or 0)
+                           for c in fill.get("tradesClosed") or ())
+                pnl -= float(fill.get("commission") or 0) + float(fill.get("guaranteedExecutionFee") or 0)
             if not filled:
                 self.close_problem = outcome
             if left is not None:
                 left -= min(left, units)
             all_closed = all_closed and filled
+        if units_filled:
+            self.closing_fill = {"price": value_filled / units_filled, "pnl": round(pnl, 2)}
         return all_closed
 
     # -- dashboard ------------------------------------------------------------------
@@ -241,6 +264,7 @@ class OandaBroker(Broker):
             row.update(exitPrice=float(trade["averageClosePrice"]) if trade.get("averageClosePrice") else None,
                        closedAt=trade.get("closeTime"),
                        pnl=float(trade.get("realizedPL") or 0) + float(trade.get("financing") or 0), closeReason=reason)
+            row.update(self.exit_fields(trade["id"]))  # the stagnancy timeout's, if it closed or watched it
         else:
             row.update(size=abs(float(trade.get("currentUnits") or units)), pnl=float(trade.get("unrealizedPL") or 0),
                        stopLoss=float(trade["stopLossOrder"]["price"]) if trade.get("stopLossOrder") else None,

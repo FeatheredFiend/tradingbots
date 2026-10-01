@@ -375,6 +375,42 @@ def _risk_settings(prefix: str, risk: str, spread: str = "10") -> list:
     ]
 
 
+# The stagnancy timeout's defaults per bot type, (min age, window, range, P/L),
+# as in shared/stagnancy.py TYPES (strategy-bots/tests/test_stagnancy.py checks).
+STAGNANCY_DEFAULTS = {
+    "SCALPER": ("90s", "60s", "0.01%", "0.25R"),
+    "SURGE": ("4m", "3m", "0.15%", "0.25R"),
+    "REVERSION": ("4bars", "4bars", "1atr", "0.2R"),
+    "BREAKOUT": ("8bars", "6bars", "1atr", "0.25R"),
+    "TREND": ("16bars", "16bars", "1.5atr", "0.3R"),
+    "EMA": ("8bars", "8bars", "0.3%", "0.15R"),
+    "SCANNER": ("3bars", "3bars", "0.15%", "0.2R"),
+}
+
+
+def _stagnancy_settings(prefix: str) -> list:
+    """One bot type's stagnancy timeout (shared/stagnancy.py): a trade older
+    than the min age whose mid price stayed within the range over the
+    window, with its P/L within the limit, is logged or closed."""
+    min_age, window, rng, pnl = STAGNANCY_DEFAULTS[prefix]
+    times = "90s, 15m, 2h" + ("" if prefix in ("SCALPER", "SURGE") else " or 4bars (of its bar length)")
+    ranges = "a % of the price (0.05%)" + ("" if prefix in ("SCALPER", "SURGE", "EMA", "SCANNER") else
+                                          " or ATRs of its bars (0.25atr)")
+    p = f"{prefix}_STAGNANT_"
+    return [
+        Sub("Stagnancy timeout"),
+        Setting(p + "MODE", "Mode", "off, shadow (log it, leave it open) or enforce (close it: TIMEOUT_STAGNANT) - "
+                                    "empty for the General tab's"),
+        Setting(p + "MIN_AGE", "Checked from", f"The trade's age: {times} - default {min_age}"),
+        Setting(p + "WINDOW", "Window", f"The latest stretch looked at: {times} - default {window}"),
+        Setting(p + "RANGE", "Max range", f"Of the mid price over the window: {ranges} - default {rng}"),
+        Setting(p + "PNL", "Max P/L", f"Either way, net of costs: an amount (1.50) or of what the trade risks "
+                                      f"(0.2R) - default {pnl}"),
+        Setting(p + "COOLDOWN", "Cooldown", f"No new trade in that market for this long after a timeout close: "
+                                            f"{times.split(' or ')[0]} - default 0 (none)"),
+    ]
+
+
 TIMEFRAME_HINT = "M5, M15, M30, H1 or H4"
 SETTING_GROUPS = [
     ("General", "Where every bot reports to (leave empty to switch reporting off), and a dry run for the strategy bots.", [
@@ -382,7 +418,13 @@ SETTING_GROUPS = [
         Setting("DASHBOARD_TOKEN", "Dashboard token", "The dashboard's INGEST_TOKEN", secret=True),
         Setting("DASHBOARD_COMMANDS", "Close from dashboard", "1 = a dashboard admin can close (part of) a bot's "
                                                               "positions; empty = off"),
+        Setting("DASHBOARD_BROADCAST", "Broadcast trades", "1 = a dashboard admin can push one trade to every "
+                                                           "strategy bot and momentum scanner at once, each with its "
+                                                           "own size, stops and limits; empty = off"),
         Setting("STRATEGY_DRY_RUN", "Strategy bots: dry run", "1 = log the trades they'd make without sending them"),
+        Setting("STAGNANT_MODE", "Stagnancy timeout", "Trades going nowhere: shadow = log them (default), enforce = "
+                                                      "close them (TIMEOUT_STAGNANT), off. Each bot type's own setting "
+                                                      "wins; exceptions per broker or market go in stagnancy.json"),
     ]),
     ("Momentum scanners", "Shared by the Alpaca, OANDA, Pepperstone, Capital.com and IG scanners.", [
         Setting("SCANNER_TIMEFRAME", "Bar length", "M1, M5, M15 or M30 - default M15 (M1 is too quick for IG's)"),
@@ -395,9 +437,11 @@ SETTING_GROUPS = [
         Setting("SCANNER_LAST_ENTRY_MINUTES", "No entries before rollover", "No new CFD trades from this many "
                                                                            "minutes before it to 45 after - "
                                                                            "default 60; 0 = off", number=True),
+        *_stagnancy_settings("SCANNER"),
     ]),
     ("EMA crossover bots", "Shared by the Alpaca, OANDA, Pepperstone, Capital.com and IG EMA bots.", [
         Setting("EMA_TIMEFRAME", "Bar length", "M1, M5, M15 or M30 - default M15"),
+        *_stagnancy_settings("EMA"),
     ]),
     ("Forex session breakout", "Shared by the breakout bot on every broker. Trades the break of the London "
                                "morning's range in the London / New York overlap; always flat before the rollover. "
@@ -419,6 +463,7 @@ SETTING_GROUPS = [
                                                             "(the middle)", number=True),
         Setting("BREAKOUT_REWARD_RISK", "Take-profit", "Times the stop distance - default 1.5", number=True),
         *_risk_settings("BREAKOUT_", "1"),
+        *_stagnancy_settings("BREAKOUT"),
     ]),
     ("Index mean reversion", "Shared by the index bot on every broker. Fades moves stretched far from the day's "
                              "VWAP, only in each index's cash session; always closed the same day.", [
@@ -439,6 +484,7 @@ SETTING_GROUPS = [
         Setting("REVERSION_FLAT_MINUTES", "Close before the close", "Minutes before the cash close - default 15",
                 number=True),
         *_risk_settings("REVERSION_", "0.5"),
+        *_stagnancy_settings("REVERSION"),
     ]),
     ("Commodity trend", "Shared by the commodity bot on every broker. Takes the 4-hour trend's side on a "
                         "15-minute EMA crossover; holds overnight, so it watches the swap.", [
@@ -458,6 +504,7 @@ SETTING_GROUPS = [
         Setting("TREND_WEEKEND_FLAT", "Flat for the weekend", "1 = close Friday 20:00 UK (default), 0 = hold"),
         Setting("TREND_MAX_SWAP_PERCENT", "Max swap", "% of the trade's value per night - default 0.05", number=True),
         *_risk_settings("TREND_", "1"),
+        *_stagnancy_settings("TREND"),
     ]),
     ("Tick scalper (HFT-style)", "Shared by the scalper on every broker. Reads live prices every few seconds and "
                                  "trades short bursts, measured in the market's usual spread; out within minutes, "
@@ -478,6 +525,7 @@ SETTING_GROUPS = [
         Setting("SCALPER_TAKE_PROFIT_SPREADS", "Take-profit", "Usual spreads from the fill - default 3", number=True),
         Setting("SCALPER_MAX_HOLD_SECONDS", "Time stop", "Seconds - default 300", number=True),
         *_risk_settings("SCALPER_", "0.5", spread="60"),
+        *_stagnancy_settings("SCALPER"),
     ]),
     ("Opening surge", "The surge scanner watches every liquid US share for the first minutes after the 09:30 New "
                       "York open (14:30 UK) and passes each surge to the followers, which trade it. Start the "
@@ -503,6 +551,7 @@ SETTING_GROUPS = [
                                                     "started) - default 2", number=True),
         Setting("SURGE_MAX_HOLD_MINUTES", "Time stop", "Minutes - default 15", number=True),
         *_risk_settings("SURGE_", "0.5", spread="25"),
+        *_stagnancy_settings("SURGE"),
     ]),
     ("Slow trend (OANDA)", "Daily trend following on commodity CFDs: each market long, flat or short by its 50/200-day "
                            "EMAs and its move on a year ago, sized by its volatility, rebalanced once a weekday. "

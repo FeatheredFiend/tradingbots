@@ -14,6 +14,9 @@ from datetime import datetime, timezone
 from unittest import mock
 
 os.environ["DASHBOARD_URL"] = ""  # never report test runs to the real dashboard
+for _name in [n for n in os.environ if "STAGNANT" in n]:  # the stagnancy timeout at its defaults
+    del os.environ[_name]
+os.environ["STAGNANT_FILE"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "no-stagnancy.json")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from engine import runner  # noqa: E402

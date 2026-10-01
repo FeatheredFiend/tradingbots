@@ -337,7 +337,9 @@ class RebalanceBot(StrategyBot):
                          f"({swaps[0] * 365:+.1f}% / {swaps[1] * 365:+.1f}% a year)")
         log.info("=" * 78)
         config = {"markets": list(self.markets), "budget": s.budget, "dryRun": s.dry_run, **self.p}
-        self.dashboard.describe(account=account.id, currency=self.currency, config=config)
+        self.dashboard.describe(account=account.id, currency=self.currency, config=config,
+                                account_mode=self.broker.account_mode)
+        self.dashboard.broadcast_off("A portfolio bot holds all its markets at target sizes - no broadcast trades.")
         self.dashboard.accept_closes(self.close_from_dashboard)
         self.started_at = time.time()
         self.preview()

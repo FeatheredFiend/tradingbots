@@ -33,6 +33,16 @@ Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
   (SCANNER_FLAT_MINUTES / SCANNER_LAST_ENTRY_MINUTES, 0 = off; see
   shared/rollover.py). It knows its own positions by the deal IDs saved
   in own_trades.json beside it.
+- Stagnancy : one of its own positions that has gone nowhere for a while is
+  logged (shadow, the default) or closed with the reason TIMEOUT_STAGNANT,
+  freeing its slot (SCANNER_STAGNANT_* settings; see shared/stagnancy.py).
+  Prices come from the positions it reads each pass - no extra requests.
+- Broadcasts: with DASHBOARD_BROADCAST=1 it takes broadcast trades from the
+  dashboard (shared/broadcast.py) - the admin's market and side, IG's
+  minimum size, its own stop-loss, take-profit and loss limits. A market
+  outside the pool is managed until its trade closes (brackets, the loss
+  limits, the pre-rollover close, the stagnancy timeout) but never traded on
+  a streak. Dashboard commands are picked up between markets, not once a pass.
 
 Unlike ig_cfd_ema_bot.py, this bot can go SHORT (CFDs support it) — a
 genuinely different, higher-risk capability than the long-only Alpaca and
@@ -114,7 +124,10 @@ from trading_ig.rest import IGException
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
+import broadcast  # noqa: E402 - needs the path above
 import rollover  # noqa: E402 - needs the path above
+import stagnancy  # noqa: E402 - needs the path above
+import symbols  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -123,6 +136,7 @@ IG_USERNAME = os.environ.get("IG_USERNAME", "")
 IG_PASSWORD = os.environ.get("IG_PASSWORD", "")
 IG_API_KEY = os.environ.get("IG_API_KEY", "")
 ACCOUNT_TYPE = "DEMO"  # Hardcoded — this script never trades a LIVE account.
+ACCOUNT_MODE = "demo" if ACCOUNT_TYPE == "DEMO" else "live"  # for the dashboard's broadcast previews
 CURRENCY_CODE = os.environ.get("IG_CURRENCY_CODE", "GBP")
 
 # (search term or "term:EPIC" override, expected IG instrumentType)
@@ -157,6 +171,7 @@ BARS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "momentum_b
 # open means the bars either side of the gap are treated as consecutive.
 SAVED_BARS_MAX_AGE_HOURS = 16
 OWN_TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "own_trades.json")
+BROADCASTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "broadcasts.json")
 
 # Percent of the entry price, e.g. STOP_LOSS_PERCENT=0.5 for 0.5%. IG sets a
 # minimum stop/limit distance per market, so a very tight value can get a
@@ -223,6 +238,7 @@ log = logging.getLogger("ig_momentum_bot")
 # Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
 dashboard = DashboardReporter("ig-momentum-scanner", "IG momentum scanner", broker="IG", strategy="Momentum streak")
 own_trades = rollover.OwnTrades(OWN_TRADES_FILE)  # the positions this bot opened - only these close before the rollover
+broadcasts = broadcast.Book(path=BROADCASTS_FILE, log=log)  # the broadcast trades it acted on (shared/broadcast.py)
 
 
 # ---------------------------------------------------------------------------
@@ -401,76 +417,79 @@ def fetch_market_details(ig_service: IGService, epic: str) -> Optional[dict]:
         return None
 
 
+def resolve_entry(ig_service: IGService, entry: str, expected_type=None) -> Optional[dict]:
+    """One pool entry - "term" or "term:EPIC" - as {"term", "epic", "name"},
+    or None (logged why) if it doesn't resolve cleanly."""
+    if ":" in entry:
+        term, explicit_epic = entry.split(":", 1)
+        term, explicit_epic = term.strip(), explicit_epic.strip()
+        details = _call_with_retry(
+            f"'{term}' ({explicit_epic})", lambda: fetch_market_details(ig_service, explicit_epic)
+        )
+        if details is None:
+            log.warning(f"Skipping '{term}': explicit epic '{explicit_epic}' did not resolve.")
+            return None
+        log.info(f"Resolved '{term}' -> epic={explicit_epic} (explicit)")
+        return {"term": term, "epic": explicit_epic, "name": term}
+
+    term = entry
+    markets = _call_with_retry(f"search for '{term}'", lambda: _paced_search(ig_service, term))
+    if markets is None:
+        log.warning(f"Skipping '{term}': search kept failing.")
+        return None
+    if len(markets) == 0:
+        log.warning(f"Skipping '{term}': no markets found.")
+        return None
+
+    candidates = markets
+    if expected_type and "instrumentType" in candidates:
+        candidates = _narrow(candidates, candidates["instrumentType"] == expected_type)
+
+    if "instrumentName" in candidates:
+        names = candidates["instrumentName"]
+        noise = "|".join(re.escape(m) for m in NOT_THE_MARKET_MARKERS)
+        candidates = _narrow(candidates, ~names.str.contains(noise, case=False, regex=True))
+
+        # Exact name first — a "GBP/EUR" search lists the inverse EUR/GBP first.
+        candidates = _narrow(
+            candidates, candidates["instrumentName"].map(_normalized_name) == _normalized_name(term)
+        )
+
+    # Undated (rolling) markets over dated futures — no expiry to roll.
+    if "expiry" in candidates:
+        candidates = _narrow(candidates, candidates["expiry"].isin(["-", "DFB"]))
+
+    if len(candidates) > 1 and "instrumentName" in candidates:
+        candidates = _narrow(candidates, candidates["instrumentName"].str.contains("24 Hours", case=False))
+
+        # Plainest name first ("BP PLC" over "BP PLC - Pfd"), then the
+        # smallest contract for a small-capital bot — US 500 at £1 a point,
+        # not $250. "Mini" breaks ties where names carry no size (FX).
+        order = candidates["instrumentName"].map(
+            lambda n: (len(_normalized_name(n)), _contract_size(n), 0 if "mini" in n.lower() else 1)
+        )
+        candidates = candidates.loc[order.sort_values(kind="stable").index]
+
+    row = candidates.iloc[0]
+    if len(candidates) > 1:
+        log.info(
+            f"'{term}' had {len(candidates)} plausible matches — auto-picked the first "
+            f"(plainest name, then smallest contract). "
+            f"If wrong, change its DEFAULT_POOL entry to '{term}:EPIC'. Candidates: {_describe(candidates)}"
+        )
+
+    log.info(f"Resolved '{term}' -> epic={row['epic']} ({row.get('instrumentName', term)})")
+    return {"term": term, "epic": row["epic"], "name": row.get("instrumentName", term)}
+
+
 def resolve_pool_epics(ig_service: IGService) -> list:
     """Best-effort resolution: SKIP (don't exit) any entry that fails to
     resolve cleanly, logging why, so one bad search term in the pool doesn't
     take the whole bot down. See module docstring for why this differs from
     ig_cfd_ema_bot.py's strict, hard-exit resolution."""
     pool = [(p, None) for p in POOL_ENTRIES] if POOL_ENTRIES else DEFAULT_POOL
-    resolved = []
-
-    for entry, expected_type in pool:
-        if ":" in entry:
-            term, explicit_epic = entry.split(":", 1)
-            term, explicit_epic = term.strip(), explicit_epic.strip()
-            details = _call_with_retry(
-                f"'{term}' ({explicit_epic})", lambda: fetch_market_details(ig_service, explicit_epic)
-            )
-            if details is None:
-                log.warning(f"Skipping '{term}': explicit epic '{explicit_epic}' did not resolve.")
-                continue
-            resolved.append({"term": term, "epic": explicit_epic, "name": term})
-            log.info(f"Resolved '{term}' -> epic={explicit_epic} (explicit)")
-            continue
-
-        term = entry
-        markets = _call_with_retry(f"search for '{term}'", lambda: _paced_search(ig_service, term))
-        if markets is None:
-            log.warning(f"Skipping '{term}': search kept failing.")
-            continue
-        if len(markets) == 0:
-            log.warning(f"Skipping '{term}': no markets found.")
-            continue
-
-        candidates = markets
-        if expected_type and "instrumentType" in candidates:
-            candidates = _narrow(candidates, candidates["instrumentType"] == expected_type)
-
-        if "instrumentName" in candidates:
-            names = candidates["instrumentName"]
-            noise = "|".join(re.escape(m) for m in NOT_THE_MARKET_MARKERS)
-            candidates = _narrow(candidates, ~names.str.contains(noise, case=False, regex=True))
-
-            # Exact name first — a "GBP/EUR" search lists the inverse EUR/GBP first.
-            candidates = _narrow(
-                candidates, candidates["instrumentName"].map(_normalized_name) == _normalized_name(term)
-            )
-
-        # Undated (rolling) markets over dated futures — no expiry to roll.
-        if "expiry" in candidates:
-            candidates = _narrow(candidates, candidates["expiry"].isin(["-", "DFB"]))
-
-        if len(candidates) > 1 and "instrumentName" in candidates:
-            candidates = _narrow(candidates, candidates["instrumentName"].str.contains("24 Hours", case=False))
-
-            # Plainest name first ("BP PLC" over "BP PLC - Pfd"), then the
-            # smallest contract for a small-capital bot — US 500 at £1 a point,
-            # not $250. "Mini" breaks ties where names carry no size (FX).
-            order = candidates["instrumentName"].map(
-                lambda n: (len(_normalized_name(n)), _contract_size(n), 0 if "mini" in n.lower() else 1)
-            )
-            candidates = candidates.loc[order.sort_values(kind="stable").index]
-
-        row = candidates.iloc[0]
-        if len(candidates) > 1:
-            log.info(
-                f"'{term}' had {len(candidates)} plausible matches — auto-picked the first "
-                f"(plainest name, then smallest contract). "
-                f"If wrong, change its DEFAULT_POOL entry to '{term}:EPIC'. Candidates: {_describe(candidates)}"
-            )
-
-        resolved.append({"term": term, "epic": row["epic"], "name": row.get("instrumentName", term)})
-        log.info(f"Resolved '{term}' -> epic={row['epic']} ({row.get('instrumentName', term)})")
+    resolved = [item for item in (resolve_entry(ig_service, entry, expected_type) for entry, expected_type in pool)
+                if item is not None]
 
     if len(resolved) == 0:
         log.critical("Nothing in the pool resolved to a usable epic. Exiting.")
@@ -648,20 +667,31 @@ def deal_outcome(result) -> str:
     return status if status == "ACCEPTED" or not reason else f"{status} ({reason})"
 
 
-def open_position(ig_service: IGService, epic: str, name: str, details: dict, price: float, direction: str) -> None:
+_open_problem = ""  # why the last open_position() wasn't accepted, for a broadcast's answer
+
+
+def open_position(ig_service: IGService, epic: str, name: str, details: dict, price: float, direction: str) -> bool:
+    """A minimum-size market order with the stop and limit attached. True if
+    IG accepted it. (IG's API here takes no label for an order, so a
+    broadcast's is known by its deal ID.)"""
+    global _open_problem
+    _open_problem = ""
     if rollover.entries_paused():
         log.info(f"{name} ({epic}): {direction} signal, but it's too near the daily rollover to open a trade; skipping.")
-        return
+        _open_problem = "too near the daily rollover"
+        return False
     blocked = loss_limits.why_no_new_trades()
     if blocked:
         log.info(f"{name} ({epic}): {direction} signal, but {blocked}; skipping.")
-        return
+        _open_problem = blocked
+        return False
     # Always the market's minimum deal size — the smallest trade IG allows,
     # and still thousands of pounds of exposure (README: "IG position sizing").
     size = details["min_deal_size"]
     stop_distance = stop_distance_for(name, epic, details, price, direction)
     if stop_distance is None:
-        return
+        _open_problem = "its stop can't be placed within the loss limit (see the log)"
+        return False
     limit_distance = compute_point_distance(price, TAKE_PROFIT_PCT, details["scaling_factor"])
     try:
         result = ig_service.create_open_position(
@@ -670,13 +700,19 @@ def open_position(ig_service: IGService, epic: str, name: str, details: dict, pr
             limit_level=None, order_type="MARKET", quote_id=None, size=size,
             stop_distance=stop_distance, stop_level=None, trailing_stop=False, trailing_stop_increment=None,
         )
-        if isinstance(result, dict) and result.get("dealStatus") == "ACCEPTED":
+        accepted = isinstance(result, dict) and result.get("dealStatus") == "ACCEPTED"
+        if accepted:
             own_trades.add(result.get("dealId"), *(d.get("dealId") for d in result.get("affectedDeals") or ()))
             loss_limits.open_positions += 1
+        else:
+            _open_problem = deal_outcome(result)
         log.info(f"{direction} submitted -> {name} ({epic}) size={size} {details['currency']} stop_dist={stop_distance} "
                  f"limit_dist={limit_distance} result={deal_outcome(result)}")
+        return accepted
     except Exception as e:
         log.error(f"Error submitting {direction} for {name} ({epic}): {e}")
+        _open_problem = str(e) or "empty response - likely rate limited"
+        return False
 
 
 def close_position(ig_service: IGService, epic: str, name: str, position: dict, details: dict, reason: str) -> bool:
@@ -718,6 +754,81 @@ def close_own_positions(ig_service: IGService, positions: Optional[pd.DataFrame]
 def close_before_rollover(ig_service: IGService, positions: Optional[pd.DataFrame], pool: list):
     """Close every position this bot opened, so none is charged a night's funding."""
     return close_own_positions(ig_service, positions, pool, rollover.REASON)
+
+
+# ---------------------------------------------------------------------------
+# STAGNANCY TIMEOUT (shared/stagnancy.py)
+# ---------------------------------------------------------------------------
+watch = None  # the timeout, set up in run_bot()
+
+
+def stagnancy_pass(ig_service: IGService, positions: Optional[pd.DataFrame], pool: list):
+    """The stagnancy timeout over the positions this bot opened: one that has
+    gone nowhere for a while is logged (shadow) or closed (enforce), freeing
+    its slot. The prices are the positions' own (IG lists each with its
+    market's bid, offer and status), so this costs no extra requests.
+    Returns `positions` without any it closed."""
+    now = time.time()
+    rows = [p for p in _pool_positions(positions, pool) if p["dealId"] in own_trades]
+    names = {item["epic"]: item["name"] for item in pool}
+
+    def tradeable(p) -> bool:
+        status = p.get("marketStatus")
+        bid, offer = _number(p.get("bid")), _number(p.get("offer"))
+        return bool(bid and offer) and (status == "TRADEABLE" if isinstance(status, str) else True)
+
+    for epic in {p["epic"] for p in rows}:
+        p = next(r for r in rows if r["epic"] == epic)
+        watch.observe(epic, now, _number(p.get("bid")), _number(p.get("offer")), tradeable(p))
+    held = []
+    for p in rows:
+        level, stop = _number(p["level"]), _number(p.get("stopLevel"))
+        size, contract_size = _number(p["size"]), _number(p.get("contractSize"))
+        rate = exchange_rate(p.get("currency"))
+        # What it stands to lose at its stop, booked the way position_pnl() books a move.
+        risk = (abs(level - stop) * size * contract_size / rate
+                if None not in (level, stop, size, contract_size) and rate else None)
+        held.append((stagnancy.Held(
+            key=p["dealId"], symbol=p["epic"], direction="long" if p["direction"] == "BUY" else "short",
+            size=size or 0.0, entry=level, opened_at=_utc_seconds(p.get("createdDateUTC")), risk=risk,
+            pnl=position_pnl(p),  # at the price it would close at, so net of the spread
+            refs=(p["dealId"],), aliases=(names.get(p["epic"], ""),),
+        ), tradeable(p)))
+
+    closed = []
+
+    def close(h):
+        result = close_for_timeout(ig_service, h, names.get(h.symbol, h.symbol))
+        if result.get("done"):
+            closed.append(h.key)
+            loss_limits.open_positions -= 1
+        return result
+
+    watch.run(held, now, close)
+    return positions if not closed else positions[~positions["dealId"].isin(closed)]
+
+
+def close_for_timeout(ig_service: IGService, held, name: str) -> dict:
+    """Close one of the bot's positions at market for the stagnancy timeout,
+    by deal ID. IG's confirmation says where it closed and what it made."""
+    try:
+        result = ig_service.close_open_position(
+            deal_id=held.key, direction="SELL" if held.direction == "long" else "BUY", epic=None, expiry=None,
+            level=None, order_type="MARKET", quote_id=None, size=held.size,
+        )
+    except Exception as e:
+        log.error(f"Error closing position for {name} ({held.symbol}) ({stagnancy.TIMEOUT_REASON}): {e}")
+        return {"done": False, "problem": str(e) or "empty response - likely rate limited"}
+    outcome = deal_outcome(result)
+    log.info(f"CLOSE submitted ({stagnancy.TIMEOUT_REASON}) -> {name} ({held.symbol}) result={outcome}")
+    if outcome != "ACCEPTED":
+        # A deal its stop or limit closed a moment before comes back REJECTED: the next pass finds it gone.
+        return {"done": False, "problem": outcome}
+    profit = _number(result.get("profit"))  # in the deal's currency
+    in_account_currency = result.get("profitCurrency") in (None, CURRENCY_CODE)
+    # IG's trade history names a trade by the end of the closing deal's ID.
+    return {"done": True, "price": _number(result.get("level")), "pnl": profit if in_account_currency else None,
+            "refs": (str(result["dealId"])[-8:],) if result.get("dealId") else ()}
 
 
 # ---------------------------------------------------------------------------
@@ -837,6 +948,163 @@ def close_from_dashboard(ig_service: IGService, pool: list, symbol: str, ref, di
 
 
 # ---------------------------------------------------------------------------
+# BROADCAST TRADES FROM THE DASHBOARD (shared/broadcast.py)
+# ---------------------------------------------------------------------------
+guests = []       # pool items {"term", "epic", "name"}: a broadcast trade's market outside the pool - managed, never traded
+left_guests = {}  # epic -> (item, until): a guest whose trade closed, still in the dashboard reports a while
+LEFT_GUEST_SECONDS = 3600  # IG's history lists a closed trade by its market's name, so the name is kept this long
+
+
+def managed(pool: list) -> list:
+    """The pool, plus the markets outside it holding a broadcast trade."""
+    epics = {item["epic"] for item in pool}
+    return [*pool, *(g for g in guests if g["epic"] not in epics)]
+
+
+def reported(pool: list) -> list:
+    """What the dashboard reports cover: the managed markets, and those of
+    broadcast trades that closed lately (their closed trades)."""
+    now = time.time()
+    for epic in [e for e, (_, until) in left_guests.items() if until <= now]:
+        del left_guests[epic]
+    items = managed(pool)
+    epics = {item["epic"] for item in items}
+    return items + [item for epic, (item, _) in left_guests.items() if epic not in epics]
+
+
+def restore_guests(ig_service: IGService, pool: list) -> None:
+    """After a restart: the markets outside the pool its open broadcast trades are in."""
+    epics = {item["epic"] for item in pool}
+    for epic in sorted(broadcasts.open_symbols() - epics):
+        name = next(iter(broadcasts.aliases(epic)), epic)
+        if fetch_market_details(ig_service, epic) is None:
+            log.warning(f"{name} ({epic}): couldn't look up its broadcast trade's market; IG still holds its stop "
+                        f"and limit.")
+            continue
+        guests.append({"term": name, "epic": epic, "name": name})
+        log.info(f"{name} ({epic}): managing its broadcast trade (not in the pool).")
+
+
+def broadcast_plan(ig_service: IGService, pool: list, request, now: float, most: float = None) -> dict:
+    """The trade this bot would make for a broadcast, every limit applied -
+    or broadcast.Declined saying why not."""
+    found = symbols.candidates("ig", request.symbol)
+    item = candidate = None
+    for candidate in found:
+        parts = {p.strip().upper() for p in candidate.code.split(":") if p.strip()}
+        item = next((i for i in managed(pool) if {i["epic"].upper(), i["name"].upper(), i["term"].upper()} & parts),
+                    None) or resolve_entry(ig_service, candidate.code)
+        if item is not None:
+            break
+    if item is None:
+        raise broadcast.Declined(broadcast.UNAVAILABLE, f"{request.symbol} isn't available on IG"
+                                 + (f" (looked for {', '.join(c.code for c in found)})." if found else "."))
+    epic, name = item["epic"], item["name"]
+    if rollover.entries_paused(now):
+        raise broadcast.Declined(broadcast.CLOSED, f"{name}: too near the daily rollover to open a trade.")
+    if loss_limits.stopped:
+        raise broadcast.Declined(broadcast.PAUSED, f"{loss_limits.why_no_new_trades()[0].upper()}"
+                                                   f"{loss_limits.why_no_new_trades()[1:]}.")
+    positions = fetch_all_positions(ig_service)
+    if find_position(positions, epic) is not None:
+        raise broadcast.Declined(broadcast.NO_SLOT, f"A {name} position is already open on the account.")
+    open_count = len(_pool_positions(positions, managed(pool)))
+    if MAX_POSITIONS and open_count >= MAX_POSITIONS:
+        raise broadcast.Declined(broadcast.NO_SLOT, f"{open_count} positions are already open "
+                                                    f"(IG_MAX_POSITIONS={MAX_POSITIONS}).")
+    if watch is not None and watch.cooling(epic, now):
+        raise broadcast.Declined(broadcast.RISK, f"{name}: the stagnancy timeout closed it lately (cooldown).")
+    details = fetch_market_details(ig_service, epic)
+    if details is None or details["market_status"] != "TRADEABLE" or details["bid"] is None or details["offer"] is None:
+        status = details["market_status"] if details is not None else "no market details"
+        raise broadcast.Declined(broadcast.CLOSED, f"{name}: not tradeable right now ({status}).")
+
+    price = (float(details["bid"]) + float(details["offer"])) / 2.0
+    direction = "BUY" if request.side == "buy" else "SELL"
+    stop_distance = stop_distance_for(name, epic, details, price, direction)
+    if stop_distance is None:
+        raise broadcast.Declined(broadcast.RISK, f"{name}: its stop can't be placed within IG_MAX_TRADE_LOSS="
+                                                 f"{MAX_TRADE_LOSS:g} {CURRENCY_CODE}, or there's no exchange rate for "
+                                                 f"it yet - the bot log says which.")
+    size = details["min_deal_size"]
+    if most is not None and most < size - 1e-12:
+        raise broadcast.Declined(broadcast.RISK, f"{name}: IG's smallest trade is now {size:g}, more than the {most:g} "
+                                                 f"previewed.")
+    per_point = money_per_point(details)
+    exposure = price * details["scaling_factor"] * per_point if per_point else None
+    capped = ""
+    if request.quantity is not None:
+        if exposure is not None and request.quantity < exposure * (1 - 1e-9):
+            raise broadcast.Declined(broadcast.RISK, f"{name}: IG's smallest trade ({size:g}) is worth about "
+                                                     f"{exposure:,.2f} {CURRENCY_CODE}, more than the "
+                                                     f"{request.quantity:,.2f} asked for.")
+        capped = "IG always trades the market's minimum size"
+    sign = 1 if direction == "BUY" else -1
+    entry = float(details["offer"] if sign > 0 else details["bid"])
+    limit_distance = compute_point_distance(price, TAKE_PROFIT_PCT, details["scaling_factor"])
+    rule = watch.book.rule(epic, (name,)) if watch is not None else None
+    exits = (f"stop-loss {STOP_LOSS_PCT * 100:g}% (closer if it would lose over {MAX_TRADE_LOSS:g}) / take-profit "
+             f"{TAKE_PROFIT_PCT * 100:g}% at IG; "
+             + (f"closed {rollover.FLAT_MINUTES} min before the rollover" if rollover.FLAT_MINUTES else "held overnight")
+             + ("; streak reversal" if any(i["epic"] == epic for i in pool) else "; managed until it closes (not in the pool)")
+             + (f"; stagnancy timeout ({rule.mode})" if rule and rule.mode != "off" else ""))
+    return {"item": item, "details": details, "price": price, "direction": direction, "capped": capped,
+            "figures": broadcast.figures(
+                symbol=epic, name=name, size=size, sizeUnit="contracts",
+                exposure=round(exposure, 2) if exposure is not None else None,
+                risk=round(stop_distance * per_point, 2) if per_point else None, currency=CURRENCY_CODE, entry=entry,
+                stopLoss=entry - sign * stop_distance / details["scaling_factor"],
+                takeProfit=entry + sign * limit_distance / details["scaling_factor"], accountMode=ACCOUNT_MODE,
+                exits=exits, capped=capped or None, standIn=candidate.canonical if candidate.stand_in else None,
+                previewedAt=now)}
+
+
+def broadcast_preview(ig_service: IGService, pool: list, command: dict) -> tuple:
+    """What this bot would do with a broadcast trade: (a line, {figures})."""
+    request = broadcast.Request.parse(command)
+    plan = broadcast_plan(ig_service, pool, request, time.time())
+    f = plan["figures"]
+    line = (f"Would {request.side} {f['size']:g} of {f['name']} ({f['symbol']}) at ~{f['entry']:g}: stop-loss "
+            f"~{f['stopLoss']:g}, take-profit ~{f['takeProfit']:g}" + (f" ({plan['capped']})" if plan["capped"] else ""))
+    log.info(f"Broadcast #{request.id}: {line}")
+    return line + ".", f
+
+
+def broadcast_open(ig_service: IGService, pool: list, command: dict) -> tuple:
+    """Open a broadcast trade the admin confirmed - every limit checked again
+    on fresh prices, never bigger than previewed. (a line, {figures})."""
+    now = time.time()
+    request = broadcast.Request.parse(command)
+    broadcasts.check_new(request)
+    request.check_age(now)
+    plan = broadcast_plan(ig_service, pool, request, now, most=request.size)
+    item = plan["item"]
+    epic, name = item["epic"], item["name"]
+    broadcasts.opening(request, epic, (name,), now)
+    before = set(own_trades.ids)
+    if not open_position(ig_service, epic, name, plan["details"], plan["price"], plan["direction"]):
+        broadcasts.failed(request)
+        raise CommandError(f"IG didn't accept it: {_open_problem or 'see the bot log'}.")
+    refs = sorted(own_trades.ids - before)
+    broadcasts.opened(request, refs, now)
+    if all(i["epic"] != epic for i in pool):
+        guests.append(item)
+        left_guests.pop(epic, None)
+        log.info(f"{name} ({epic}): not in the pool - managing its broadcast trade until it closes, never trading it "
+                 f"on a streak.")
+    entry = plan["figures"]["entry"]
+    verb = "Bought" if request.side == "buy" else "Sold"
+    size = plan["figures"]["size"]
+    return (f"{verb} {size:g} of {name} at ~{entry:g}" + (f" (deal {refs[0]})" if refs else "") + "."), \
+        {"symbol": epic, "size": size, "price": entry, **({"ref": refs[0]} if refs else {})}
+
+
+def broadcast_symbols(pool: list) -> list:
+    """The instrument names the dashboard can offer for this bot."""
+    return sorted(set(symbols.names("ig")) | {symbols.canonical(i["name"]) or i["name"] for i in pool})
+
+
+# ---------------------------------------------------------------------------
 # DASHBOARD
 # ---------------------------------------------------------------------------
 # Open positions come free with every pass. The account costs one request
@@ -942,6 +1210,7 @@ def fetch_closed_trades(ig_service: IGService, pool: list, since: Optional[float
     last week by default), newest first, from IG's transaction history
     (which has the realised profit, costs included)."""
     names = {item["name"] for item in pool}
+    epics = {item["name"]: item.get("epic") for item in pool}
     if since is None:
         since = time.time() - TRADES_LOOKBACK_DAYS * 86400
     _rate_limiter.wait()
@@ -967,8 +1236,18 @@ def fetch_closed_trades(ig_service: IGService, pool: list, since: Optional[float
             "openedAt": _utc_seconds(t.get("openDateUtc")),
             "closedAt": closed_at,
             "pnl": _money(t.get("profitAndLoss")),
+            **stagnancy_fields(str(t["reference"]), epics.get(name), _utc_seconds(t.get("openDateUtc"))),
         })
     return trades
+
+
+def stagnancy_fields(ref: str, epic, opened_at) -> dict:
+    """The stagnancy timeout's fields for a closed trade: by its closing deal,
+    or - for one it only watched - by market and opening time, as IG's
+    history doesn't name the deal that opened a trade."""
+    if watch is None:
+        return {}
+    return watch.fields_for(ref) or watch.fields_matching(epic, opened_at)
 
 
 def report_to_dashboard(ig_service: IGService, positions: Optional[pd.DataFrame], pool: list) -> None:
@@ -977,6 +1256,15 @@ def report_to_dashboard(ig_service: IGService, positions: Optional[pd.DataFrame]
     global _last_trades_fetch
     if not dashboard.enabled:
         return
+    # Broadcast trades no longer open have closed; their markets outside the pool stop being managed.
+    now = time.time()
+    own_open = set() if positions is None or len(positions) == 0 else {
+        row["epic"] for _, row in positions.iterrows() if row["dealId"] in own_trades}
+    broadcasts.sync(own_open, now)
+    broadcasts.prune(now)
+    for guest in [g for g in guests if g["epic"] not in broadcasts.open_symbols()]:
+        guests.remove(guest)
+        left_guests[guest["epic"]] = (guest, now + LEFT_GUEST_SECONDS)
     try:
         report = {"positions": dashboard_positions(positions, pool)}
         if dashboard.due(ACCOUNT_EVERY_SECONDS):
@@ -1019,6 +1307,13 @@ def trading_cycle(ig_service: IGService, item: dict, positions: Optional[pd.Data
 
     signal = detect_streak(closes)
     log.info(f"{name} ({epic}) | price={price:.2f} | streak={signal or 'none'} | position={position_desc}")
+    if position is not None and watch is not None and watch.closing(position["deal_id"]):
+        log.info(f"{name} ({epic}): its {stagnancy.TIMEOUT_REASON} close is under way - nothing else done with it.")
+        return
+    if position is None and signal and watch is not None and watch.cooling(epic, time.time()):
+        # only with SCANNER_STAGNANT_COOLDOWN set
+        log.info(f"{name} ({epic}): {signal} streak, but the stagnancy timeout closed it lately (cooldown); skipping.")
+        return
 
     closed = False
     if signal == "bullish":
@@ -1069,13 +1364,21 @@ def run_bot() -> None:
                     f"{BAR_SECONDS // 60}-minute bar gets only a sample or two per market; 5 minutes or longer "
                     f"suits this scanner.")
     log.info(rollover.describe())
+    global watch
+    watch = stagnancy.start_watch("scanner", "ig", "ig-momentum-scanner", "IG", log, bar_seconds=BAR_SECONDS,
+                                  loop_seconds=max(pass_seconds, 30), currency=CURRENCY_CODE)
     log.info("=" * 78)
-    dashboard.describe(account=_account_id, currency=CURRENCY_CODE, config={
+    dashboard.describe(account=_account_id, currency=CURRENCY_CODE, account_mode=ACCOUNT_MODE, config={
         "markets": [item["name"] for item in pool], "timeframe": TIMEFRAME, "streakLength": STREAK_LENGTH,
         "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
         "maxTradeLoss": MAX_TRADE_LOSS, "maxPositions": MAX_POSITIONS, "dailyLossLimit": DAILY_LOSS_LIMIT,
+        **watch.book.config(),
     })
-    dashboard.accept_closes(lambda *command: close_from_dashboard(ig_service, pool, *command))
+    dashboard.accept_closes(lambda *command: close_from_dashboard(ig_service, managed(pool), *command))
+    restore_guests(ig_service, pool)
+    dashboard.tag_rows(broadcasts.tags)
+    dashboard.accept_broadcasts(lambda command: broadcast_preview(ig_service, pool, command),
+                                lambda command: broadcast_open(ig_service, pool, command), broadcast_symbols(pool))
 
     consecutive_errors = 0
     pass_number = 0
@@ -1093,19 +1396,28 @@ def run_bot() -> None:
             continue
         if rollover.flat_due():
             try:
-                positions = close_before_rollover(ig_service, positions, pool)
+                positions = close_before_rollover(ig_service, positions, managed(pool))
             except Exception as e:
                 pass_had_error = True
                 log.error(f"Error closing positions {rollover.REASON}: {e or 'empty response - likely rate limited'}")
         try:
-            positions = loss_limits.update(ig_service, positions, pool)
+            positions = loss_limits.update(ig_service, positions, managed(pool))
         except Exception as e:
             pass_had_error = True
             log.error(f"Error checking the loss limits: {e or 'empty response - likely rate limited'}")
-        report_to_dashboard(ig_service, positions, pool)
+        if watch.book.active:
+            try:
+                positions = stagnancy_pass(ig_service, positions, managed(pool))
+            except Exception as e:
+                pass_had_error = True
+                log.error(f"Error in the stagnancy check: {e or 'empty response - likely rate limited'}")
+        report_to_dashboard(ig_service, positions, reported(pool))
 
         for item in pool:
             try:
+                # Between markets too: a broadcast's preview is answered within the dashboard's 30 s, not a pass later.
+                if dashboard.run_commands():
+                    positions = fetch_all_positions(ig_service)  # what they opened or closed counts for the rest
                 trading_cycle(ig_service, item, positions)
             except Exception as e:
                 pass_had_error = True

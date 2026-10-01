@@ -18,6 +18,10 @@ Strategy
 - Exit      : 9-period EMA crosses BELOW the 21-period EMA -> close the long
 - Risk mgmt : 2% stop-loss / 5% take-profit, attached to the order, so OANDA
               enforces them even while the bot isn't running.
+- Stagnancy : one of its own trades (IDs saved in own_trades.json beside it)
+              that has gone nowhere for a while is logged (shadow, the
+              default) or closed with the reason TIMEOUT_STAGNANT, freeing its
+              slot (EMA_STAGNANT_* settings; see shared/stagnancy.py).
 
 Sizing
 ------
@@ -67,6 +71,8 @@ import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
+import rollover  # noqa: E402 - needs the path above (for OwnTrades)
+import stagnancy  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -103,6 +109,7 @@ BAR_SECONDS = BAR_MINUTES[TIMEFRAME] * 60
 LOOP_INTERVAL_SECONDS = min(60, BAR_SECONDS // 4)  # how often to look for newly closed bars
 REQUEST_TIMEOUT_SECONDS = 20
 MAX_CONSECUTIVE_ERRORS = 10
+OWN_TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "own_trades.json")
 
 assert MAX_OPEN_POSITIONS >= 1, "OANDA_MAX_POSITIONS must be at least 1"
 assert BUDGET > 0, "OANDA_BUDGET must be positive"
@@ -120,6 +127,7 @@ log = logging.getLogger("oanda_ema_bot")
 
 # Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
 dashboard = DashboardReporter("oanda-ema-bot", "OANDA EMA crossover", broker="OANDA", strategy="EMA 9/21 crossover")
+own_trades = rollover.OwnTrades(OWN_TRADES_FILE)  # the trades this bot opened - only these get the stagnancy timeout
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +336,7 @@ def submit_buy(account_id: str, symbol: str, instrument: dict, price: dict, curr
         log.error(f"Error submitting BUY for {symbol}: {e}")
         return False
     filled, outcome = fill_outcome(body, "order")
+    own_trades.add(((body.get("orderFillTransaction") or {}).get("tradeOpened") or {}).get("tradeID"))
     log.info(
         f"BUY submitted -> {symbol} units={order['units']} (~{units * price['unit_value']:,.2f} {currency}) "
         f"stop={order['stopLossOnFill']['price']} limit={order['takeProfitOnFill']['price']} result={outcome}"
@@ -391,6 +400,63 @@ def close_from_dashboard(account_id: str, markets: dict, symbol: str, ref, direc
 
 
 # ---------------------------------------------------------------------------
+# STAGNANCY TIMEOUT (shared/stagnancy.py)
+# ---------------------------------------------------------------------------
+watch = None  # the timeout, set up in run_bot()
+
+
+def stagnancy_pass(account_id: str, watchlist: dict, currency: str) -> None:
+    """The stagnancy timeout over the trades this bot opened: one that has
+    gone nowhere for a while is logged (shadow) or closed (enforce). Its
+    slot is free once OANDA no longer lists it - the next bar's count of
+    open positions doesn't include it."""
+    now = time.time()
+    open_trades = oanda("GET", f"/v3/accounts/{account_id}/openTrades").get("trades", [])
+    own_trades.keep_open(t["id"] for t in open_trades)
+    trades = [t for t in open_trades if t["id"] in own_trades and t["instrument"] in watchlist]
+    prices = fetch_prices(account_id, sorted({t["instrument"] for t in trades}), currency) if trades else {}
+    for symbol, price in prices.items():
+        watch.observe(symbol, now, price["bid"], price["ask"], price["tradeable"])
+    held = []
+    for t in trades:
+        symbol, units, entry = t["instrument"], float(t["currentUnits"]), float(t["price"])
+        price = prices.get(symbol)
+        # What it stands to lose at its stop-loss, in the account's currency.
+        stop = float(t["stopLossOrder"]["price"]) if t.get("stopLossOrder") else None
+        distance = abs(entry - stop) if stop is not None else entry * STOP_LOSS_PCT
+        risk = abs(units) * distance * price["unit_value"] / ((price["bid"] + price["ask"]) / 2) if price else None
+        held.append((stagnancy.Held(
+            key=t["id"], symbol=symbol, direction="long" if units > 0 else "short", size=abs(units), entry=entry,
+            opened_at=float(t["openTime"]), risk=risk, refs=(t["id"],),
+            # OANDA values a trade at the price it would close at (net of the spread); financing apart.
+            pnl=float(t.get("unrealizedPL") or 0) + float(t.get("financing") or 0),
+        ), bool(price and price["tradeable"])))
+    watch.run(held, now, lambda h: close_trade_now(account_id, h))
+
+
+def close_trade_now(account_id: str, held) -> dict:
+    """Close one of the bot's trades at market for the stagnancy timeout -
+    by trade ID, so another bot's trades in the market are left alone."""
+    try:
+        body = oanda("PUT", f"/v3/accounts/{account_id}/trades/{held.key}/close")
+    except (OandaError, requests.RequestException) as e:
+        # A trade its stop-loss or take-profit closed a moment before is refused
+        # here (TRADE_DOESNT_EXIST): the next pass finds it gone.
+        log.error(f"Error closing {held.symbol} trade {held.key} ({stagnancy.TIMEOUT_REASON}): {e}")
+        return {"done": False, "problem": str(e)}
+    filled, outcome = fill_outcome(body, "order")
+    log.info(f"CLOSE submitted ({stagnancy.TIMEOUT_REASON}) -> {held.symbol} trade {held.key} {held.size:g} units "
+             f"result={outcome}")
+    if not filled:
+        return {"done": False, "problem": outcome}
+    CLOSE_REASONS[held.key] = stagnancy.TIMEOUT_REASON
+    fill = body.get("orderFillTransaction") or {}
+    pnl = sum(float(c.get("realizedPL") or 0) + float(c.get("financing") or 0) for c in fill.get("tradesClosed") or ())
+    price = fill.get("fullVWAP") or fill.get("price")
+    return {"done": True, "price": float(price) if price else None, "pnl": round(pnl, 2)}
+
+
+# ---------------------------------------------------------------------------
 # DASHBOARD
 # ---------------------------------------------------------------------------
 CLOSE_REASONS = {}  # trade ID -> why this bot closed it; stop-loss/take-profit come from OANDA
@@ -420,6 +486,8 @@ def dashboard_trade(trade: dict) -> dict:
             pnl=float(trade.get("realizedPL") or 0) + float(trade.get("financing") or 0),
             closeReason=reason,
         )
+        if watch is not None:  # the stagnancy timeout's fields, if it closed or watched it
+            row.update(watch.fields_for(trade["id"]))
     else:
         row.update(
             size=abs(float(trade.get("currentUnits") or units)),
@@ -475,12 +543,17 @@ def trade_new_bars(account_id: str, watchlist: dict, new_bars: dict, currency: s
             elif len(held) >= MAX_OPEN_POSITIONS:
                 log.info(f"{symbol}: bullish crossover, but {MAX_OPEN_POSITIONS} positions are already open; "
                          f"skipping buy.")
+            elif watch is not None and watch.cooling(symbol, time.time()):  # only with EMA_STAGNANT_COOLDOWN set
+                log.info(f"{symbol}: bullish crossover, but the stagnancy timeout closed it lately (cooldown); "
+                         f"skipping buy.")
             elif price is None or not price["tradeable"]:
                 log.info(f"{symbol}: bullish crossover, but OANDA says it isn't tradeable right now; skipping buy.")
             elif submit_buy(account_id, symbol, watchlist[symbol], price, currency):
                 held.append(symbol)
         elif signal == "bearish" and position is not None and position["side"] == "long":
-            if close_position(account_id, symbol, position, "EMA bearish crossover"):
+            if watch is not None and watch.closing_in(symbol):
+                log.info(f"{symbol}: bearish crossover, but its {stagnancy.TIMEOUT_REASON} close is under way.")
+            elif close_position(account_id, symbol, position, "EMA bearish crossover"):
                 held.remove(symbol)
 
 
@@ -514,11 +587,14 @@ def run_bot() -> None:
         f"Stop-loss={STOP_LOSS_PCT:.0%} | Take-profit={TAKE_PROFIT_PCT:.0%} | "
         f"Timeframe={TIMEFRAME} | EMA periods={EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}"
     )
+    global watch
+    watch = stagnancy.start_watch("ema", "oanda", "oanda-ema-bot", "OANDA", log, bar_seconds=BAR_SECONDS,
+                                  loop_seconds=LOOP_INTERVAL_SECONDS, currency=currency)
     log.info("=" * 78)
     dashboard.describe(account=account_id, currency=currency, config={
         "watchlist": list(watchlist), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
         "timeframe": TIMEFRAME, "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}",
-        "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
+        "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100, **watch.book.config(),
     })
     dashboard.accept_closes(lambda *command: close_from_dashboard(account_id, watchlist, *command))
 
@@ -529,6 +605,8 @@ def run_bot() -> None:
         try:
             if dashboard.due():
                 report_to_dashboard(account_id, watchlist)
+            if watch.book.active:
+                stagnancy_pass(account_id, watchlist, currency)
 
             latest = {}
             for symbol in watchlist:

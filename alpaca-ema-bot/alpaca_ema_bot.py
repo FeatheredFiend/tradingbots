@@ -11,6 +11,9 @@ Strategy
 - Exit      : 9-period EMA crosses BELOW the 21-period EMA  -> SELL (close position)
 - Risk mgmt : 2% hard stop-loss / 5% take-profit, measured against the
               position's average entry price and checked every loop.
+- Stagnancy : a position that has gone nowhere for a while is logged
+              (shadow, the default) or sold with the reason TIMEOUT_STAGNANT
+              (EMA_STAGNANT_* settings; see shared/stagnancy.py).
 
 The bot scans a WATCHLIST of symbols every cycle and applies the same EMA
 crossover logic independently to each one — a bullish cross on any symbol
@@ -67,6 +70,7 @@ from alpaca_trade_api.rest import APIError, TimeFrame, TimeFrameUnit
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
+import stagnancy  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -369,7 +373,110 @@ def report_closed_trade(order, position, reason: str, qty=None) -> None:
         "closedAt": datetime.now(timezone.utc).isoformat(),
         "pnl": float(position.unrealized_pl) * share,
         "closeReason": reason.split(",")[0],
+        **(watch.shadow_fields(position.symbol) if watch is not None else {}),  # what the stagnancy timeout saw
     })
+
+
+# ---------------------------------------------------------------------------
+# STAGNANCY TIMEOUT (shared/stagnancy.py)
+# ---------------------------------------------------------------------------
+watch = None            # the timeout, set up in run_bot()
+_opened = {}            # symbol -> (qty, when its latest buy filled): Alpaca's positions don't say when they opened
+_timeout_closes = {}    # symbol -> the TIMEOUT_STAGNANT sell: {"order": id, "entry": price, "row": its fill, once known}
+
+
+def latest_prices(api: tradeapi.REST, positions: dict) -> dict:
+    """{symbol: (bid, ask)}. Shares: IEX's quote, or its last trade when it
+    shows one side only. Crypto: the position's own current price."""
+    shares = [s for s in positions if not is_crypto_symbol(s)]
+    quotes = api.get_latest_quotes(shares, feed=DATA_FEED) if shares else {}
+    prices = {}
+    for symbol in shares:
+        quote = quotes.get(symbol)
+        bid, ask = (float(quote.bp or 0), float(quote.ap or 0)) if quote is not None else (0.0, 0.0)
+        if bid > 0 and ask >= bid:
+            prices[symbol] = (bid, ask)
+    missing = [s for s in shares if s not in prices]
+    trades = api.get_latest_trades(missing, feed=DATA_FEED) if missing else {}
+    for symbol in missing:
+        if symbol in trades:
+            prices[symbol] = (float(trades[symbol].p), float(trades[symbol].p))
+    for symbol, p in positions.items():
+        if is_crypto_symbol(symbol) and float(p.current_price or 0) > 0:
+            prices[symbol] = (float(p.current_price), float(p.current_price))
+    return prices
+
+
+def opened_at(api: tradeapi.REST, position):
+    """When the position's latest buy filled, looked up once per position size."""
+    cached = _opened.get(position.symbol)
+    if cached is not None and cached[0] == position.qty:
+        return cached[1]
+    orders = api.list_orders(status="closed", symbols=[position.symbol], limit=20, direction="desc")
+    filled = [pd.Timestamp(o.filled_at).timestamp() for o in orders if o.side == "buy" and o.filled_at]
+    _opened[position.symbol] = (position.qty, max(filled) if filled else None)
+    return _opened[position.symbol][1]
+
+
+def stagnancy_pass(api: tradeapi.REST, market_open: bool) -> None:
+    """The stagnancy timeout over the watchlist's positions: one that has gone
+    nowhere for a while is logged (shadow) or sold (enforce). Alpaca fills
+    the sell a moment after taking it, so it counts once the position has
+    gone; the record sent with the sell is then corrected to the fill."""
+    now = time.time()
+    positions = {p.symbol: p for p in api.list_positions() if p.symbol in WATCHLIST}
+    prices = latest_prices(api, positions)
+    held = []
+    for symbol, p in positions.items():
+        tradeable = symbol in prices and (market_open or is_crypto_symbol(symbol))
+        bid, ask = prices.get(symbol, (None, None))
+        watch.observe(symbol, now, bid, ask, tradeable)
+        qty, entry = float(p.qty), float(p.avg_entry_price)
+        held.append((stagnancy.Held(
+            key=symbol, symbol=symbol, direction="long", size=qty, entry=entry, opened_at=opened_at(api, p),
+            # Alpaca values a position at the last trade; selling gets the bid. No commission.
+            pnl=(bid - entry) * qty if bid else float(p.unrealized_pl),
+            risk=qty * entry * STOP_LOSS_PCT,
+        ), tradeable))
+    for symbol, fields in watch.run(held, now, lambda h: close_for_timeout(api, h, positions),
+                                    fill_of=lambda s: timeout_fill(api, s)):
+        sold = _timeout_closes.pop(symbol, None)
+        if sold is not None:
+            dashboard.trade({"ref": sold["order"], **sold.get("row", {}), **fields})
+
+
+def close_for_timeout(api: tradeapi.REST, held, positions: dict) -> dict:
+    """Sell the position for the stagnancy timeout."""
+    symbol, position = held.symbol, positions.get(held.symbol)
+    try:
+        order = api.close_position(symbol)
+    except (APIError, requests.exceptions.RequestException) as e:
+        log.error(f"Error closing {symbol} ({stagnancy.TIMEOUT_REASON}): {e}")
+        return {"done": False, "problem": str(e)}
+    log.info(f"CLOSE position submitted ({stagnancy.TIMEOUT_REASON}) -> {symbol} order_id={order.id}")
+    report_closed_trade(order, position, stagnancy.TIMEOUT_REASON)  # priced before the fill; corrected after
+    _timeout_closes[symbol] = {"order": str(order.id), "entry": float(position.avg_entry_price)}
+    return {"done": True, "filled": False, "refs": (str(order.id),)}
+
+
+def timeout_fill(api: tradeapi.REST, symbol: str):
+    """What the TIMEOUT_STAGNANT sell filled at, once the position has gone."""
+    sold = _timeout_closes.get(symbol)
+    if sold is None:
+        return None
+    try:
+        order = api.get_order(sold["order"])
+    except (APIError, requests.exceptions.RequestException) as e:
+        log.warning(f"{symbol}: couldn't look up sell order {sold['order']}: {e}")
+        return None
+    if not order.filled_avg_price or not float(order.filled_qty or 0):
+        return None
+    price, qty = float(order.filled_avg_price), float(order.filled_qty)
+    pnl = round((price - sold["entry"]) * qty, 2)
+    sold["row"] = {"symbol": symbol, "direction": "long", "size": qty, "entryPrice": sold["entry"],
+                   "exitPrice": price, "closedAt": pd.Timestamp(order.filled_at).isoformat(), "pnl": pnl,
+                   "closeReason": stagnancy.TIMEOUT_REASON}
+    return {"price": price, "pnl": pnl, "refs": (sold["order"],)}
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +518,9 @@ def check_risk_management(api: tradeapi.REST, symbol: str, position) -> bool:
 # TRADING CYCLE
 # ---------------------------------------------------------------------------
 def trading_cycle(api: tradeapi.REST, symbol: str) -> None:
+    if watch is not None and watch.closing(symbol):
+        log.info(f"{symbol}: its {stagnancy.TIMEOUT_REASON} sell is under way; nothing else done with it.")
+        return
     position = get_open_position(api, symbol)
 
     # Risk management takes priority over signal generation every loop.
@@ -444,7 +554,10 @@ def trading_cycle(api: tradeapi.REST, symbol: str) -> None:
     )
 
     if signal == "bullish":
-        if position is None:
+        if position is None and watch is not None and watch.cooling(symbol, time.time()):
+            # only with EMA_STAGNANT_COOLDOWN set
+            log.info(f"{symbol}: bullish crossover, but the stagnancy timeout sold it lately (cooldown); skipping buy.")
+        elif position is None:
             submit_buy(api, symbol)
         else:
             log.info(f"{symbol}: bullish crossover detected but already holding a position; skipping buy.")
@@ -486,6 +599,10 @@ def run_bot() -> None:
         f"Stop-loss={STOP_LOSS_PCT:.0%} | Take-profit={TAKE_PROFIT_PCT:.0%} | "
         f"Timeframe={TIMEFRAME} | EMA periods={EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}"
     )
+    global watch
+    watch = stagnancy.start_watch("ema", "alpaca", "alpaca-ema-bot", "Alpaca", log,
+                                  bar_seconds=BAR_MINUTES[TIMEFRAME] * 60, loop_seconds=LOOP_INTERVAL_SECONDS,
+                                  currency="USD")
     log.info("=" * 78)
 
     try:
@@ -504,7 +621,7 @@ def run_bot() -> None:
     dashboard.describe(currency="USD", config={
         "watchlist": WATCHLIST, "tradeUsd": TRADE_NOTIONAL_USD,
         "timeframe": TIMEFRAME, "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}",
-        "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
+        "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100, **watch.book.config(),
     })
     dashboard.accept_closes(lambda *command: close_from_dashboard(api, WATCHLIST, *command))
 
@@ -550,6 +667,12 @@ def run_bot() -> None:
                     continue
 
         cycle_had_error = False
+        if watch.book.active:
+            try:
+                stagnancy_pass(api, market_open)
+            except Exception as e:
+                cycle_had_error = True
+                log.error(f"Error in the stagnancy check this cycle: {e}")
         for symbol in WATCHLIST:
             if not market_open and not is_crypto_symbol(symbol):
                 continue

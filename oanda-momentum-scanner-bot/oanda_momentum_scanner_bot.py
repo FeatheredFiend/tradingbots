@@ -27,6 +27,14 @@ Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
   opens from an hour before it to 45 minutes after (SCANNER_FLAT_MINUTES /
   SCANNER_LAST_ENTRY_MINUTES, 0 = off; see shared/rollover.py). It knows
   its own trades by the IDs saved in own_trades.json beside it.
+- Stagnancy : one of its own trades that has gone nowhere for a while is
+  logged (shadow, the default) or closed with the reason TIMEOUT_STAGNANT,
+  freeing its slot (SCANNER_STAGNANT_* settings; see shared/stagnancy.py).
+- Broadcasts: with DASHBOARD_BROADCAST=1 it takes broadcast trades from the
+  dashboard (shared/broadcast.py) - the admin's market and side, its own
+  slice size (or less), stop-loss, take-profit and limits. A market outside
+  the pool is managed until its trade closes (brackets, the pre-rollover
+  close, the stagnancy timeout) but never traded on a streak.
 
 Sizing
 ------
@@ -87,7 +95,10 @@ import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
+import broadcast  # noqa: E402 - needs the path above
 import rollover  # noqa: E402 - needs the path above
+import stagnancy  # noqa: E402 - needs the path above
+import symbols  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -95,6 +106,7 @@ import rollover  # noqa: E402 - needs the path above
 API_TOKEN = os.environ.get("OANDA_API_TOKEN", "")
 ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
 BASE_URL = "https://api-fxpractice.oanda.com"  # Practice (demo) only — do not change.
+ACCOUNT_MODE = "demo" if "fxpractice" in BASE_URL else "live"  # for the dashboard's broadcast previews
 
 # The IG scanner's pool in OANDA's instrument names (OANDA only quotes the
 # pound against the euro as EUR/GBP). Anything this account doesn't offer,
@@ -130,6 +142,7 @@ REQUEST_TIMEOUT_SECONDS = 20
 ERROR_BACKOFF_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
 OWN_TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "own_trades.json")
+BROADCASTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "broadcasts.json")
 
 assert STREAK_LENGTH >= 2, "STREAK_LENGTH must be at least 2 to mean anything"
 assert MAX_OPEN_POSITIONS >= 1, "OANDA_MAX_POSITIONS must be at least 1"
@@ -150,6 +163,7 @@ log = logging.getLogger("oanda_momentum_bot")
 # Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
 dashboard = DashboardReporter("oanda-momentum-scanner", "OANDA momentum scanner", broker="OANDA", strategy="Momentum streak")
 own_trades = rollover.OwnTrades(OWN_TRADES_FILE)  # the trades this bot opened - only these close before the rollover
+broadcasts = broadcast.Book(path=BROADCASTS_FILE, log=log)  # the broadcast trades it acted on (shared/broadcast.py)
 
 
 # ---------------------------------------------------------------------------
@@ -337,15 +351,24 @@ def fill_outcome(body: dict, prefix: str) -> tuple:
     return False, "no fill reported"
 
 
+_open_problem = ""  # why the last open_position() didn't fill, for a broadcast's answer
+
+
 def open_position(account_id: str, symbol: str, instrument: dict, price: dict, direction: str,
-                  currency: str) -> bool:
-    """Market order with the stop-loss and take-profit attached. True if it filled."""
+                  currency: str, units: float = None, tag: str = None) -> bool:
+    """Market order with the stop-loss and take-profit attached: one budget
+    slice, or `units` (a broadcast's size). `tag` labels the order and its
+    trade (OANDA client extensions). True if it filled."""
+    global _open_problem
+    _open_problem = ""
     if rollover.entries_paused():
         log.info(f"{symbol}: {direction} signal, but it's too near the daily rollover to open a trade; skipping.")
+        _open_problem = "too near the daily rollover"
         return False
-    units = units_for_slice(instrument, price["unit_value"])
+    units = units_for_slice(instrument, price["unit_value"]) if units is None else units
     if units == 0:
         log.info(f"{symbol}: {direction} signal, but its smallest trade is now worth more than a slice; skipping.")
+        _open_problem = "its smallest trade is worth more than a slice"
         return False
     sign = 1 if direction == "BUY" else -1
     entry = price["ask"] if sign > 0 else price["bid"]
@@ -359,12 +382,17 @@ def open_position(account_id: str, symbol: str, instrument: dict, price: dict, d
         "stopLossOnFill": {"price": f"{entry * (1 - sign * STOP_LOSS_PCT):.{digits}f}"},
         "takeProfitOnFill": {"price": f"{entry * (1 + sign * TAKE_PROFIT_PCT):.{digits}f}"},
     }
+    if tag:
+        order["clientExtensions"] = order["tradeClientExtensions"] = {"tag": "broadcast", "comment": tag}
     try:
         body = oanda("POST", f"/v3/accounts/{account_id}/orders", json={"order": order})
     except (OandaError, requests.RequestException) as e:
         log.error(f"Error submitting {direction} for {symbol}: {e}")
+        _open_problem = str(e)
         return False
     filled, outcome = fill_outcome(body, "order")
+    if not filled:
+        _open_problem = outcome
     own_trades.add(((body.get("orderFillTransaction") or {}).get("tradeOpened") or {}).get("tradeID"))
     log.info(
         f"{direction} submitted -> {symbol} units={order['units']} "
@@ -409,6 +437,62 @@ def close_before_rollover(account_id: str) -> None:
             CLOSE_REASONS[trade["id"]] = rollover.REASON
 
 
+# ---------------------------------------------------------------------------
+# STAGNANCY TIMEOUT (shared/stagnancy.py)
+# ---------------------------------------------------------------------------
+watch = None  # the timeout, set up in run_bot()
+
+
+def stagnancy_pass(account_id: str, pool: dict, currency: str) -> None:
+    """The stagnancy timeout over the trades this bot opened: one that has
+    gone nowhere for a while is logged (shadow) or closed (enforce). Its
+    slot is free once OANDA no longer lists it - the next bar's count of
+    open positions doesn't include it."""
+    now = time.time()
+    trades = [t for t in oanda("GET", f"/v3/accounts/{account_id}/openTrades").get("trades", [])
+              if t["id"] in own_trades and t["instrument"] in pool]
+    prices = fetch_prices(account_id, sorted({t["instrument"] for t in trades}), currency) if trades else {}
+    for symbol, price in prices.items():
+        watch.observe(symbol, now, price["bid"], price["ask"], price["tradeable"])
+    held = []
+    for t in trades:
+        symbol, units, entry = t["instrument"], float(t["currentUnits"]), float(t["price"])
+        price = prices.get(symbol)
+        # What it stands to lose at its stop-loss, in the account's currency.
+        stop = float(t["stopLossOrder"]["price"]) if t.get("stopLossOrder") else None
+        distance = abs(entry - stop) if stop is not None else entry * STOP_LOSS_PCT
+        risk = abs(units) * distance * price["unit_value"] / ((price["bid"] + price["ask"]) / 2) if price else None
+        held.append((stagnancy.Held(
+            key=t["id"], symbol=symbol, direction="long" if units > 0 else "short", size=abs(units), entry=entry,
+            opened_at=float(t["openTime"]), risk=risk, refs=(t["id"],),
+            # OANDA values a trade at the price it would close at (net of the spread); financing apart.
+            pnl=float(t.get("unrealizedPL") or 0) + float(t.get("financing") or 0),
+        ), bool(price and price["tradeable"])))
+    watch.run(held, now, lambda h: close_trade_now(account_id, h))
+
+
+def close_trade_now(account_id: str, held) -> dict:
+    """Close one of the bot's trades at market for the stagnancy timeout -
+    by trade ID, so another bot's trades in the market are left alone."""
+    try:
+        body = oanda("PUT", f"/v3/accounts/{account_id}/trades/{held.key}/close")
+    except (OandaError, requests.RequestException) as e:
+        # A trade its stop-loss or take-profit closed a moment before is refused
+        # here (TRADE_DOESNT_EXIST): the next pass finds it gone.
+        log.error(f"Error closing {held.symbol} trade {held.key} ({stagnancy.TIMEOUT_REASON}): {e}")
+        return {"done": False, "problem": str(e)}
+    filled, outcome = fill_outcome(body, "order")
+    log.info(f"CLOSE submitted ({stagnancy.TIMEOUT_REASON}) -> {held.symbol} trade {held.key} {held.size:g} units "
+             f"result={outcome}")
+    if not filled:
+        return {"done": False, "problem": outcome}
+    CLOSE_REASONS[held.key] = stagnancy.TIMEOUT_REASON
+    fill = body.get("orderFillTransaction") or {}
+    pnl = sum(float(c.get("realizedPL") or 0) + float(c.get("financing") or 0) for c in fill.get("tradesClosed") or ())
+    price = fill.get("fullVWAP") or fill.get("price")
+    return {"done": True, "price": float(price) if price else None, "pnl": round(pnl, 2)}
+
+
 def close_from_dashboard(account_id: str, markets: dict, symbol: str, ref, direction: str, size) -> str:
     """A close asked for on the dashboard (DASHBOARD_COMMANDS=1): the trade
     it showed as `ref` - all of it, or `size` units - if it's still open on
@@ -450,6 +534,144 @@ def close_from_dashboard(account_id: str, markets: dict, symbol: str, ref, direc
 
 
 # ---------------------------------------------------------------------------
+# BROADCAST TRADES FROM THE DASHBOARD (shared/broadcast.py)
+# ---------------------------------------------------------------------------
+guests = {}  # instrument -> OANDA's details: a broadcast trade's market outside the pool, managed but never traded
+
+
+def managed(pool: dict) -> dict:
+    """The pool, plus the markets outside it holding a broadcast trade."""
+    return {**guests, **pool}
+
+
+def reported(pool: dict) -> dict:
+    """What the dashboard reports cover: the managed markets, and those of
+    broadcast trades that have closed lately (their closed trades)."""
+    return {**{s: None for s in broadcasts.symbols()}, **managed(pool)}
+
+
+def instrument_details(account_id: str, symbol: str):
+    """OANDA's details for an instrument this account offers, or None."""
+    try:
+        found = oanda("GET", f"/v3/accounts/{account_id}/instruments", params={"instruments": symbol})
+    except (OandaError, requests.RequestException):
+        return None
+    return next(iter(found.get("instruments") or ()), None)
+
+
+def restore_guests(account_id: str, pool: dict) -> None:
+    """After a restart: look up the markets outside the pool its open broadcast trades are in."""
+    for symbol in sorted(broadcasts.open_symbols() - set(pool)):
+        details = instrument_details(account_id, symbol)
+        if details is None:
+            log.warning(f"{symbol}: couldn't look up its broadcast trade's market; OANDA still holds its stop-loss "
+                        f"and take-profit.")
+            continue
+        guests[symbol] = details
+        log.info(f"{symbol}: managing its broadcast trade (not in the pool).")
+
+
+def broadcast_plan(account_id: str, pool: dict, currency: str, request, now: float, most: float = None) -> dict:
+    """The trade this bot would make for a broadcast, every limit applied -
+    or broadcast.Declined saying why not."""
+    found = symbols.candidates("oanda", request.symbol)
+    symbol = instrument = candidate = None
+    for candidate in found:
+        symbol = candidate.code.upper()
+        instrument = pool.get(symbol) or guests.get(symbol) or instrument_details(account_id, symbol)
+        if instrument is not None:
+            break
+    if instrument is None:
+        raise broadcast.Declined(broadcast.UNAVAILABLE, f"{request.symbol} isn't available on OANDA"
+                                 + (f" (looked for {', '.join(c.code for c in found)})." if found else "."))
+    if rollover.entries_paused(now):
+        raise broadcast.Declined(broadcast.CLOSED, f"{symbol}: too near the daily rollover to open a trade.")
+    positions = fetch_positions(account_id)
+    if symbol in positions:
+        raise broadcast.Declined(broadcast.NO_SLOT, f"A {symbol} position is already open on the account (OANDA nets a "
+                                                    f"market's trades together).")
+    held = [s for s in positions if s in pool or s in guests]
+    if len(held) >= MAX_OPEN_POSITIONS:
+        raise broadcast.Declined(broadcast.NO_SLOT, f"{len(held)} positions are already open (max {MAX_OPEN_POSITIONS}).")
+    if watch is not None and watch.cooling(symbol, now):
+        raise broadcast.Declined(broadcast.RISK, f"{symbol}: the stagnancy timeout closed it lately (cooldown).")
+    price = fetch_prices(account_id, [symbol], currency).get(symbol)
+    if price is None or not price["tradeable"]:
+        raise broadcast.Declined(broadcast.CLOSED, f"{symbol}: OANDA says it isn't tradeable right now.")
+
+    exposure, capped = broadcast.exposure_for(request, TRADE_EXPOSURE, currency, "budget slice")
+    precision = int(instrument["tradeUnitsPrecision"])
+    step = 10.0 ** -precision
+    units = math.floor(exposure / price["unit_value"] / step + 1e-9) * step
+    if most is not None:
+        units = min(units, math.floor(most / step + 1e-9) * step)
+    units = round(units, precision)
+    minimum = float(instrument["minimumTradeSize"])
+    if units < minimum or units <= 0:
+        raise broadcast.Declined(broadcast.RISK, f"{symbol}: its smallest trade ({minimum:g} units) is worth about "
+                                                 f"{minimum * price['unit_value']:,.2f} {currency}, more than the "
+                                                 f"{exposure:,.2f} it may trade.")
+    sign = 1 if request.side == "buy" else -1
+    entry = price["ask"] if sign > 0 else price["bid"]
+    digits = int(instrument["displayPrecision"])
+    rule = watch.book.rule(symbol) if watch is not None else None
+    exits = (f"stop-loss {STOP_LOSS_PCT * 100:g}% / take-profit {TAKE_PROFIT_PCT * 100:g}% at OANDA; "
+             + (f"closed {rollover.FLAT_MINUTES} min before the rollover" if rollover.FLAT_MINUTES else "held overnight")
+             + ("; streak reversal" if symbol in pool else "; managed until it closes (not in the pool)")
+             + (f"; stagnancy timeout ({rule.mode})" if rule and rule.mode != "off" else ""))
+    return {"symbol": symbol, "instrument": instrument, "price": price, "units": units,
+            "direction": "BUY" if sign > 0 else "SELL", "capped": capped,
+            "figures": broadcast.figures(
+                symbol=symbol, name=instrument.get("displayName"), size=units, sizeUnit="units",
+                exposure=round(units * price["unit_value"], 2), risk=round(units * price["unit_value"] * STOP_LOSS_PCT, 2),
+                currency=currency, entry=entry, stopLoss=round(entry * (1 - sign * STOP_LOSS_PCT), digits),
+                takeProfit=round(entry * (1 + sign * TAKE_PROFIT_PCT), digits), accountMode=ACCOUNT_MODE, exits=exits,
+                capped=capped or None, standIn=candidate.canonical if candidate.stand_in else None, previewedAt=now)}
+
+
+def broadcast_preview(account_id: str, pool: dict, currency: str, command: dict) -> tuple:
+    """What this bot would do with a broadcast trade: (a line, {figures})."""
+    request = broadcast.Request.parse(command)
+    plan = broadcast_plan(account_id, pool, currency, request, time.time())
+    f = plan["figures"]
+    line = (f"Would {request.side} {f['size']:g} units of {f['symbol']} at ~{f['entry']:g}: stop-loss {f['stopLoss']:g}, "
+            f"take-profit {f['takeProfit']:g}" + (f" ({plan['capped']})" if plan["capped"] else ""))
+    log.info(f"Broadcast #{request.id}: {line}")
+    return line + ".", f
+
+
+def broadcast_open(account_id: str, pool: dict, currency: str, command: dict) -> tuple:
+    """Open a broadcast trade the admin confirmed - every limit checked again
+    on fresh prices, never bigger than previewed. (a line, {figures})."""
+    now = time.time()
+    request = broadcast.Request.parse(command)
+    broadcasts.check_new(request)
+    request.check_age(now)
+    plan = broadcast_plan(account_id, pool, currency, request, now, most=request.size)
+    symbol, instrument = plan["symbol"], plan["instrument"]
+    broadcasts.opening(request, symbol, (instrument.get("displayName"),), now)
+    before = set(own_trades.ids)
+    if not open_position(account_id, symbol, instrument, plan["price"], plan["direction"], currency,
+                         units=plan["units"], tag=f"broadcast-{request.id}"):
+        broadcasts.failed(request)
+        raise CommandError(f"OANDA didn't fill it: {_open_problem or 'see the bot log'}.")
+    refs = sorted(own_trades.ids - before)
+    broadcasts.opened(request, refs, now)
+    if symbol not in pool:
+        guests[symbol] = instrument
+        log.info(f"{symbol}: not in the pool - managing its broadcast trade until it closes, never trading it on a streak.")
+    entry = plan["figures"]["entry"]
+    verb = "Bought" if request.side == "buy" else "Sold"
+    return (f"{verb} {plan['units']:g} units of {symbol} at ~{entry:g}" + (f" (OANDA trade {refs[0]})" if refs else "")
+            + "."), {"symbol": symbol, "size": plan["units"], "price": entry, **({"ref": refs[0]} if refs else {})}
+
+
+def broadcast_symbols(pool: dict) -> list:
+    """The instrument names the dashboard can offer for this bot."""
+    return sorted(set(symbols.names("oanda")) | {symbols.canonical(s) or s for s in pool})
+
+
+# ---------------------------------------------------------------------------
 # DASHBOARD
 # ---------------------------------------------------------------------------
 CLOSE_REASONS = {}  # trade ID -> why this bot closed it; stop-loss/take-profit come from OANDA
@@ -479,6 +701,8 @@ def dashboard_trade(trade: dict) -> dict:
             pnl=float(trade.get("realizedPL") or 0) + float(trade.get("financing") or 0),
             closeReason=reason,
         )
+        if watch is not None:  # the stagnancy timeout's fields, if it closed or watched it
+            row.update(watch.fields_for(trade["id"]))
     else:
         row.update(
             size=abs(float(trade.get("currentUnits") or units)),
@@ -499,6 +723,12 @@ def report_to_dashboard(account_id: str, markets) -> None:
                               params={"state": "CLOSED", "count": 50}).get("trades", [])
     except (OandaError, requests.RequestException):
         return
+    # Broadcast trades no longer open have closed; their markets outside the pool stop being managed.
+    now = time.time()
+    broadcasts.sync({t["instrument"] for t in open_trades if t["id"] in own_trades}, now)
+    broadcasts.prune(now)
+    for symbol in set(guests) - broadcasts.open_symbols():
+        del guests[symbol]
     dashboard.update(
         account={"balance": float(summary["balance"]), "equity": float(summary["NAV"]),
                  "unrealizedPl": float(summary["unrealizedPL"])},
@@ -514,7 +744,7 @@ def trade_new_bars(account_id: str, pool: dict, new_bars: dict, positions: dict,
     """Act on the markets whose bar just closed. `new_bars` maps symbol ->
     (bar time, closes); `positions` is every open position on the account."""
     prices = fetch_prices(account_id, list(new_bars), currency)
-    held = [s for s in positions if s in pool]
+    held = [s for s in positions if s in pool or s in guests]  # a broadcast trade outside the pool holds a slot too
 
     # Reversals first, so any slot they free is available to this bar's entries.
     candidates = []
@@ -526,7 +756,9 @@ def trade_new_bars(account_id: str, pool: dict, new_bars: dict, positions: dict,
         if position is None:
             candidates.append((abs(streak_move(closes)), symbol, "BUY" if signal == "bullish" else "SELL"))
         elif (position["side"] == "short") == (signal == "bullish"):
-            if close_position(account_id, symbol, position, f"{signal} reversal"):
+            if watch is not None and watch.closing_in(symbol):
+                log.info(f"{symbol}: {signal} reversal, but its {stagnancy.TIMEOUT_REASON} close is under way.")
+            elif close_position(account_id, symbol, position, f"{signal} reversal"):
                 held.remove(symbol)
 
     # Biggest streak first, while slots last.
@@ -535,6 +767,9 @@ def trade_new_bars(account_id: str, pool: dict, new_bars: dict, positions: dict,
         if len(held) >= MAX_OPEN_POSITIONS:
             log.info(f"{symbol}: {direction} streak ({move:.2%}), but {MAX_OPEN_POSITIONS} positions "
                      f"are already open; skipping this bar.")
+        elif watch is not None and watch.cooling(symbol, time.time()):  # only with SCANNER_STAGNANT_COOLDOWN set
+            log.info(f"{symbol}: {direction} streak, but the stagnancy timeout closed it lately (cooldown); "
+                     f"skipping this bar.")
         elif price is None or not price["tradeable"]:
             log.info(f"{symbol}: {direction} streak, but OANDA says it isn't tradeable right now; skipping this bar.")
         elif open_position(account_id, symbol, pool[symbol], price, direction, currency):
@@ -585,13 +820,21 @@ def run_bot() -> None:
         f"Take-profit={TAKE_PROFIT_PCT * 100:g}% | Timeframe={TIMEFRAME}"
     )
     log.info(rollover.describe())
+    global watch
+    watch = stagnancy.start_watch("scanner", "oanda", "oanda-momentum-scanner", "OANDA", log, bar_seconds=BAR_SECONDS,
+                                  loop_seconds=LOOP_INTERVAL_SECONDS, currency=currency)
     log.info("=" * 78)
-    dashboard.describe(account=account_id, currency=currency, config={
+    dashboard.describe(account=account_id, currency=currency, account_mode=ACCOUNT_MODE, config={
         "markets": list(pool), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
         "timeframe": TIMEFRAME, "streakLength": STREAK_LENGTH, "stopLossPercent": STOP_LOSS_PCT * 100,
-        "takeProfitPercent": TAKE_PROFIT_PCT * 100,
+        "takeProfitPercent": TAKE_PROFIT_PCT * 100, **watch.book.config(),
     })
-    dashboard.accept_closes(lambda *command: close_from_dashboard(account_id, pool, *command))
+    dashboard.accept_closes(lambda *command: close_from_dashboard(account_id, managed(pool), *command))
+    restore_guests(account_id, pool)
+    dashboard.tag_rows(broadcasts.tags)
+    dashboard.accept_broadcasts(lambda command: broadcast_preview(account_id, pool, currency, command),
+                                lambda command: broadcast_open(account_id, pool, currency, command),
+                                broadcast_symbols(pool))
 
     seen_bar = None  # symbol -> start time of the latest closed bar already dealt with
     consecutive_errors = 0
@@ -599,9 +842,11 @@ def run_bot() -> None:
     while True:
         try:
             if dashboard.due():
-                report_to_dashboard(account_id, pool)
+                report_to_dashboard(account_id, reported(pool))
             if rollover.flat_due():
                 close_before_rollover(account_id)
+            if watch.book.active:
+                stagnancy_pass(account_id, managed(pool), currency)
 
             latest = {}
             for symbol in pool:
@@ -627,7 +872,7 @@ def run_bot() -> None:
             continue
 
         consecutive_errors = 0
-        dashboard.sleep(LOOP_INTERVAL_SECONDS, lambda: report_to_dashboard(account_id, pool))  # reports fall due while it waits
+        dashboard.sleep(LOOP_INTERVAL_SECONDS, lambda: report_to_dashboard(account_id, reported(pool)))  # reports fall due while it waits
 
 
 if __name__ == "__main__":

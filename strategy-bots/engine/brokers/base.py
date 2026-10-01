@@ -53,6 +53,7 @@ class Position:
     take_profit: float = None
     raw: object = None
     own: bool = None            # opened by this bot? (None: the broker can't tell - the runner's notes decide)
+    fees: float = 0.0           # costs charged so far that pnl leaves out (OANDA's financing), account currency
 
 
 @dataclass
@@ -75,6 +76,11 @@ class Broker:
     metered_history = False     # price history is rationed per bar (IG: 10,000 a week)
     dashboard_every = None      # seconds between dashboard snapshots; None = the reporter's 15
     min_poll_seconds = 1        # the scalper reads prices no more often than this (IG: its request allowance)
+    fills_on_close = True       # close() returning True means the broker filled it (Alpaca: only accepted it)
+    # "demo" or "live", from the adapter's own connection (its endpoint, or the
+    # account the broker reports) - shown on a broadcast's preview. None: unknown.
+    account_mode = None
+    size_unit = "units"         # what a size counts, as the dashboard shows it
 
     def __init__(self, settings, dashboard, log):
         self.settings = settings
@@ -82,6 +88,18 @@ class Broker:
         self.log = log
         self.close_reasons = {}  # broker trade/deal id -> why this bot closed it, for the dashboard
         self.close_problem = ""  # why the last close() failed, in a few words, for the dashboard
+        self.open_problem = ""   # why the last open() failed, in a few words, for a broadcast's answer
+        # Set by the runner around a broadcast trade's open(): a label the
+        # adapter puts on the order where its broker takes one (OANDA client
+        # extensions, the MT5 comment, Alpaca's client order ID). IG and
+        # Capital.com take none, so only the bot's state file links the two.
+        self.order_tag = None
+        # What the last close() filled at, where the broker says straight away:
+        # {"price", "pnl" (realised, net), "refs"} - for the stagnancy timeout's record.
+        self.closing_fill = None
+        # The stagnancy timeout (shared/stagnancy.py Watch), set by the runner:
+        # its extra fields go on the dashboard records of the trades it closed or watched.
+        self.stagnancy = None
         # The broker's ids for the trades this bot opened (saved by the runner),
         # so it only ever manages - and reports - its own, never another bot's
         # or a manual trade in the same market.
@@ -155,6 +173,33 @@ class Broker:
 
     def shutdown(self) -> None:
         pass
+
+    # -- the stagnancy timeout (shared/stagnancy.py) ------------------------------
+    def net_pnl(self, market: Market, position: Position, quote) -> float:
+        """The position's unrealised P/L if it closed now, in the account's
+        currency: at the price it would close at (so net of the spread),
+        less the fees charged so far. None if unknown."""
+        return None if position.pnl is None else position.pnl + position.fees
+
+    def risk_money(self, market: Market, quote, size: float, distance: float):
+        """What `size` loses over `distance` of price, in the account's currency (None if unknown)."""
+        if quote is None or not quote.unit_value or not quote.mid:
+            return None
+        return size * distance * quote.unit_value / quote.mid
+
+    def close_fill(self, market: Market):
+        """For a broker that only accepts a close (fills_on_close False): what
+        it filled at once the position has gone - {"price", "pnl", "refs"}, or None."""
+        return None
+
+    def attach_exit(self, market: Market, fields: dict) -> None:
+        """The stagnancy timeout's fields for the trade just closed in
+        `market`. Most brokers' reports pick them up by ref (exit_fields());
+        Alpaca's, whose record the bot sends itself at the close, resends it."""
+
+    def exit_fields(self, ref) -> dict:
+        """The stagnancy timeout's extra fields for the dashboard record of trade `ref` ({} if none)."""
+        return self.stagnancy.fields_for(ref) if self.stagnancy is not None else {}
 
     # -- helpers --------------------------------------------------------------
     def round_size(self, market: Market, size: float) -> float:

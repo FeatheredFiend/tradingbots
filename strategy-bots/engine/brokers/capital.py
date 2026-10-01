@@ -52,6 +52,7 @@ def _mid_price(price: dict) -> float:
 class CapitalBroker(Broker):
     key = "capital"
     name = "Capital.com"
+    account_mode = "demo" if "demo-api" in BASE_URL else "live"
 
     def __init__(self, settings, dashboard, log):
         super().__init__(settings, dashboard, log)
@@ -281,12 +282,15 @@ class CapitalBroker(Broker):
             confirmation = self._confirm(self._call("POST", "/positions", json=order)["dealReference"])
         except BrokerError as e:
             self.log.error(f"{market.symbol}: {direction} order refused: {e}")
+            self.open_problem = str(e)
             return False
         accepted, outcome = self._outcome(confirmation)
         if accepted:
             self.own_ids.update(d["dealId"] for d in confirmation.get("affectedDeals") or () if d.get("dealId"))
             if confirmation.get("dealId"):
                 self.own_ids.add(confirmation["dealId"])
+        else:
+            self.open_problem = outcome
         self.log.info(f"{direction.upper()} {market.symbol} size={size:g} stop={order['stopLevel']} "
                       f"take-profit={order.get('profitLevel', 'none')} -> {outcome}")
         return accepted
@@ -296,9 +300,14 @@ class CapitalBroker(Broker):
             self.close_problem = "Capital.com's API only closes whole positions"
             return False
         all_closed = True
+        size_filled = value_filled = 0.0
+        pnl = 0.0
         for deal_id in position.raw or ():
             try:
-                closed, outcome = self._outcome(self._confirm(self._call("DELETE", f"/positions/{deal_id}")["dealReference"]))
+                # A position its stop-loss or take-profit closed a moment before is
+                # refused here (not found): the next read shows it gone.
+                confirmation = self._confirm(self._call("DELETE", f"/positions/{deal_id}")["dealReference"])
+                closed, outcome = self._outcome(confirmation)
             except BrokerError as e:
                 self.log.error(f"{market.symbol}: close refused ({reason}): {e}")
                 self.close_problem = str(e)
@@ -307,9 +316,18 @@ class CapitalBroker(Broker):
             self.log.info(f"CLOSE {market.symbol} {position.direction} ({reason}) -> {outcome}")
             if closed:
                 self.close_reasons[deal_id] = reason
+                filled = float(confirmation.get("size") or 0)
+                size_filled += filled
+                value_filled += filled * float(confirmation.get("level") or 0)
+                # The confirmation may carry the profit; if not, the trade record
+                # gets it from the transaction history, as always.
+                profit = confirmation.get("profit")
+                pnl = None if pnl is None or profit is None else pnl + float(profit)
             else:
                 self.close_problem = outcome
             all_closed = all_closed and closed
+        if size_filled:
+            self.closing_fill = {"price": value_filled / size_filled, "pnl": None if pnl is None else round(pnl, 2)}
         return all_closed
 
     def refs(self, position: Position) -> set:
@@ -416,5 +434,6 @@ class CapitalBroker(Broker):
                 "size": size, "entryPrice": entry, "exitPrice": exit_price,
                 "openedAt": utc_seconds(history[0]["dateUTC"]) if len(history) > 1 else opening.get("openedAt"),
                 "closedAt": closed_at, "pnl": None if pnl is None else round(pnl, 2), "closeReason": reason,
+                **self.exit_fields(deal_id),  # the stagnancy timeout's, if it closed or watched it
             })
         return trades

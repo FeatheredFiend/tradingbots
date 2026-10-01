@@ -18,6 +18,11 @@ Strategy
 - Exit      : 9-period EMA crosses BELOW the 21-period EMA -> close the long
 - Risk mgmt : 2% stop-loss / 5% take-profit, attached to the order, so
               Capital.com enforces them even while the bot isn't running.
+- Stagnancy : one of its own positions (deal IDs saved in own_trades.json
+              beside it) that has gone nowhere for a while is logged
+              (shadow, the default) or closed with the reason
+              TIMEOUT_STAGNANT, freeing its slot (EMA_STAGNANT_* settings;
+              see shared/stagnancy.py).
 
 Sizing
 ------
@@ -66,6 +71,8 @@ import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
+import rollover  # noqa: E402 - needs the path above (for OwnTrades)
+import stagnancy  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -104,6 +111,7 @@ LOOP_INTERVAL_SECONDS = min(60, BAR_SECONDS // 4)  # how often to look for newly
 REQUEST_TIMEOUT_SECONDS = 20
 MIN_REQUEST_INTERVAL = 0.15    # Capital.com allows 10 requests a second
 MAX_CONSECUTIVE_ERRORS = 10
+OWN_TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "own_trades.json")
 
 assert MAX_OPEN_POSITIONS >= 1, "CAPITAL_MAX_POSITIONS must be at least 1"
 assert BUDGET > 0, "CAPITAL_BUDGET must be positive"
@@ -122,6 +130,7 @@ log = logging.getLogger("capital_ema_bot")
 # Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
 dashboard = DashboardReporter("capital-ema-bot", "Capital.com EMA crossover", broker="Capital.com",
                               strategy="EMA 9/21 crossover")
+own_trades = rollover.OwnTrades(OWN_TRADES_FILE)  # the positions this bot opened - only these get the stagnancy timeout
 
 
 # ---------------------------------------------------------------------------
@@ -423,10 +432,14 @@ def submit_buy(epic: str, market: dict, unit_value: float, currency: str) -> boo
         "profitLevel": round(entry * (1 + TAKE_PROFIT_PCT), digits),
     }
     try:
-        accepted, outcome = deal_outcome(confirm(capital("POST", "/positions", json=order)["dealReference"]))
+        confirmation = confirm(capital("POST", "/positions", json=order)["dealReference"])
     except (CapitalError, requests.RequestException) as e:
         log.error(f"Error submitting BUY for {epic}: {e}")
         return False
+    accepted, outcome = deal_outcome(confirmation)
+    if accepted:
+        # The position's deal ID is one of these (as the strategy bots' Capital.com adapter records them).
+        own_trades.add(confirmation.get("dealId"), *(d.get("dealId") for d in confirmation.get("affectedDeals") or ()))
     log.info(
         f"BUY submitted -> {epic} size={size:g} (~{size * unit_value:,.2f} {currency}) "
         f"stop={order['stopLevel']} limit={order['profitLevel']} result={outcome}"
@@ -449,6 +462,69 @@ def close_position(epic: str, position: dict, reason: str) -> bool:
             CLOSE_REASONS[deal_id] = reason
         all_closed = all_closed and closed
     return all_closed
+
+
+# ---------------------------------------------------------------------------
+# STAGNANCY TIMEOUT (shared/stagnancy.py)
+# ---------------------------------------------------------------------------
+watch = None  # the timeout, set up in run_bot()
+
+
+def stagnancy_pass(watchlist: dict, pairs: dict, currency: str) -> None:
+    """The stagnancy timeout over the positions this bot opened: one that has
+    gone nowhere for a while is logged (shadow) or closed (enforce). Its
+    slot is free once Capital.com no longer lists it - the next bar's count
+    of open positions doesn't include it."""
+    now = time.time()
+    all_items = capital("GET", "/positions").get("positions", [])
+    own_trades.keep_open(i["position"]["dealId"] for i in all_items)
+    items = [i for i in all_items if i["market"]["epic"] in watchlist and i["position"]["dealId"] in own_trades]
+    quotes = Quotes({i["market"]["epic"] for i in items}, pairs, currency) if items else None
+    held = []
+    for item in items:
+        p, epic = item["position"], item["market"]["epic"]
+        market = quotes.markets.get(epic)
+        snapshot = (market or {}).get("snapshot") or {}
+        tradeable = snapshot.get("marketStatus") == "TRADEABLE" and snapshot.get("bid") is not None
+        if tradeable:
+            watch.observe(epic, now, float(snapshot["bid"]), float(snapshot["offer"]))
+        else:
+            watch.observe(epic, now, None, None, False)
+        entry, size = float(p["level"]), float(p["size"])
+        # What it stands to lose at its stop-loss, in the account's currency.
+        distance = abs(entry - float(p["stopLevel"])) if p.get("stopLevel") is not None else entry * STOP_LOSS_PCT
+        value = quotes.unit_value(epic)
+        risk = size * distance * value / mid(market) if value and tradeable else None
+        held.append((stagnancy.Held(
+            key=p["dealId"], symbol=epic, direction="long" if p["direction"] == "BUY" else "short", size=size,
+            entry=entry, opened_at=utc_seconds(p["createdDateUTC"]), risk=risk, refs=(p["dealId"],),
+            # Capital.com values a position at the price it would close at, so net of the spread;
+            # overnight fees come off the balance instead, so aren't in it.
+            pnl=float(p.get("upl") or 0),
+        ), tradeable))
+    watch.run(held, now, close_deal_now)
+
+
+def close_deal_now(held) -> dict:
+    """Close one of the bot's positions at market for the stagnancy timeout -
+    by deal ID, so anyone else's in the market is left alone. Capital.com
+    closes whole positions only."""
+    try:
+        confirmation = confirm(capital("DELETE", f"/positions/{held.key}")["dealReference"])
+    except (CapitalError, requests.RequestException) as e:
+        # A position its stop-loss or take-profit closed a moment before is
+        # refused here (not found): the next pass finds it gone.
+        log.error(f"Error closing {held.symbol} ({stagnancy.TIMEOUT_REASON}): {e}")
+        return {"done": False, "problem": str(e)}
+    closed, outcome = deal_outcome(confirmation)
+    log.info(f"CLOSE submitted ({stagnancy.TIMEOUT_REASON}) -> {held.symbol} {held.direction} {held.size:g} "
+             f"result={outcome}")
+    if not closed:
+        return {"done": False, "problem": outcome}
+    CLOSE_REASONS[held.key] = stagnancy.TIMEOUT_REASON
+    level, profit = confirmation.get("level"), confirmation.get("profit")  # profit: if the confirmation has it
+    return {"done": True, "price": float(level) if level is not None else None,
+            "pnl": float(profit) if profit is not None else None}
 
 
 def close_from_dashboard(markets: dict, symbol: str, ref, direction: str, size) -> str:
@@ -595,6 +671,7 @@ def closed_trades(markets, open_ids: set, quotes_rates: dict) -> list:
             "closedAt": closed_at,
             "pnl": pnl,
             "closeReason": reason,
+            **(watch.fields_for(deal_id) if watch is not None else {}),  # the stagnancy timeout's, if any
         })
     return trades
 
@@ -653,12 +730,17 @@ def trade_new_bars(watchlist: dict, pairs: dict, new_bars: dict, currency: str) 
             elif len(held) >= MAX_OPEN_POSITIONS:
                 log.info(f"{epic}: bullish crossover, but {MAX_OPEN_POSITIONS} positions are already open; "
                          f"skipping buy.")
+            elif watch is not None and watch.cooling(epic, time.time()):  # only with EMA_STAGNANT_COOLDOWN set
+                log.info(f"{epic}: bullish crossover, but the stagnancy timeout closed it lately (cooldown); "
+                         f"skipping buy.")
             elif market is None or value is None or market["snapshot"].get("marketStatus") != "TRADEABLE":
                 log.info(f"{epic}: bullish crossover, but Capital.com says it isn't tradeable right now; skipping buy.")
             elif submit_buy(epic, market, value, currency):
                 held.append(epic)
         elif signal == "bearish" and position is not None and position["side"] == "long":
-            if close_position(epic, position, "EMA bearish crossover"):
+            if watch is not None and watch.closing_in(epic):
+                log.info(f"{epic}: bearish crossover, but its {stagnancy.TIMEOUT_REASON} close is under way.")
+            elif close_position(epic, position, "EMA bearish crossover"):
                 held.remove(epic)
     return quotes.rates
 
@@ -697,11 +779,14 @@ def run_bot() -> None:
         f"Stop-loss={STOP_LOSS_PCT:.0%} | Take-profit={TAKE_PROFIT_PCT:.0%} | "
         f"Timeframe={TIMEFRAME} | EMA periods={EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}"
     )
+    global watch
+    watch = stagnancy.start_watch("ema", "capital", "capital-ema-bot", "Capital.com", log, bar_seconds=BAR_SECONDS,
+                                  loop_seconds=LOOP_INTERVAL_SECONDS, currency=currency)
     log.info("=" * 78)
     dashboard.describe(account=account["id"], currency=currency, config={
         "watchlist": list(watchlist), "budget": BUDGET, "maxPositions": MAX_OPEN_POSITIONS,
         "timeframe": TIMEFRAME, "emaPeriods": f"{EMA_SHORT_PERIOD}/{EMA_LONG_PERIOD}",
-        "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
+        "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100, **watch.book.config(),
     })
     dashboard.accept_closes(lambda *command: close_from_dashboard(watchlist, *command))
 
@@ -712,6 +797,8 @@ def run_bot() -> None:
         try:
             if dashboard.due():
                 report_to_dashboard(watchlist, rates)
+            if watch.book.active:
+                stagnancy_pass(watchlist, pairs, currency)
 
             latest = {}
             for epic in watchlist:

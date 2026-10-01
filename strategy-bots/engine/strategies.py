@@ -75,6 +75,20 @@ on 15-minute bars. This one holds overnight, so it watches the swap.
 - Swap: an entry is skipped when the broker's overnight financing for
   that direction costs more than MAX_SWAP_PERCENT (0.05%) of the trade's
   value per night.
+
+Broadcast trades
+----------------
+A broadcast trade from the dashboard (shared/broadcast.py) overrides the
+signal and nothing else: manual_signal() gives it the stop-loss and
+take-profit the strategy would give its own trade in that direction now,
+and every exit applies to it as usual. It skips when they can't be placed:
+- breakout: stop STOP_RANGE_FRACTION of today's range from the entry -
+  skipped until today's range is complete;
+- reversion: stop STOP_ATR x ATR, take-profit the session VWAP - skipped
+  outside the cash session, or when the price is already past the VWAP;
+- trend: stop STOP_ATR x ATR, take-profit REWARD_RISK x that;
+- scalper (engine/scalper.py): stop STOP_SPREADS x the usual spread,
+  take-profit TAKE_PROFIT_SPREADS x it.
 """
 
 import re
@@ -104,6 +118,16 @@ class Assessment:
     note: str = ""                 # the market's state, for the log
 
 
+class Skip(Exception):
+    """Why a trade can't go ahead: `why` in plain words, `kind` sorting it
+    for a broadcast's answer (shared/broadcast.py's kinds: "unavailable",
+    "no-slot", "closed", "risk", "paused", "other")."""
+
+    def __init__(self, kind: str, why: str):
+        super().__init__(why)
+        self.kind, self.why = kind, why
+
+
 def _fmt(price: float) -> str:
     return f"{price:.5g}" if abs(price) < 1000 else f"{price:,.1f}"
 
@@ -116,6 +140,7 @@ class Strategy:
     # True: the bot closes at its own stop-loss / take-profit, checked on every
     # pass, because the broker's may sit further out (at its minimum distance).
     checks_own_levels = False
+    takes_broadcasts = False     # True: it can place a broadcast trade's levels - manual_signal()
 
     def __init__(self, params: dict):
         self.p = params
@@ -149,6 +174,17 @@ class Strategy:
         """The day MAX_TRADES_PER_DAY counts trades in."""
         return clock.local_date("london", now).isoformat()
 
+    def manual_signal(self, market, bars: dict, quote, direction: str, now: float) -> Signal:
+        """The stop-loss and take-profit this strategy would give a trade in
+        `direction` opened now at `quote` - a broadcast trade, which
+        overrides the signal but nothing else. Raises Skip when it can't
+        place them now."""
+        raise Skip("other", "this kind of bot doesn't take broadcast trades")
+
+    def exits(self) -> str:
+        """How its trades end, in a few words - for a broadcast's preview."""
+        return ""
+
     def summary(self) -> str:
         raise NotImplementedError
 
@@ -158,6 +194,7 @@ class Strategy:
 # ---------------------------------------------------------------------------
 class SessionBreakout(Strategy):
     key = "session-breakout"
+    takes_broadcasts = True
 
     def __init__(self, params: dict):
         super().__init__(params)
@@ -245,6 +282,27 @@ class SessionBreakout(Strategy):
             return f"{self.p['flat_time']} London flat time - never held past the rollover, so no swap"
         return None
 
+    def manual_signal(self, market, bars: dict, quote, direction: str, now: float) -> Signal:
+        """The stop STOP_RANGE_FRACTION of today's range from the entry - as
+        far as its own trades' stop is from the edge they broke."""
+        p, tf = self.p, self.bar_seconds
+        day = clock.local_date("london", now)
+        range_start, range_end = clock.at("london", day, self.range_start), clock.at("london", day, self.range_end)
+        name = f"today's {p['range_start']}-{p['range_end']} London range"
+        if now < range_end:
+            raise Skip("closed", f"{name} isn't complete yet, and its stop-loss comes from it")
+        range_bars = [b for b in bars.get("exec") or () if range_start <= b.time and b.time + tf <= range_end]
+        if len(range_bars) < 0.8 * (range_end - range_start) / tf:
+            raise Skip("closed", f"only {len(range_bars)} bars of {name}, and its stop-loss comes from it")
+        width = max(b.high for b in range_bars) - min(b.low for b in range_bars)
+        sign = 1 if direction == "long" else -1
+        entry = quote.ask if sign > 0 else quote.bid
+        return Signal(direction, stop=entry - sign * p["stop_range_fraction"] * width, reward_risk=p["reward_risk"],
+                      why=f"broadcast {direction}: stop {p['stop_range_fraction']:g} of {name} ({_fmt(width)}) away")
+
+    def exits(self) -> str:
+        return f"take-profit {self.p['reward_risk']:g}R; flat at {self.p['flat_time']} London"
+
     def summary(self) -> str:
         p = self.p
         return (f"Range {p['range_start']}-{p['range_end']} London, entries to {p['entry_end']}, flat at "
@@ -275,6 +333,7 @@ def guess_session(*names: str):
 
 class IndexReversion(Strategy):
     key = "index-reversion"
+    takes_broadcasts = True
 
     def feeds(self) -> dict:
         # The previous day's bars too, so RSI and ADX are warmed up at the open.
@@ -385,6 +444,35 @@ class IndexReversion(Strategy):
     def trade_day(self, market, now: float) -> str:
         return clock.local_date(market.session.zone, now).isoformat()
 
+    def manual_signal(self, market, bars: dict, quote, direction: str, now: float) -> Signal:
+        """The stop STOP_ATR x ATR away, the take-profit the session's VWAP -
+        which must still lie ahead of the price, or its own exit would close
+        the trade at once."""
+        p = self.p
+        series = bars.get("exec") or []
+        session = self._session_bars(market, series, now) if market.session.bounds_at(now) else None
+        if session is None:
+            raise Skip("closed", f"outside the {market.session.name}")
+        if not session[2]:
+            raise Skip("closed", f"no bar of the {market.session.name} has closed yet - its take-profit is the "
+                                 f"session's VWAP")
+        atr_now = last(atr(series, ATR_PERIOD))
+        if atr_now is None:
+            raise Skip("other", f"not enough bars yet for ATR{ATR_PERIOD} ({len(series)})")
+        vwap = session_vwap(session[2])[0][-1]
+        sign = 1 if direction == "long" else -1
+        entry = quote.ask if sign > 0 else quote.bid
+        if (vwap - entry) * sign <= 0:
+            raise Skip("other", f"the price {_fmt(entry)} is already {'above' if sign > 0 else 'below'} the session "
+                                f"VWAP {_fmt(vwap)}, its take-profit - its own exit would close it straight away")
+        return Signal(direction, stop=entry - sign * p["stop_atr"] * atr_now, take_profit=vwap,
+                      why=f"broadcast {direction}: stop {p['stop_atr']:g} ATR, take-profit the session VWAP")
+
+    def exits(self) -> str:
+        p = self.p
+        return (f"take-profit the session VWAP; out at a VWAP touch, after {p['max_hold_bars']} bars, or "
+                f"{p['flat_minutes']} min before the cash close")
+
     def summary(self) -> str:
         p = self.p
         return (f"VWAP +/- {p['band_stdev']:g} sigma | RSI{p['rsi_period']} {p['rsi_oversold']:g}/"
@@ -401,6 +489,7 @@ class IndexReversion(Strategy):
 class CommodityTrend(Strategy):
     key = "commodity-trend"
     holds_overnight = True
+    takes_broadcasts = True
 
     def __init__(self, params: dict):
         super().__init__(params)
@@ -503,6 +592,24 @@ class CommodityTrend(Strategy):
         if p["weekend_flat"] and london_now.weekday() == 4 and london_now.hour >= 20:
             return "Friday 20:00 London - flat for the weekend (no weekend swap or gap)"
         return None
+
+    def manual_signal(self, market, bars: dict, quote, direction: str, now: float) -> Signal:
+        """The stop STOP_ATR x the ATR of its entry bars, the take-profit REWARD_RISK x that."""
+        p = self.p
+        series = bars.get("exec") or []
+        atr_now = last(atr(series, ATR_PERIOD))
+        if atr_now is None:
+            raise Skip("other", f"not enough {self.timeframe} bars yet for ATR{ATR_PERIOD} ({len(series)})")
+        sign = 1 if direction == "long" else -1
+        entry = quote.ask if sign > 0 else quote.bid
+        return Signal(direction, stop=entry - sign * p["stop_atr"] * atr_now, reward_risk=p["reward_risk"] or None,
+                      why=f"broadcast {direction}: stop {p['stop_atr']:g} x the {self.timeframe} ATR")
+
+    def exits(self) -> str:
+        p = self.p
+        take_profit = f"take-profit {p['reward_risk']:g}R" if p["reward_risk"] else "no take-profit"
+        return (f"{take_profit}; {p['trail_atr']:g} ATR trailing stop, {self.higher_timeframe} EMA{p['htf_slow_ema']} "
+                f"break, {p['max_hold_days']:g} days at most" + (", Friday 20:00 London flat" if p["weekend_flat"] else ""))
 
     def summary(self) -> str:
         p = self.p

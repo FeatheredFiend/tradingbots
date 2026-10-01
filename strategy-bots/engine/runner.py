@@ -38,6 +38,23 @@ restart carries on where it stopped.
 With DASHBOARD_COMMANDS=1, the dashboard can close (part of) the bot's own
 positions too - see close_from_dashboard().
 
+With DASHBOARD_BROADCAST=1, it takes broadcast trades from the dashboard
+(shared/broadcast.py): the admin's instrument and side, the strategy's own
+stop-loss and take-profit for it (Strategy.manual_signal()), and every one
+of the rules above - entry() is the one place they're applied, to the
+strategy's signals and broadcasts alike - except the strategy's signal
+filters. A broadcast in a market outside the bot's list makes it a "guest":
+watched for that trade's exits (bars, stop-loss / take-profit, time stops,
+the stagnancy timeout), never traded by the strategy, and dropped once the
+trade has closed. Its notes say so, so a restart looks it up again.
+
+The stagnancy timeout (shared/stagnancy.py) looks at every position on
+every pass, after the strategy's own exits: one that has gone nowhere for a
+while is logged (shadow mode, the default) or closed with the reason
+TIMEOUT_STAGNANT (enforce), freeing its slot. Its notes are saved with the
+rest, so a restart doesn't close anything twice. A position's slot is only
+ever freed in release() - once.
+
 The tick scalper (engine/scalper.py) has no bars: every SCALPER_POLL_SECONDS
 the runner reads every market's price, hands it to the strategy, checks the
 scalper's own stop-loss / take-profit (the broker's may sit further out, at
@@ -61,14 +78,19 @@ import math
 import os
 import sys
 import time
+from dataclasses import dataclass
 
 from . import clock
-from .brokers.base import BrokerError, Quote
+from .brokers.base import BrokerError, Position, Quote
+from .indicators import atr, last
 from .settings import BROKER_NAMES, REBALANCERS, STRATEGY_NAMES, TIMEFRAMES, SettingsError, bot_settings
-from .strategies import make_strategy
+from .strategies import ATR_PERIOD, Skip, make_strategy
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "shared"))
 from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
+import broadcast  # noqa: E402 - needs the path above
+import stagnancy  # noqa: E402 - needs the path above
+import symbols  # noqa: E402 - needs the path above
 
 STATE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state")
 LOOP_SECONDS = 30
@@ -85,6 +107,24 @@ STATUS_EVERY_SECONDS = 300       # the scalper logs each market's state this oft
 # later, not at the next 15-second snapshot: soon, then again once the
 # broker's history lists the close with its profit.
 TRADE_REPORT_DELAYS = (1, 8)
+ROLLOVER_SKIP = "too close to the daily rollover (spreads widen)"
+PREVIEWED_SECONDS = 300          # a guest market looked up for a broadcast's preview is kept this long for its open
+GUEST_REPORT_SECONDS = 3600      # a guest market's closed trade is still reported this long after it closes
+
+
+@dataclass
+class Entry:
+    """A trade that passed every entry rule, sized - see StrategyBot.entry()."""
+    direction: str
+    price: float                 # the price it would fill at now: the ask to buy, the bid to sell
+    stop: float
+    take_profit: float           # None: no take-profit
+    distance: float              # from the price to the stop
+    size: float
+    sizing: str                  # how the size was worked out, for the log
+    capped: str = ""             # a broadcast's quantity, cut to the bot's limits - why, else ""
+    exposure: float = None       # what it's worth, in the account's currency
+    risk: float = None           # what it loses at its stop, in the account's currency
 
 
 def make_broker(key: str, settings, dashboard, log):
@@ -157,11 +197,15 @@ class State:
         self.positions = {}   # symbol -> notes on the bot's open position
         self.trades = {}      # symbol -> {"day": ..., "count": ...}
         self.own_ids = []     # the broker's ids for every trade this bot opened
+        self.stagnancy = {}   # the stagnancy timeout's notes (shared/stagnancy.py Watch)
+        self.broadcasts = {}  # the broadcasts it acted on and the trades they opened (shared/broadcast.py Book)
         try:
             with open(self.path, encoding="utf-8") as f:
                 saved = json.load(f)
             self.positions, self.trades = saved.get("positions", {}), saved.get("trades", {})
             self.own_ids = saved.get("own_ids", [])
+            self.stagnancy = saved.get("stagnancy") or {}
+            self.broadcasts = saved.get("broadcasts") or {}
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as e:
@@ -171,7 +215,8 @@ class State:
         try:
             os.makedirs(STATE_DIR, exist_ok=True)
             with open(self.path + ".tmp", "w", encoding="utf-8") as f:
-                json.dump({"positions": self.positions, "trades": self.trades, "own_ids": self.own_ids}, f, indent=1)
+                json.dump({"positions": self.positions, "trades": self.trades, "own_ids": self.own_ids,
+                           "stagnancy": self.stagnancy, "broadcasts": self.broadcasts}, f, indent=1)
             os.replace(self.path + ".tmp", self.path)
         except OSError as e:
             self.log.warning(f"Couldn't save {self.path}: {e}")
@@ -210,12 +255,33 @@ class StrategyBot:
         self.quiet_until = {}    # symbol -> no new price signals there before this time (the scalper's cooldown)
         self.status = {}         # symbol -> the latest read's state, logged every STATUS_EVERY_SECONDS
         self.next_status = 0.0
+        # Broadcast trades from the dashboard (shared/broadcast.py).
+        self.broadcasts = broadcast.Book(self.state.broadcasts, save=self.state.save)
+        self.guests = set()      # markets held only for a broadcast trade: watched for its exits, never traded
+        self.previewed = {}      # code -> (Market, {role: Feed}, when) - a guest looked up for a broadcast's preview
+        self.left_guests = {}    # symbol -> (Market, until) - a guest whose trade closed, still reported a while
+        # The stagnancy timeout - none for the portfolio bots. The bar strategies
+        # hand it their own bars (a "4bars" window, ATR); the scalper and the
+        # surge followers their price reads.
+        try:
+            book = stagnancy.RuleBook.for_bot(settings.strategy, settings.broker,
+                                              bar_seconds=getattr(strategy, "bar_seconds", None),
+                                              has_bars=not (strategy.uses_prices or strategy.uses_signals))
+        except stagnancy.ConfigError as e:
+            raise SettingsError(str(e)) from None
+        self.watch = None
+        if book is not None:
+            self.watch = stagnancy.Watch(book, settings.slug, broker.name, log, gap=max(3 * self.loop_seconds, 30),
+                                         dry_run=settings.dry_run, store=self.state.stagnancy)
+            broker.stagnancy = self.watch
 
     # -- startup --------------------------------------------------------------------
     def start(self) -> None:
         s, log = self.settings, self.log
         account = self.broker.connect()
         self.currency = account.currency
+        if self.watch is not None:
+            self.watch.currency = self.currency
 
         names, hints = [], {}
         for entry in s.markets:
@@ -230,6 +296,7 @@ class StrategyBot:
         self.markets = self.check_sizes(markets)
         if not self.markets:
             raise BrokerError(f"none of the markets ({', '.join(s.markets)}) can be traded - see above")
+        self.restore_guests()
 
         log.info("=" * 78)
         log.info(f"{s.name} starting - DEMO / PRACTICE ACCOUNT ONLY" + (" - DRY RUN, NO ORDERS" if s.dry_run else ""))
@@ -245,6 +312,8 @@ class StrategyBot:
                      f"max {s.max_positions} positions ({self.slice_cap():,.2f} each) | spread max "
                      f"{self.p['max_spread_percent']:g}% of the stop")
         log.info(self.strategy.summary())
+        if self.watch is not None:
+            log.info(self.watch.book.describe(self.currency))
         log.info(f"Markets: {', '.join(self.markets)}")
         for symbol, market in self.markets.items():
             swaps = [self.broker.swap_percent_per_night(market, d) for d in ("long", "short")]
@@ -261,7 +330,10 @@ class StrategyBot:
         config.update({k: v for k, v in self.p.items() if k not in ("risk_percent", "max_leverage", "max_spread_percent")})
         if getattr(self.broker, "magic", None):
             config["magicNumber"] = self.broker.magic
-        self.dashboard.describe(account=account.id, currency=self.currency, config=config)
+        if self.watch is not None:
+            config.update(self.watch.book.config())
+        self.dashboard.describe(account=account.id, currency=self.currency, config=config,
+                                account_mode=self.broker.account_mode)
 
         if not self.strategy.uses_prices:
             for symbol, market in self.markets.items():
@@ -271,6 +343,11 @@ class StrategyBot:
         self.refresh_feeds(self.started_at)
         self.seen = {s: (f["exec"].bars[-1].time if f["exec"].bars else 0.0) for s, f in self.feeds.items()}
         self.dashboard.accept_closes(self.close_from_dashboard)
+        self.dashboard.tag_rows(self.broadcasts.tags)
+        if self.strategy.takes_broadcasts:
+            self.dashboard.accept_broadcasts(self.broadcast_preview, self.broadcast_open, self.broadcast_symbols())
+        else:
+            self.dashboard.broadcast_off(f"A {STRATEGY_NAMES[s.strategy].lower()} bot doesn't take broadcast trades.")
         if self.strategy.uses_prices:
             log.info(f"Reading prices every {self.loop_seconds:g}s; trading starts once each market has "
                      f"{self.p['window_seconds']}s of them.")
@@ -303,6 +380,36 @@ class StrategyBot:
             usable[symbol] = market
         return usable
 
+    def restore_guests(self) -> None:
+        """After a restart: the markets outside the bot's list it holds a
+        broadcast trade in, looked up again so the trade is still managed."""
+        wanted = {notes["guest"]: symbol for symbol, notes in self.state.positions.items()
+                  if notes.get("guest") and symbol not in self.markets}
+        if not wanted:
+            return
+        try:
+            found = self.strategy.prepare(self.broker.resolve(list(wanted)), self.log)
+        except BrokerError as e:
+            self.log.warning(f"Couldn't look up the markets of its broadcast trades ({e}).")
+            found = {}
+        for symbol, market in found.items():
+            self.markets[symbol] = market
+            self.guests.add(symbol)
+            self.log.info(f"{symbol}: managing the broadcast trade the bot holds in it (not one of its own markets).")
+        for symbol in set(wanted.values()) - set(found):
+            self.log.warning(f"{symbol}: couldn't look its market up again, so its broadcast trade is left as it is at "
+                             f"{self.broker.name}, its stop-loss and take-profit there. It's tried again at the next "
+                             f"restart.")
+
+    def broadcast_symbols(self) -> list:
+        """The instrument names the dashboard can offer for this bot: the
+        symbol map's for its broker, and its own markets'."""
+        names = set(symbols.names(self.settings.broker))
+        for symbol, market in self.markets.items():
+            if symbol not in self.guests:
+                names.add(symbols.canonical(market.requested.split(":")[0]) or symbols.canonical(symbol) or symbol)
+        return sorted(names)
+
     # -- the loop -------------------------------------------------------------------
     def run(self) -> None:
         self.start()
@@ -326,9 +433,14 @@ class StrategyBot:
 
     def report(self) -> None:
         """Account, positions and trades for the dashboard - when due, which
-        can be in the middle of the wait between passes."""
+        can be in the middle of the wait between passes. A guest market whose
+        broadcast trade has just closed is still included for a while, as
+        some brokers list a closed trade only by its market."""
+        now = time.time()
+        self.left_guests = {s: (m, until) for s, (m, until) in self.left_guests.items() if until > now}
+        markets = {**{s: m for s, (m, _) in self.left_guests.items()}, **self.markets}
         try:
-            self.broker.report(self.markets, self.state.positions)
+            self.broker.report(markets, self.state.positions)
         except Exception as e:
             self.log.warning(f"Couldn't report to the dashboard this time: {e}")
 
@@ -415,10 +527,49 @@ class StrategyBot:
                                f"{self.broker.close_problem or 'see the bot log for why'}.")
         if size is not None:
             return f"Closed {size:g} of the {symbol} {direction} position ({position.size:g}) at {self.broker.name}."
-        self.state.positions.pop(market.symbol, None)
-        self.state.save()
-        self.close_retry_at.pop(market.symbol, None)
+        self.release(market.symbol, time.time())
         return f"Closed the {symbol} {direction} position ({position.size:g}) at {self.broker.name}."
+
+    def release(self, symbol: str, now: float, fields: dict = None) -> bool:
+        """Free a position's slot once its close is confirmed, or it has gone
+        from the broker: forget its notes, and pass the stagnancy timeout's
+        fields for its trade record to the broker's report. The one place a
+        slot is freed; False if it already was, so a close confirmed twice
+        frees one slot."""
+        notes = self.state.positions.pop(symbol, None)
+        if notes is None:
+            return False
+        if self.watch is not None:
+            if fields is None:
+                market = self.markets.get(symbol)
+                fill = self.broker.close_fill(market) if self.watch.sent(symbol) and market is not None else None
+                fields = self.watch.gone(symbol, now, **(fill or {}))
+            if fields and symbol in self.markets:
+                self.broker.attach_exit(self.markets[symbol], fields)
+        self.close_retry_at.pop(symbol, None)
+        if notes.get("broadcast") is not None:
+            self.broadcasts.closed(symbol, now)
+        if symbol in self.guests:
+            self.drop_guest(symbol, now)
+        self.save_state()
+        self.dashboard.report_soon(*TRADE_REPORT_DELAYS)
+        return True
+
+    def drop_guest(self, symbol: str, now: float) -> None:
+        """A guest market's broadcast trade has closed: stop watching it."""
+        self.guests.discard(symbol)
+        market = self.markets.pop(symbol, None)
+        for held in (self.feeds, self.seen, self.status, self.quiet_until):
+            held.pop(symbol, None)
+        if market is not None:
+            self.left_guests[symbol] = (market, now + GUEST_REPORT_SECONDS)
+        self.log.info(f"{symbol}: its broadcast trade has closed, and it isn't one of the bot's markets - no longer "
+                      f"watching it.")
+
+    def save_state(self) -> None:
+        self.state.save()
+        if self.watch is not None:
+            self.watch.changed = False
 
     def reconcile(self, own: dict, others: dict, now: float) -> None:
         """Match the saved notes to what's really open."""
@@ -426,13 +577,18 @@ class StrategyBot:
         for symbol in list(self.state.positions):
             if symbol not in own:
                 notes = self.state.positions[symbol]
-                if now - (notes.get("opened_at") or 0) < FILL_GRACE_SECONDS:
+                if notes.get("guest") and symbol not in self.markets:
+                    continue  # a broadcast trade whose market couldn't be looked up again: unseen, not closed
+                seen = self.watch is not None and symbol in self.watch.marks  # it has shown up open before
+                if not seen and now - (notes.get("opened_at") or 0) < FILL_GRACE_SECONDS:
                     continue  # just opened - Alpaca fills a moment after accepting the order
-                del self.state.positions[symbol]
-                changed = True
-                self.log.info(f"{symbol}: the bot's {notes.get('direction', '')} position has closed - by its "
-                              f"stop-loss or take-profit at {self.broker.name}, or by hand.")
-                self.dashboard.report_soon(*TRADE_REPORT_DELAYS)
+                if self.watch is None or not self.watch.closing(symbol):  # else the timeout says what happened
+                    self.log.info(f"{symbol}: the bot's {notes.get('direction', '')} position has closed - by its "
+                                  f"stop-loss or take-profit at {self.broker.name}, or by hand.")
+                self.release(symbol, now)
+        if self.watch is not None:  # the timeout's notes on positions whose own notes were lost
+            for symbol in [s for s in self.watch.marks if s not in own and s not in self.state.positions]:
+                self.watch.gone(symbol, now)
         for symbol, position in own.items():
             notes = self.state.positions.get(symbol)
             if notes is None or notes.get("direction") != position.direction:  # e.g. the notes file was lost
@@ -450,23 +606,91 @@ class StrategyBot:
         for symbol in self.others - set(others):
             self.log.info(f"{symbol}: the other position has closed - {symbol} can be traded again.")
         self.others = set(others)
-        if changed:
-            self.state.save()
+        if changed or (self.watch is not None and self.watch.changed):
+            self.save_state()
 
     def time_exits(self, positions: dict, now: float, quotes: dict = None) -> None:
         # The scalper and the surge follower check their own stop-loss /
         # take-profit on every pass too: the broker's may sit further out, at
         # its minimum distance.
         check_levels = not self.broker.native_stops or self.strategy.checks_own_levels
-        if positions and check_levels and quotes is None:
+        # The stagnancy timeout needs price reads for a window counted in time,
+        # and a live price to close at.
+        watching = self.watch is not None and bool(positions) and (
+            self.watch.book.needs_reads or any(self.watch.closing(s) for s in positions))
+        if positions and (check_levels or watching) and quotes is None:
             quotes = self.broker.quotes([self.markets[s] for s in positions])
+        if self.watch is not None and quotes is not None:
+            for symbol in positions:
+                quote = quotes.get(symbol)
+                self.watch.observe(symbol, now, quote.bid if quote else None, quote.ask if quote else None,
+                                   quote.tradeable if quote else False)
         for symbol, position in list(positions.items()):
             market, notes = self.markets[symbol], self.state.positions.get(symbol, {})
+            if self.watch is not None and self.watch.closing(symbol):
+                # The timeout's close is under way: nothing else closes it meanwhile.
+                if self.stagnancy_exit(market, position, notes, quotes, now):
+                    del positions[symbol]
+                continue
             reason = self.strategy.exit_on_time(market, position, notes, now)
             if not reason and check_levels:
                 reason = self.bot_side_stop(position, notes, quotes.get(symbol))
-            if reason and self.close(market, position, reason, now):
+            if reason:
+                if self.close(market, position, reason, now):
+                    del positions[symbol]
+                continue
+            if self.watch is not None and self.stagnancy_exit(market, position, notes, quotes, now):
                 del positions[symbol]
+        if self.watch is not None:
+            self.watch.prune(now)
+            if self.watch.changed:
+                self.save_state()
+
+    def stagnancy_exit(self, market, position, notes: dict, quotes, now: float) -> bool:
+        """The stagnancy timeout's look at one of the bot's positions. True if
+        it closed it and the broker confirmed it - the slot is free."""
+        watch, symbol = self.watch, market.symbol
+        quote = (quotes or {}).get(symbol)
+        rule = watch.book.rule(symbol, (market.name, market.requested))
+        bars = self.feeds[symbol]["exec"].bars if symbol in self.feeds else None
+        atr_now = last(atr(bars, ATR_PERIOD)) if bars and rule.range.unit == "atr" else None
+        held = self.held(market, position, notes, quote, rule)
+        live = quote is not None and quote.tradeable
+        if not watch.assess(held, now, mid=quote.mid if live else None,
+                            tradeable=quote.tradeable if quote is not None else True, bars=bars, atr=atr_now):
+            return False
+        if self.settings.dry_run:
+            return False
+        if not live:
+            quote = self.broker.quotes([market]).get(symbol)  # the mid just before the close, for its slippage
+        self.broker.close_problem, self.broker.closing_fill = "", None
+        done = self.broker.close(market, position, stagnancy.TIMEOUT_REASON)
+        fill = self.broker.closing_fill or {}
+        fields = watch.closed(held, now, done, filled=self.broker.fills_on_close, price=fill.get("price"),
+                              pnl=fill.get("pnl"), refs=fill.get("refs", ()),
+                              mid=quote.mid if quote is not None and quote.tradeable else None,
+                              problem=self.broker.close_problem)
+        if fields is None:
+            if watch.changed:
+                self.save_state()
+            return False
+        self.release(symbol, now, fields)
+        return True
+
+    def held(self, market, position, notes: dict, quote, rule) -> "stagnancy.Held":
+        """One of the bot's positions, as the stagnancy timeout sees it."""
+        risk = notes.get("risk")
+        if risk is None and rule.pnl.unit == "R" and notes.get("stop") is not None and notes.get("entry"):
+            # Opened before the bot noted what it risked: worked out once, from its notes.
+            quote = quote or self.broker.quotes([market]).get(market.symbol)
+            risk = self.broker.risk_money(market, quote, position.size, abs(notes["entry"] - notes["stop"])) or 0.0
+            notes["risk"] = risk
+            self.state.save()
+        return stagnancy.Held(
+            key=market.symbol, symbol=market.symbol, direction=position.direction, size=position.size,
+            entry=position.entry, opened_at=notes.get("opened_at") or position.opened_at,
+            pnl=self.broker.net_pnl(market, position, quote), risk=risk,
+            refs=tuple(sorted(str(r) for r in self.broker.refs(position))), aliases=(market.name, market.requested))
 
     @staticmethod
     def bot_side_stop(position, notes: dict, quote):
@@ -492,10 +716,7 @@ class StrategyBot:
             self.close_retry_at[market.symbol] = now + retry
             return False
         if self.broker.close(market, position, reason):
-            self.state.positions.pop(market.symbol, None)
-            self.state.save()
-            self.close_retry_at.pop(market.symbol, None)
-            self.dashboard.report_soon(*TRADE_REPORT_DELAYS)
+            self.release(market.symbol, now)
             return True
         self.close_retry_at[market.symbol] = now + retry
         self.log.warning(f"{market.symbol}: will try closing again in {retry}s.")
@@ -504,6 +725,8 @@ class StrategyBot:
     def on_new_bars(self, symbols: list, positions: dict, others: dict, now: float) -> None:
         signals = []
         for symbol in symbols:
+            if symbol not in self.markets:
+                continue  # a guest market dropped this pass, its broadcast trade closed
             market = self.markets[symbol]
             bars = {role: feed.bars for role, feed in self.feeds[symbol].items()}
             closed_at = clock.local("london", bars["exec"][-1].time + self.strategy.bar_seconds).strftime("%a %H:%M")
@@ -511,6 +734,9 @@ class StrategyBot:
                 self.log.info(f"[{closed_at} London] {symbol} | not trading it - someone else's position is open")
                 continue
             position = positions.get(symbol)
+            if position is not None and self.watch is not None and self.watch.closing(symbol):
+                self.log.info(f"[{closed_at} London] {symbol} | closing it ({stagnancy.TIMEOUT_REASON})")
+                continue
             if position is not None:
                 notes = self.state.positions.setdefault(symbol, {})
                 reason = self.strategy.exit_on_bar(market, bars, position, notes, now)
@@ -521,6 +747,8 @@ class StrategyBot:
                 if reason and self.close(market, position, reason, now):
                     del positions[symbol]
                 continue
+            if symbol in self.guests:
+                continue  # watched for its broadcast trade only - never traded by the strategy
             assessment = self.strategy.assess(market, bars, now)
             self.log.info(f"[{closed_at} London] {symbol} | {assessment.note}")
             if assessment.signal is not None:
@@ -548,6 +776,8 @@ class StrategyBot:
                 pnl = f", P/L {position.pnl:+.2f}" if position.pnl is not None else ""
                 self.status[symbol] = f"holding {position.direction} {position.size:g} @ {position.entry:g}{pnl}"
                 continue
+            if symbol in self.guests:
+                continue  # watched for its broadcast trade only - never traded by the strategy
             if symbol in others:
                 self.status[symbol] = "not trading it - someone else's position is open"
                 continue
@@ -576,83 +806,107 @@ class StrategyBot:
 
     # -- entries ------------------------------------------------------------------------
     def enter(self, signals: list, positions: dict, now: float, quotes: dict = None) -> None:
-        s, p, log = self.settings, self.p, self.log
+        log = self.log
         if clock.near_rollover(now, *ROLLOVER_QUIET):
             for _, symbol, signal in signals:
-                log.info(f"{symbol}: {signal.direction} signal skipped - too close to the daily rollover (spreads widen).")
+                log.info(f"{symbol}: {signal.direction} signal skipped - {ROLLOVER_SKIP}.")
             return
         if quotes is None:
             quotes = self.broker.quotes([self.markets[symbol] for _, symbol, _ in signals])
         held = len(positions)
         for _, symbol, signal in sorted(signals, key=lambda item: item[0], reverse=True):
-            market, quote, direction = self.markets[symbol], quotes.get(symbol), signal.direction
+            market, quote = self.markets[symbol], quotes.get(symbol)
+            try:
+                entry = self.entry(market, quote, signal, held, now)
+            except Skip as skip:
+                log.info(f"{symbol}: {signal.direction} signal skipped - {skip.why}.")
+                continue
+            log.info(f"{symbol}: {signal.why} | entry ~{entry.price:g}, stop {entry.stop:g}, take-profit "
+                     f"{f'{entry.take_profit:g}' if entry.take_profit is not None else 'none'} | {entry.sizing}")
+            if self.settings.dry_run:
+                log.info(f"DRY RUN: would open {entry.direction} {symbol} size {entry.size:g}.")
+                continue
+            if self.open_entry(market, signal, entry, quote, now):
+                held += 1
 
-            def skip(why):
-                log.info(f"{symbol}: {direction} signal skipped - {why}.")
+    def entry(self, market, quote, signal, held: int, now: float, exposure: float = None, most: float = None) -> Entry:
+        """Every rule an entry must pass, and its size - the one place they're
+        applied, to the strategy's signals and broadcast trades alike. `held`
+        is how many positions the bot has open; a broadcast can ask for less
+        `exposure` than the bot would trade, and its open no more than the
+        size it previewed (`most`). Raises Skip saying why not."""
+        s, p = self.settings, self.p
+        symbol, direction = market.symbol, signal.direction
+        if direction == "short" and not self.broker.can_short:
+            raise Skip(broadcast.UNAVAILABLE, f"{self.broker.name} can't sell short here")
+        if held >= s.max_positions:
+            raise Skip(broadcast.NO_SLOT, f"{s.max_positions} position(s) already open")
+        cooling = self.watch.cooling(symbol, now) if self.watch is not None else 0
+        if cooling:  # only with a <TYPE>_STAGNANT_COOLDOWN set
+            raise Skip(broadcast.RISK, f"closed by the stagnancy timeout - no new trade in it before "
+                                       f"{clock.local('london', cooling).strftime('%H:%M')} London")
+        day = self.strategy.trade_day(market, now)
+        if self.state.trades_on(symbol, day) >= p["max_trades_per_day"]:
+            raise Skip(broadcast.RISK, f"already traded {p['max_trades_per_day']} time(s) today")
+        if clock.near_rollover(now, *ROLLOVER_QUIET):
+            raise Skip(broadcast.CLOSED, ROLLOVER_SKIP)
+        if quote is None:
+            raise Skip(broadcast.CLOSED, "no live price")
+        if not quote.tradeable:
+            raise Skip(broadcast.CLOSED, quote.why_not or "not tradeable right now")
 
-            day = self.strategy.trade_day(market, now)
-            if direction == "short" and not self.broker.can_short:
-                skip(f"{self.broker.name} can't sell short here")
-                continue
-            if held >= s.max_positions:
-                skip(f"{s.max_positions} position(s) already open")
-                continue
-            if self.state.trades_on(symbol, day) >= p["max_trades_per_day"]:
-                skip(f"already traded {p['max_trades_per_day']} time(s) today")
-                continue
-            if quote is None:
-                skip("no live price")
-                continue
-            if not quote.tradeable:
-                skip(quote.why_not or "not tradeable right now")
-                continue
+        sign = 1 if direction == "long" else -1
+        price = quote.ask if sign > 0 else quote.bid
+        distance = (price - signal.stop) * sign
+        if distance <= 0:
+            raise Skip(broadcast.RISK, f"the price {price:g} is already through the stop {signal.stop:g}")
+        too_wide = self.spread_problem(quote, distance)
+        if too_wide:
+            raise Skip(broadcast.RISK, too_wide)
+        if signal.take_profit is not None:
+            take_profit = signal.take_profit
+        elif signal.reward_risk:
+            take_profit = price + sign * signal.reward_risk * distance
+        else:
+            take_profit = None
+        if take_profit is not None and (take_profit - price) * sign <= 0:
+            raise Skip(broadcast.RISK, f"the price {price:g} is already past the take-profit {take_profit:g}")
+        if self.strategy.holds_overnight:
+            swap = self.broker.swap_percent_per_night(market, direction)
+            if swap is not None and -swap > p["max_swap_percent"]:
+                raise Skip(broadcast.RISK, f"holding it costs {-swap:.4f}% a night in swap "
+                                           f"(max {p['max_swap_percent']:g}%)")
 
-            sign = 1 if direction == "long" else -1
-            entry = quote.ask if sign > 0 else quote.bid
-            distance = (entry - signal.stop) * sign
-            if distance <= 0:
-                skip(f"the price {entry:g} is already through the stop {signal.stop:g}")
-                continue
-            too_wide = self.spread_problem(quote, distance)
-            if too_wide:
-                skip(too_wide)
-                continue
-            if signal.take_profit is not None:
-                take_profit = signal.take_profit
-            elif signal.reward_risk:
-                take_profit = entry + sign * signal.reward_risk * distance
-            else:
-                take_profit = None
-            if take_profit is not None and (take_profit - entry) * sign <= 0:
-                skip(f"the price {entry:g} is already past the take-profit {take_profit:g}")
-                continue
-            if self.strategy.holds_overnight:
-                swap = self.broker.swap_percent_per_night(market, direction)
-                if swap is not None and -swap > p["max_swap_percent"]:
-                    skip(f"holding it costs {-swap:.4f}% a night in swap (max {p['max_swap_percent']:g}%)")
-                    continue
-
-            size, sizing = self.size(market, quote, distance)
+        size, sizing, capped = self.sizing(market, quote, distance, exposure)
+        if size == 0:
+            raise Skip(broadcast.RISK, sizing)
+        if most is not None and size > most + 1e-12:
+            size = market.min_size if self.broker.fixed_min_size else self.broker.round_size(market, most)
+            sizing += f", cut to the {most:g} it previewed"
             if size == 0:
-                skip(sizing)
-                continue
-            log.info(f"{symbol}: {signal.why} | entry ~{entry:g}, stop {signal.stop:g}, take-profit "
-                     f"{f'{take_profit:g}' if take_profit is not None else 'none'} | {sizing}")
-            broker_stop, broker_target = self.broker_levels(market, quote, sign, entry, signal.stop, take_profit)
-            if s.dry_run:
-                log.info(f"DRY RUN: would open {direction} {symbol} size {size:g}.")
-                continue
-            if not self.broker.open(market, direction, size, broker_stop, broker_target, quote):
-                continue
-            held += 1
-            notes = {"direction": direction, "opened_at": now, "entry": entry, "stop": signal.stop,
-                     "take_profit": take_profit, "why": signal.why}
-            self.strategy.on_open(market, signal, entry, notes)
-            self.state.positions[symbol] = notes
-            self.state.own_ids = sorted(self.broker.own_ids)
-            self.state.count_trade(symbol, day)
-            self.state.save()
-            self.dashboard.report_soon(TRADE_REPORT_DELAYS[0])
+                raise Skip(broadcast.RISK, f"the {most:g} it previewed is now below {self.broker.name}'s smallest trade")
+        return Entry(direction, price, signal.stop, take_profit, distance, size, sizing, capped,
+                     exposure=size * quote.unit_value if quote.unit_value else None,
+                     risk=self.broker.risk_money(market, quote, size, distance))
+
+    def open_entry(self, market, signal, entry: Entry, quote, now: float, notes: dict = None) -> bool:
+        """Send an entry that passed entry() to the broker, and note the
+        position. True if the broker took it."""
+        symbol, sign = market.symbol, 1 if entry.direction == "long" else -1
+        broker_stop, broker_target = self.broker_levels(market, quote, sign, entry.price, entry.stop, entry.take_profit)
+        if not self.broker.open(market, entry.direction, entry.size, broker_stop, broker_target, quote):
+            return False
+        notes = {"direction": entry.direction, "opened_at": now, "entry": entry.price, "stop": entry.stop,
+                 "take_profit": entry.take_profit, "why": signal.why,
+                 # what it stands to lose at its stop - the stagnancy timeout's "R"
+                 "risk": entry.risk, **(notes or {})}
+        self.strategy.on_open(market, signal, entry.price, notes)
+        self.state.positions[symbol] = notes
+        self.state.own_ids = sorted(self.broker.own_ids)
+        self.state.count_trade(symbol, self.strategy.trade_day(market, now))
+        self.state.save()
+        self.dashboard.report_soon(TRADE_REPORT_DELAYS[0])
+        return True
 
     def spread_problem(self, quote, distance: float) -> str:
         """Why the spread is too wide for a stop `distance` from the entry, or
@@ -682,25 +936,220 @@ class StrategyBot:
 
     def size(self, market, quote, distance: float) -> tuple:
         """(size, how it was worked out) - (0, why not) if nothing fits."""
+        size, sizing, _ = self.sizing(market, quote, distance)
+        return size, sizing
+
+    def sizing(self, market, quote, distance: float, exposure: float = None) -> tuple:
+        """(size, how it was worked out, "" or why a broadcast's `exposure`
+        was cut) - (0, why not, "") if nothing fits. A broadcast's exposure,
+        in the account's currency, only ever makes the trade smaller than the
+        bot's own limits allow."""
+        cur = self.currency
         if self.broker.fixed_min_size:
-            return market.min_size, f"size {market.min_size:g} ({self.broker.name}'s minimum)"
+            text = f"size {market.min_size:g} ({self.broker.name}'s minimum)"
+            if exposure is None:
+                return market.min_size, text, ""
+            worth = market.min_size * quote.unit_value if quote.unit_value else None
+            if worth is not None and exposure < worth * (1 - 1e-9):
+                return 0.0, (f"its smallest trade ({market.min_size:g}) is worth {worth:,.2f} {cur}, more than the "
+                             f"{exposure:,.2f} asked for"), ""
+            return market.min_size, text, f"{self.broker.name} always trades the market's minimum size"
         if not quote.unit_value:
-            return 0.0, f"can't value a trade in {self.currency}"
+            return 0.0, f"can't value a trade in {cur}", ""
         per_point = quote.unit_value / quote.mid              # account currency per unit per 1.0 of price
         risk_budget = self.settings.budget * self.p["risk_percent"] / 100
         by_risk = risk_budget / (distance * per_point)
         by_exposure = self.slice_cap() / quote.unit_value
-        size = self.broker.round_size(market, min(by_risk, by_exposure))
+        limit = "risk" if by_risk <= by_exposure else "leverage cap"
+        wanted = min(by_risk, by_exposure)
+        capped = ""
+        if exposure is not None:
+            asked = exposure / quote.unit_value
+            if asked > wanted * (1 + 1e-9):
+                capped = f"capped at {wanted * quote.unit_value:,.2f} {cur} exposure (the bot's {limit} limit)"
+            else:
+                wanted, limit = asked, "the quantity asked for"
+        size = self.broker.round_size(market, wanted)
         if size <= 0:
             smallest = max(market.min_size, market.size_step)
+            if limit == "the quantity asked for":
+                return 0.0, (f"its smallest trade ({smallest:g}) would be worth {smallest * quote.unit_value:,.2f} "
+                             f"{cur}, more than the {exposure:,.2f} asked for"), ""
             return 0.0, (f"its smallest trade ({smallest:g}) would be worth {smallest * quote.unit_value:,.2f} and risk "
-                         f"{smallest * distance * per_point:,.2f} {self.currency} - over this bot's "
+                         f"{smallest * distance * per_point:,.2f} {cur} - over this bot's "
                          f"{risk_budget:,.2f} risk or {self.slice_cap():,.2f} per-trade limit; raise "
-                         f"{self.settings.env_prefix}BUDGET for it")
-        exposure, risk = size * quote.unit_value, size * distance * per_point
-        limit = "risk" if by_risk <= by_exposure else "leverage cap"
-        return size, (f"size {size:g}: {exposure:,.2f} {self.currency} exposure, {risk:,.2f} at risk "
-                      f"({risk / self.settings.budget:.2%} of the budget; sized by {limit})")
+                         f"{self.settings.env_prefix}BUDGET for it"), ""
+        value, risk = size * quote.unit_value, size * distance * per_point
+        return size, (f"size {size:g}: {value:,.2f} {cur} exposure, {risk:,.2f} at risk "
+                      f"({risk / self.settings.budget:.2%} of the budget; sized by {limit})"), capped
+
+    # -- broadcast trades from the dashboard (shared/broadcast.py) ------------------------
+    def broadcast_preview(self, command: dict) -> tuple:
+        """What the bot would do with a broadcast trade: (a line, {figures})."""
+        request = broadcast.Request.parse(command)
+        plan = self.broadcast_plan(request, time.time())
+        e, figures = plan["entry"], plan["figures"]
+        take_profit = figures.get("takeProfit")
+        line = (f"Would {request.side} {e.size:g} {self.broker.size_unit} of {figures['symbol']} at ~{e.price:g}: "
+                f"stop-loss {figures['stopLoss']:g}, "
+                + (f"take-profit {take_profit:g}" if take_profit is not None else "no take-profit")
+                + (f" ({e.capped})" if e.capped else ""))
+        self.log.info(f"Broadcast #{request.id}: {line} | {e.sizing}")
+        return line + ".", figures
+
+    def broadcast_open(self, command: dict) -> tuple:
+        """Open a broadcast trade the admin confirmed: every rule checked again
+        on fresh prices, never bigger than the preview. (a line, {figures})."""
+        now = time.time()
+        request = broadcast.Request.parse(command)
+        self.broadcasts.check_new(request)
+        request.check_age(now)
+        plan = self.broadcast_plan(request, now, most=request.size)
+        market, e = plan["market"], plan["entry"]
+        symbol = market.symbol
+        self.broadcasts.opening(request, symbol, (market.name, market.requested), now)
+        before = set(self.broker.own_ids)
+        self.broker.order_tag, self.broker.open_problem = f"broadcast-{request.id}", ""
+        notes = {"broadcast": request.id, "entry_source": broadcast.ENTRY_SOURCE}
+        if plan["guest"]:
+            notes["guest"] = market.requested  # looked up again by this after a restart
+        try:
+            opened = self.open_entry(market, plan["signal"], e, plan["quote"], now, notes)
+        finally:
+            self.broker.order_tag = None
+        if not opened:
+            self.broadcasts.failed(request)
+            raise CommandError(f"{self.broker.name} didn't open it: {self.broker.open_problem or 'see the bot log'}.")
+        refs = sorted(str(r) for r in self.broker.own_ids - before)
+        self.broadcasts.opened(request, refs, now)
+        if plan["guest"]:
+            self.add_guest(market, plan["feeds"])
+        verb = "Bought" if request.side == "buy" else "Sold"
+        self.log.info(f"Broadcast #{request.id}: {verb.lower()} {e.size:g} {symbol} ({e.sizing}).")
+        return (f"{verb} {e.size:g} {self.broker.size_unit} of {symbol} at ~{e.price:g}"
+                + (f" ({self.broker.name} ref {refs[0]})" if refs else "") + "."), \
+            {"symbol": symbol, "size": e.size, "price": e.price, **({"ref": refs[0]} if refs else {})}
+
+    def broadcast_plan(self, request, now: float, most: float = None) -> dict:
+        """The trade the bot would make for a broadcast, every rule applied:
+        {"market", "guest", "feeds", "quote", "signal", "entry", "figures"}.
+        Raises broadcast.Declined saying why it won't."""
+        if self.settings.dry_run:
+            raise broadcast.Declined(broadcast.PAUSED, "The bot is on a dry run (STRATEGY_DRY_RUN), so it sends no "
+                                                       "orders.")
+        market, candidate, feeds, guest = self.broadcast_market(request, now)
+        symbol = market.symbol
+        own, others = self.split_positions(self.markets if not guest else {**self.markets, symbol: market})
+        if symbol in own or symbol in self.state.positions:
+            raise broadcast.Declined(broadcast.NO_SLOT, f"The bot already holds {symbol}, and holds one position per "
+                                                        f"market.")
+        if symbol in others:
+            raise broadcast.Declined(broadcast.NO_SLOT, f"Someone else's {symbol} position is open, and the bot doesn't "
+                                                        f"trade a market while one is.")
+        quote = self.broker.quotes([market]).get(symbol)
+        if quote is None or not quote.tradeable:
+            why = (quote.why_not if quote is not None else "") or "no live price"
+            raise broadcast.Declined(broadcast.CLOSED, f"{symbol}: {why}.")
+        bars = {role: feed.bars for role, feed in feeds.items()}
+        try:
+            self.exits_at_once(market, bars, quote, request.direction, now)
+            signal = self.strategy.manual_signal(market, bars, quote, request.direction, now)
+            entry = self.entry(market, quote, signal, len(set(own) | set(self.state.positions)), now,
+                               exposure=request.quantity, most=most)
+        except Skip as skip:
+            raise broadcast.Declined(skip.kind, f"{symbol}: {skip.why}.") from None
+        rule = self.watch.book.rule(symbol, (market.name, market.requested)) if self.watch is not None else None
+        exits = self.strategy.exits() + (f"; stagnancy timeout ({rule.mode})" if rule and rule.mode != "off" else "")
+        if guest:
+            exits += " - watched until it closes, as it isn't one of the bot's markets"
+        figures = broadcast.figures(
+            symbol=symbol, name=market.name, size=entry.size, sizeUnit=self.broker.size_unit,
+            exposure=round(entry.exposure, 2) if entry.exposure is not None else None,
+            risk=round(entry.risk, 2) if entry.risk is not None else None, currency=self.currency,
+            entry=entry.price, stopLoss=self.broker.round_price(market, entry.stop),
+            takeProfit=self.broker.round_price(market, entry.take_profit) if entry.take_profit is not None else None,
+            accountMode=self.broker.account_mode, exits=exits, capped=entry.capped or None,
+            standIn=candidate.canonical if candidate.stand_in else None, previewedAt=now)
+        return {"market": market, "guest": guest, "feeds": feeds, "quote": quote, "signal": signal, "entry": entry,
+                "figures": figures}
+
+    def broadcast_market(self, request, now: float) -> tuple:
+        """(Market, symbols.Candidate, {role: Feed}, guest?) for a broadcast's
+        instrument: one of the bot's own markets, or else looked up on its
+        broker as a guest (its bars fetched, for the stop-loss). Raises
+        broadcast.Declined if the broker hasn't got it."""
+        found = symbols.candidates(self.settings.broker, request.symbol)
+        unavailable = broadcast.Declined(broadcast.UNAVAILABLE, f"{request.symbol} isn't available on "
+                                                                f"{self.broker.name}" + (
+            f" (looked for {', '.join(c.code for c in found)})." if found else "."))
+        for candidate in found:
+            market = self.own_market(candidate.code)
+            if market is not None:
+                return market, candidate, self.feeds.get(market.symbol, {}), market.symbol in self.guests
+        self.previewed = {c: v for c, v in self.previewed.items() if now - v[2] < PREVIEWED_SECONDS}
+        for candidate in found:
+            if candidate.code in self.previewed:
+                market, feeds, _ = self.previewed[candidate.code]
+            else:
+                try:
+                    markets = self.broker.resolve([candidate.code])
+                except BrokerError as e:
+                    self.log.warning(f"Broadcast #{request.id}: couldn't look up {candidate.code} ({e}).")
+                    continue
+                if not markets:
+                    continue
+                markets = self.strategy.prepare(markets, self.log)
+                if not markets:
+                    raise broadcast.Declined(broadcast.UNAVAILABLE, f"{candidate.code} isn't a market this bot can "
+                                                                    f"trade - its log says why.")
+                market = next(iter(markets.values()))
+                feeds = {role: Feed(self.broker, market, tf, keep) for role, (tf, keep) in self.strategy.feeds().items()}
+            try:
+                for feed in feeds.values():
+                    feed.refresh(now)
+            except BrokerError as e:
+                raise broadcast.Declined(broadcast.CLOSED, f"Couldn't get {market.symbol}'s bars ({e}).") from None
+            self.previewed[candidate.code] = (market, feeds, now)
+            return market, candidate, feeds, True
+        raise unavailable
+
+    def own_market(self, code: str):
+        """The bot's market (its own, or a guest it holds) a broker code names, or None."""
+        wanted = {part.strip().upper() for part in code.split(":") if part.strip()}
+        for market in self.markets.values():
+            names = {market.symbol.upper(), market.requested.split(":")[0].strip().upper(), (market.name or "").upper()}
+            if wanted & names:
+                return market
+        return None
+
+    def exits_at_once(self, market, bars: dict, quote, direction: str, now: float) -> None:
+        """Raise Skip if the bot's own exits would close a trade opened now
+        straight away - outside its hours, past its flat time, on the wrong
+        side of its trend - so a broadcast doesn't open one only to close it."""
+        price = quote.ask if direction == "long" else quote.bid
+        position = Position(market.symbol, direction, 0.0, price, opened_at=now, own=True)
+        notes = {"direction": direction, "opened_at": now, "entry": price}
+        reason = self.strategy.exit_on_time(market, position, notes, now)
+        if reason:
+            raise Skip(broadcast.CLOSED, f"its own exit would close it straight away ({reason})")
+        if bars.get("exec"):
+            reason = self.strategy.exit_on_bar(market, bars, position, dict(notes), now)
+            if reason:
+                raise Skip(broadcast.OTHER, f"its own exit would close it at the next bar ({reason})")
+
+    def add_guest(self, market, feeds: dict) -> None:
+        """A market outside the bot's list, now holding a broadcast trade:
+        watched for that trade's exits until it closes - never traded."""
+        symbol = market.symbol
+        self.markets[symbol] = market
+        self.guests.add(symbol)
+        self.left_guests.pop(symbol, None)
+        self.previewed = {c: v for c, v in self.previewed.items() if v[0].symbol != symbol}
+        if feeds:
+            self.feeds[symbol] = feeds
+            self.seen[symbol] = feeds["exec"].bars[-1].time if feeds["exec"].bars else 0.0
+        self.log.info(f"{symbol}: not one of the bot's markets - watching it for its broadcast trade's exits until "
+                      f"it closes.")
 
 
 # ---------------------------------------------------------------------------

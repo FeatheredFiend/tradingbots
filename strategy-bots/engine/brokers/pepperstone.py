@@ -33,6 +33,7 @@ DEAL_REASONS = {
 class PepperstoneBroker(Broker):
     key = "pepperstone"
     name = "Pepperstone"
+    size_unit = "lots"
 
     def __init__(self, settings, dashboard, log):
         super().__init__(settings, dashboard, log)
@@ -88,6 +89,7 @@ class PepperstoneBroker(Broker):
         if account.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO:
             raise BrokerError(f"account {account.login} on {account.server} is not a demo account - this bot only "
                               f"trades demo accounts")
+        self.account_mode = "demo"  # as MT5 itself says, just checked
         terminal = mt5.terminal_info()
         if terminal is not None and (not terminal.trade_allowed or terminal.tradeapi_disabled):
             raise BrokerError("the MT5 terminal isn't allowing automated trading. Switch on Algo Trading on its "
@@ -222,12 +224,14 @@ class PepperstoneBroker(Broker):
 
     @staticmethod
     def _send(request: dict) -> tuple:
+        """(done?, what happened, MT5's result or None). A part-filled order
+        (TRADE_RETCODE_DONE_PARTIAL) isn't done: the rest is still open."""
         result = mt5.order_send(request)
         if result is None:
-            return False, f"NOT SENT ({mt5.last_error()})"
+            return False, f"NOT SENT ({mt5.last_error()})", None
         if result.retcode == mt5.TRADE_RETCODE_DONE:
-            return True, f"DONE {result.volume:g} @ {result.price}"
-        return False, f"REJECTED ({result.retcode}: {result.comment})"
+            return True, f"DONE {result.volume:g} @ {result.price}", result
+        return False, f"REJECTED ({result.retcode}: {result.comment})", result
 
     def round_size(self, market: Market, size: float) -> float:
         return min(super().round_size(market, size), market.raw.volume_max)
@@ -239,10 +243,12 @@ class PepperstoneBroker(Broker):
             "action": mt5.TRADE_ACTION_DEAL, "symbol": market.symbol, "volume": size,
             "type": mt5.ORDER_TYPE_BUY if buy else mt5.ORDER_TYPE_SELL, "price": quote.ask if buy else quote.bid,
             "sl": self._to_tick(info, stop), "tp": self._to_tick(info, take_profit) if take_profit is not None else 0.0,
-            "deviation": DEVIATION_POINTS, "magic": self.magic, "comment": self.comment,
+            "deviation": DEVIATION_POINTS, "magic": self.magic, "comment": (self.order_tag or self.comment)[:31],
             "type_time": mt5.ORDER_TIME_GTC, "type_filling": self._filling(info),
         }
-        done, outcome = self._send(request)
+        done, outcome, _ = self._send(request)
+        if not done:
+            self.open_problem = outcome
         self.log.info(f"{direction.upper()} {market.symbol} volume={size:g} stop={request['sl']} "
                       f"take-profit={request['tp'] or 'none'} -> {outcome}")
         return done
@@ -250,6 +256,7 @@ class PepperstoneBroker(Broker):
     def close(self, market: Market, position: Position, reason: str, size: float = None) -> bool:
         all_closed = True
         left = size
+        volume_filled = value_filled = pnl = 0.0
         for p in position.raw or ():
             if left is not None and left <= 0:
                 break
@@ -260,7 +267,9 @@ class PepperstoneBroker(Broker):
                 self.close_problem = f"no live price for {p.symbol} (is the market open?)"
                 return False
             closing_long = p.type == mt5.POSITION_TYPE_BUY
-            done, outcome = self._send({
+            # A position its stop-loss or take-profit closed a moment before is
+            # refused here (TRADE_RETCODE_POSITION_CLOSED): the next read shows it gone.
+            done, outcome, result = self._send({
                 "action": mt5.TRADE_ACTION_DEAL, "position": p.ticket, "symbol": p.symbol, "volume": volume,
                 "type": mt5.ORDER_TYPE_SELL if closing_long else mt5.ORDER_TYPE_BUY,
                 "price": tick.bid if closing_long else tick.ask, "deviation": DEVIATION_POINTS, "magic": self.magic,
@@ -269,12 +278,33 @@ class PepperstoneBroker(Broker):
             self.log.info(f"CLOSE {p.symbol} {'long' if closing_long else 'short'} {volume:g} lots ({reason}) -> {outcome}")
             if done and volume >= p.volume:
                 self.close_reasons[p.ticket] = reason
+                # What the whole position made, costs in: its deals, now that it's closed.
+                deals = mt5.history_deals_get(position=p.ticket) or ()
+                pnl += sum(d.profit + d.swap + d.commission + d.fee for d in deals)
+            if done and result is not None and result.volume:
+                volume_filled += result.volume
+                value_filled += result.volume * result.price
             if not done:
                 self.close_problem = outcome
             if left is not None:
                 left -= volume
             all_closed = all_closed and done
+        if volume_filled:
+            self.closing_fill = {"price": value_filled / volume_filled, "pnl": round(pnl, 2)}
         return all_closed
+
+    def net_pnl(self, market: Market, position: Position, quote) -> float:
+        """MT5's profit is at the closing price (so net of the spread) with the
+        swap, but not the commission: its opening deal's (share CFDs:
+        $0.02 a share each way) is counted, and the same again to close."""
+        pnl = super().net_pnl(market, position, quote)
+        if pnl is None:
+            return None
+        for p in position.raw or ():
+            for d in mt5.history_deals_get(position=p.ticket) or ():
+                if d.entry == mt5.DEAL_ENTRY_IN:
+                    pnl += 2 * d.commission + d.fee
+        return pnl
 
     def refs(self, position: Position) -> set:
         return {str(p.ticket) for p in position.raw or ()}
@@ -308,6 +338,7 @@ class PepperstoneBroker(Broker):
                 "pnl": sum(d.profit + d.swap + d.commission + d.fee for d in outs) + entry.commission + entry.fee,
                 "closeReason": (self.close_reasons.get(position_id) if last_reason == mt5.DEAL_REASON_EXPERT else None)
                 or DEAL_REASONS.get(last_reason, "closed"),
+                **self.exit_fields(position_id),  # the stagnancy timeout's, if it closed or watched it
             })
         self.dashboard.update(
             account={"balance": account.balance, "equity": account.equity, "unrealizedPl": account.profit},

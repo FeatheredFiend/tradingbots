@@ -763,8 +763,18 @@ the surge rule, the signals file, the scanner on made-up Alpaca data and
 the followers against a fake broker. `test_rebalancer.py` covers the
 portfolio bots: the slow trend's signal, volatility and sizing, the
 rotation's month-end average, both schedules, the orders that take a
-position to its target, and a rebalance against a fake broker. No broker is contacted. Run them in
-`ig-bot-env`, which has everything they import.
+position to its target, and a rebalance against a fake broker. `test_stagnancy.py` covers the
+stagnancy timeout: the rule on made-up prices (flat, slow drift, a spike
+inside and outside the window, stale and closed markets, bars), its
+settings, retries, part fills, a stop-loss getting there first, and that
+one close frees exactly one slot; `test_stagnancy_bots.py` runs it in the
+scanners and EMA bots against fake brokers. `test_broadcast.py` covers
+broadcast trades: the symbol map, the book that never opens one twice and
+tags the dashboard's rows, the reporter's commands, and the strategy bots'
+previews, opens, limits and guest markets against a fake broker;
+`test_broadcast_bots.py` runs them in the scanners. No broker is contacted. Run them in
+`ig-bot-env`, which has everything they import (the Alpaca ones are
+skipped there - run those from `alpaca-bot-env`).
 
 ## Opening surge (`strategy-bots/surge_*`)
 
@@ -1135,6 +1145,96 @@ No stocks-in-play bot is worth building. The surge followers trade the same
 minutes after the open, so the same spreads apply to them (plus Pepperstone's
 $0.02 a share commission each way on share CFDs).
 
+## Stagnancy timeout (`shared/stagnancy.py`)
+
+A bot has only a few position slots, and a trade that sits flat for hours,
+worth pennies either way, holds one of them and pads the results with
+near-zero trades. The stagnancy timeout spots those and - once you switch
+it on - closes them, so the slot frees up. It never changes how a bot
+enters a trade. It covers the strategy bots (scalper, surge followers,
+index reversion, session breakout, commodity trend), the momentum scanners
+and the EMA bots (not the IG EMA bot, which can't trade, nor the portfolio
+bots, which hold on purpose).
+
+**The rule.** A trade is stagnant when all three hold:
+
+- it's older than `MIN_AGE`;
+- over the most recent `WINDOW` (rolling - not since the entry) the high-low
+  range of the **mid** price is within `RANGE`: a % of the price (`0.05%`)
+  or ATRs of the bot's own bars (`0.25atr`, strategy bots on bars only);
+- its unrealised P/L is within `PNL` either way: an amount in the account's
+  currency (`1.50`) or a fraction of what it stood to lose at its stop
+  (`0.2R`). The P/L is at the price the trade would close at, so it's net of
+  the spread, plus the fees the bot knows about (OANDA's financing,
+  Pepperstone's share commission).
+
+Mid prices, so a widening spread isn't mistaken for movement. Nothing is
+checked while prices are stale, have a gap or the market is shut; the window
+starts again on fresh prices. Times are `90s`, `15m`, `2h` or `4bars` (bars
+of the bot's own timeframe, so a bot on M5 bars gets a shorter window than
+one on M15).
+
+**Modes.** `shadow` (the default) logs `TIMEOUT_STAGNANT_SHADOW` and leaves
+the trade open; when it closes, its dashboard record says when the timeout
+would have closed it and at what P/L, so the archive shows what the timeout
+would have changed. `enforce` closes it at market with the reason
+`TIMEOUT_STAGNANT`. `off` does nothing.
+
+When enforcing, the trade is marked "closing" first (the strategy bots keep
+that in their state file, so a restart doesn't close it twice) and the
+bot's other exits leave it alone meanwhile. Its slot frees once the broker
+confirms the close - once. A refused close is tried again after 15, 30, 60,
+120 and 240 seconds, then every 5 minutes, with one `ALERT` line (ERROR, so
+the dashboard shows it) after the 5th failure. A part fill has the rest
+closed straight away. If the market shuts before the close goes through,
+the timeout is called off and looks again on fresh prices after the open.
+If the stop-loss or take-profit gets there first, the broker refuses the
+close and the trade keeps the broker's reason.
+
+Broker notes: Alpaca only *accepts* a sell (it fills a moment later), so the
+slot frees once the position has gone, and the record sent with the sell is
+then corrected to the fill; the scanner's stop order at Alpaca is cancelled
+first. Pepperstone's MT5 bars are built from the bid, so its time windows
+use tick mids. Capital.com closes whole positions only. IG's trade history
+doesn't name the opening deal, so the timeout's fields reach IG records by
+market and opening time. The IG scanner reads its prices from the positions
+it already fetches - no extra requests. The OANDA and Capital.com EMA bots
+now save their trade IDs to `own_trades.json` (gitignored), like the
+scanners, so the timeout only ever closes their own trades.
+
+| Bot type (`<TYPE>`) | Min age | Window | Range | P/L | Why |
+|---|---|---|---|---|---|
+| Tick scalper (`SCALPER`) | 90s | 60s | 0.01% | 0.25R | About a spread on FX majors and the US 500; a burst that stalls for a minute is over (its 300s time stop stays) |
+| Surge follower (`SURGE`) | 4m | 3m | 0.15% | 0.25R | A surge should carry on within minutes; three flat ones means it's done |
+| Index reversion (`REVERSION`) | 4 bars | 4 bars | 1 ATR | 0.2R | A fade should snap back to the VWAP inside the hour |
+| Session breakout (`BREAKOUT`) | 8 bars | 6 bars | 1 ATR | 0.25R | A real break follows through within about two hours |
+| Commodity trend (`TREND`) | 16 bars | 16 bars | 1.5 ATR | 0.3R | Trend trades sit through noise: only after 4h tighter than its own 2-ATR stop |
+| EMA bots (`EMA`) | 8 bars | 8 bars | 0.3% | 0.15R | Against a 2% stop, under 0.3% in 2 hours means no follow-through |
+| Momentum scanners (`SCANNER`) | 3 bars | 3 bars | 0.15% | 0.2R | A 3-bar streak should keep going within three bars |
+
+**Settings** are in the launcher, like everything else: `STAGNANT_MODE`
+(General) for every bot type, and per type a "Stagnancy timeout" part of
+its section - `<TYPE>_STAGNANT_MODE`, `_MIN_AGE`, `_WINDOW`, `_RANGE`,
+`_PNL` and `_COOLDOWN` (no new trade in that market for this long after a
+timeout close; `0`, the default, = none). Exceptions for one broker or one
+market go in `stagnancy.json` at the top of the repo (gitignored; copy
+`stagnancy.example.json`), and win over the launcher's. All are read when a
+bot starts; a setting the bot can't use stops it starting, naming it.
+
+**Logging.** Each close logs one line with everything about it:
+
+```
+TIMEOUT_STAGNANT | trade 4127 | oanda-session-breakout | OANDA | GBP_USD long 17 | entry 2026-10-01T09:15:02Z @ 1.33412 | exit 2026-10-01T11:45:31Z @ 1.33404 | held 2h30m29s | P/L -0.04 GBP net | slippage -0.000025 vs mid 1.334065 | range 0.00009 <= 0.00011 (1atr) over 6bars | P/L -0.03 within +/-0.05 (0.25R) | 2h30m27s old
+```
+
+and the trade's dashboard record gets `closeReason: "TIMEOUT_STAGNANT"`
+plus four optional fields - `exitMid`, `slippage` (the fill against that
+mid; negative is a cost), `durationSeconds`, and `stagnancy` (what
+triggered it: window, range and its limit, P/L and its limit, mode). The
+dashboard keeps them in optional columns of `trade` and `trade_archive`;
+a record without them (every other exit, or an older dashboard) is
+unchanged.
+
 ## Dashboard (`shared/dashboard_reporter.py`)
 
 Every bot can report to the
@@ -1204,6 +1304,83 @@ who can sign in to the dashboard as an admin can close trades.
 - The IG EMA bot doesn't report positions, so it has nothing to close.
 - A strategy bot on a dry run answers that it sent nothing.
 
+### Broadcast trades from the dashboard (`DASHBOARD_BROADCAST`)
+
+With `DASHBOARD_BROADCAST=1` (launcher: Settings > General > "Broadcast
+trades"), the dashboard's Admin > Broadcast page can push one trade - an
+instrument, Buy or Sell, and optionally a quantity - to every strategy bot
+(breakout, reversion, trend, scalper) and momentum scanner at once. It's a
+separate switch from closing, as opening trades is riskier. EMA bots, the
+surge scanner and followers and the portfolio bots don't take them, and
+say so. `shared/broadcast.py` and `shared/symbols.py` are the shared parts.
+
+1. **Preview.** Each bot works out what it would do as if its own strategy
+   had signalled: its broker's code for the instrument (`shared/symbols.py`
+   maps one name to every broker - `US500` is OANDA's `SPX500_USD`, IG's
+   `US 500` epic; Alpaca gets a fund standing in, `SPY`), its own size,
+   stop-loss and take-profit from live prices, and every limit it applies to
+   its own trades: slots, one position per market, trades a day, spread,
+   swap, the rollover's quiet time, the stagnancy cooldown, IG's loss
+   limits, Alpaca's buys-only and closing time. Only the signal filters are
+   skipped. It also skips a trade its own exits would close straight away
+   (past the breakout's flat time, outside the index's cash session, against
+   the trend's 4H EMA200). Nothing goes to the broker; the page shows each
+   bot's figures, or why it won't take it, with DEMO or LIVE from the bot's
+   own connection.
+2. **Confirm.** The admin unticks any bots and sends it. Each bot checks
+   everything again on fresh prices and opens it - never bigger than it
+   previewed, and only within 150 s of its preview. It notes the broadcast in
+   its saved notes before the order goes (`strategy-bots/state/<bot>.json`,
+   or a scanner's `broadcasts.json`), so it never opens one twice, even after
+   a restart.
+
+A **quantity** is the exposure wanted in the bot's account currency. It can
+only make a trade smaller than the bot's own limits allow: above them it's
+cut (the preview says "capped at"), and below the broker's smallest trade
+that bot skips it. IG always trades the market's minimum.
+
+An instrument outside a bot's market list or pool becomes a **guest**: the
+bot watches it for that trade's exits (a strategy bot fetches its bars;
+brackets, time stops, the rollover close and the stagnancy timeout all
+apply), never trades it on its own signals, and drops it once the trade
+closes. A scanner's streak-reversal exit only covers its pool.
+
+Every order, position and trade a broadcast opened is tagged
+`entrySource: MANUAL_BROADCAST` and its `broadcastId` in the bot's dashboard
+rows, so benchmarks can leave them out (the dashboard's Archive has an Entry
+filter). Where the broker takes a label the order carries
+`broadcast-<id>` too: OANDA's client extensions, the MT5 comment, Alpaca's
+client order ID. IG and Capital.com take none, so there it's the bot's
+saved notes only.
+
+Running bots pick the switch up when restarted. To try it safely on the
+demo accounts first, see "Testing broadcasts" below.
+
+#### Testing broadcasts
+
+Every bot here only connects to demo / practice / paper accounts, so the
+preview shows DEMO for all of them; one that never said shows as LIVE and
+needs an extra tick.
+
+1. Set `DASHBOARD_BROADCAST=1` and, for a first run, `STRATEGY_DRY_RUN=1`.
+   Restart one strategy bot and one scanner. The dashboard's Broadcast page
+   should list them as taking broadcasts; dry-run bots answer "paused".
+2. Preview `EURUSD` with no quantity. Check each row's instrument, size,
+   stop-loss and take-profit against the bot's settings, and that skipped
+   bots say why. Nothing appears at the broker.
+3. Preview with a small quantity (e.g. 10) and a large one (e.g. 100000):
+   the first sizes down or skips ("more than the 10.00 asked for"), the
+   second shows "capped at".
+4. Switch the dry run off, restart those bots, and broadcast a trade to one
+   bot only (untick the rest). Check the fill on the result row, the order
+   at the broker (OANDA / MT5 / Alpaca show the `broadcast-<id>` label), and
+   the "Broadcast" tag on the bot page's position and, once it closes, its
+   trade.
+5. Confirm the same broadcast again, and restart the bot: no second trade.
+6. Try a market outside a bot's list (e.g. `XAUUSD` on a breakout bot): it
+   opens as a guest, the bot's log says it's watching it, and it's dropped
+   when the trade closes.
+
 ## Launcher (`launcher/`) - a Windows app for all of this
 
 `TradingBots.exe` starts and stops the bots and edits their settings:
@@ -1249,9 +1426,10 @@ e.g. `start_bot.bat oanda-momentum-scanner`.
 ## Repo layout
 
 Each momentum scanner and EMA bot lives in its own folder with its own
-`requirements.txt`; the shared pieces are `shared/dashboard_reporter.py`
-and `shared/rollover.py` (standard library only; the latter uses the
-strategy engine's `clock.py`). The strategy bots, the opening surge
+`requirements.txt`; the shared pieces are `shared/dashboard_reporter.py`,
+`shared/rollover.py`, `shared/stagnancy.py`, `shared/broadcast.py` and
+`shared/symbols.py` (standard library only;
+rollover uses the strategy engine's `clock.py`). The strategy bots, the opening surge
 scanner and followers, and the portfolio bots share `strategy-bots/engine/` and need nothing
 beyond their broker's existing requirements.
 Virtual environments (`*-bot-env/`) are gitignored — create your own per

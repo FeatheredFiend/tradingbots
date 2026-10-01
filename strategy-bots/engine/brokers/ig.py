@@ -92,6 +92,8 @@ def _mid(price: dict):
 class IGBroker(Broker):
     key = "ig"
     name = "IG"
+    account_mode = "demo" if ACCOUNT_TYPE == "DEMO" else "live"
+    size_unit = "contracts"
     fixed_min_size = True
     metered_history = True
     dashboard_every = 60        # each snapshot costs two of IG's ~30 requests a minute
@@ -286,6 +288,19 @@ class IGBroker(Broker):
             return None
         return round((close - level) * (1 if is_long else -1) * size * contract_size / rate, 2)
 
+    def risk_money(self, market: Market, quote, size: float, distance: float):
+        """As _pnl() values a move: distance x size x contract size, in the
+        deal's currency, at IG's rate for it (IG's quotes carry no unit value)."""
+        instrument = (market.raw or {}).get("instrument") or {}
+        contract_size = _number(instrument.get("contractSize"))
+        currency = self._deal_currency(instrument)
+        rate = 1.0 if currency == self.currency_code else next(
+            (_number(c.get("baseExchangeRate")) for c in instrument.get("currencies") or () if c.get("code") == currency),
+            None)
+        if not contract_size or not rate:
+            return None
+        return distance * size * contract_size / rate
+
     def positions(self, markets: dict) -> dict:
         frame = self._open_positions()
         own, others = {}, {}
@@ -340,12 +355,15 @@ class IGBroker(Broker):
             )
         except BrokerError as e:
             self.log.error(f"{market.symbol}: {direction} order failed: {e}")
+            self.open_problem = str(e)
             return False
         accepted, outcome = self._outcome(result)
         if accepted:
             self.own_ids.update(d["dealId"] for d in result.get("affectedDeals") or () if d.get("dealId"))
             if result.get("dealId"):
                 self.own_ids.add(result["dealId"])
+        else:
+            self.open_problem = outcome
         self.log.info(f"{direction.upper()} {market.symbol} size={size:g} stop={self.round_price(market, stop)} "
                       f"take-profit={self.round_price(market, take_profit) if take_profit is not None else 'none'} "
                       f"-> {outcome}")
@@ -354,12 +372,16 @@ class IGBroker(Broker):
     def close(self, market: Market, position: Position, reason: str, size: float = None) -> bool:
         all_closed = True
         left = size
+        size_filled = value_filled = 0.0
+        pnl, refs = 0.0, []
         for deal_id, direction, deal_size in position.raw or ():
             if left is not None and left <= 0:
                 break
             amount = deal_size if left is None else min(left, deal_size)
             try:
                 # By deal ID alone: IG rejects a close that also names the epic and expiry.
+                # A deal its stop or limit closed a moment before comes back REJECTED:
+                # the next read shows it gone.
                 result = self._call(f"close {market.symbol}", IGService.close_open_position, paced=False,
                                     deal_id=deal_id, direction="SELL" if direction == "BUY" else "BUY", epic=None,
                                     expiry=None, level=None, order_type="MARKET", quote_id=None, size=amount)
@@ -370,11 +392,25 @@ class IGBroker(Broker):
                 continue
             closed, outcome = self._outcome(result)
             self.log.info(f"CLOSE {market.symbol} {position.direction} {amount:g} ({reason}) -> {outcome}")
+            if closed:
+                # IG's confirmation says where it closed and what it made (in the
+                # deal's currency); its trade history names the trade by the end
+                # of the closing deal's ID.
+                size_filled += amount
+                value_filled += amount * (_number(result.get("level")) or 0.0)
+                profit = _number(result.get("profit"))
+                in_account_currency = result.get("profitCurrency") in (None, self.currency_code)
+                pnl = None if pnl is None or profit is None or not in_account_currency else pnl + profit
+                if result.get("dealId"):
+                    refs.append(str(result["dealId"])[-8:])
             if not closed:
                 self.close_problem = outcome
             if left is not None:
                 left -= amount
             all_closed = all_closed and closed
+        if size_filled and value_filled:
+            self.closing_fill = {"price": value_filled / size_filled, "pnl": None if pnl is None else round(pnl, 2),
+                                 "refs": tuple(refs)}
         return all_closed
 
     def refs(self, position: Position) -> set:
@@ -415,7 +451,7 @@ class IGBroker(Broker):
             self.log.warning(f"Couldn't gather the dashboard report: {e}")
 
     def _closed_trades(self, markets: dict) -> list:
-        names = {m.name for m in markets.values()}
+        epics = {m.name: m.symbol for m in markets.values()}
         since = datetime.now(timezone.utc) - timedelta(days=7)
         history = self._call("transaction history", IGService.fetch_transaction_history, trans_type="ALL_DEAL",
                              from_date=since.strftime("%Y-%m-%dT%H:%M:%S"), page_size=200)
@@ -424,13 +460,20 @@ class IGBroker(Broker):
             size = _number(str(t.get("size", "")).replace("+", ""))
             closed_at = _utc_seconds(t.get("dateUtc"))
             name = _history_market_name(t.get("instrumentName"))
-            if name not in names or not t.get("reference") or not size or closed_at is None:
+            if name not in epics or not t.get("reference") or not size or closed_at is None:
                 continue
             profit = t.get("profitAndLoss")
+            opened_at = _utc_seconds(t.get("openDateUtc"))
+            # The stagnancy timeout's fields: by the closing deal, or - for a trade
+            # it only watched - by market and opening time, as IG's history doesn't
+            # name the deal that opened it.
+            extra = self.exit_fields(t["reference"]) or (
+                self.stagnancy.fields_matching(epics[name], opened_at) if self.stagnancy is not None else {})
             trades.append({
                 "ref": str(t["reference"]), "symbol": name, "direction": "short" if size < 0 else "long",
                 "size": abs(size), "entryPrice": _number(t.get("openLevel")), "exitPrice": _number(t.get("closeLevel")),
-                "openedAt": _utc_seconds(t.get("openDateUtc")), "closedAt": closed_at,
+                "openedAt": opened_at, "closedAt": closed_at,
                 "pnl": _number(re.sub(r"[^\d.\-]", "", profit)) if isinstance(profit, str) else _number(profit),
+                **extra,
             })
         return trades

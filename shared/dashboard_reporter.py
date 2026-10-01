@@ -24,6 +24,15 @@ sleep() or run_commands(), never on the reporting thread, and the answer
 goes out straight away. Commands only ever close (part of) the bot's own
 positions; each one is carried out once at most.
 
+Broadcast trades
+----------------
+A bot that registers handlers with accept_broadcasts() - and runs with
+DASHBOARD_BROADCAST=1 - also takes the dashboard's broadcast trades: a
+"broadcast-preview" (what it would do with a trade) and a "broadcast-open"
+(do it), carried out the same way. See shared/broadcast.py. The bot says
+whether its account is a demo (describe(account_mode=...)), and tag_rows()
+lets it mark the rows about trades a broadcast opened.
+
 One relay for every bot on the PC
 ---------------------------------
 The dashboard's host hangs up a connection after 5 idle seconds, so a bot
@@ -62,6 +71,9 @@ URL = os.environ.get("DASHBOARD_URL", "").strip().rstrip("/")
 TOKEN = os.environ.get("DASHBOARD_TOKEN", "").strip()
 # Off unless set: lets whoever can sign in to the dashboard as an admin close this bot's positions.
 COMMANDS_ON = os.environ.get("DASHBOARD_COMMANDS", "").strip().lower() in ("1", "true", "yes", "on")
+# Off unless set: lets a dashboard admin open trades in this bot - broadcast trades (shared/broadcast.py).
+BROADCAST_ON = os.environ.get("DASHBOARD_BROADCAST", "").strip().lower() in ("1", "true", "yes", "on")
+BROADCAST_ACTIONS = ("broadcast-preview", "broadcast-open")
 
 REPORT_EVERY_SECONDS = 10     # the dashboard calls a bot silent after 3 minutes without a report
 SNAPSHOT_EVERY_SECONDS = 15   # how often due() asks the bot for account/positions/trades
@@ -90,7 +102,12 @@ RELAY_RETRY_SECONDS = 60      # ...for this long, posting straight to the dashbo
 
 class CommandError(Exception):
     """A dashboard command the bot won't or can't carry out. The message is
-    the answer shown on the dashboard, so say why in plain words."""
+    the answer shown on the dashboard, so say why in plain words; `data`
+    goes with it (a broadcast's {"reason": kind})."""
+
+    def __init__(self, message: str, data: dict = None):
+        super().__init__(message)
+        self.data = data
 
 
 class DashboardReporter:
@@ -105,8 +122,10 @@ class DashboardReporter:
             "acceptsCommands": [],
         }
         self._close = None            # the bot's close handler, if it takes commands
+        self._broadcast = None        # the bot's (preview, open) handlers, if it takes broadcast trades
+        self._tagger = None           # adds fields to the bot's position and trade rows - see tag_rows()
         self._inbox = collections.deque()   # commands from the dashboard, not yet carried out
-        self._answers = []            # {"id", "ok", "message"} not yet sent
+        self._answers = []            # {"id", "ok", "message", "data"?} not yet sent
         self._seen_commands = set()   # IDs already taken in, so none runs twice
         self._wake = threading.Event()
         self._lock = threading.Lock()
@@ -137,8 +156,11 @@ class DashboardReporter:
         logging.getLogger(__name__).info(f"Reporting to the dashboard at {URL} as '{slug}'.")
 
     # -- called by the bot -------------------------------------------------
-    def describe(self, account=None, currency=None, config=None) -> None:
-        """What the dashboard shows about the bot itself; sent with every report."""
+    def describe(self, account=None, currency=None, config=None, account_mode=None) -> None:
+        """What the dashboard shows about the bot itself; sent with every
+        report. `account_mode` is "demo" or "live", from the bot's own
+        connection to its broker (the dashboard treats one that never says
+        as live)."""
         with self._lock:
             if account is not None:
                 self._bot["account"] = str(account)
@@ -146,6 +168,8 @@ class DashboardReporter:
                 self._bot["currency"] = currency
             if config is not None:
                 self._bot["config"] = config
+            if account_mode is not None:
+                self._bot["accountMode"] = account_mode
 
     def accept_closes(self, close) -> None:
         """Let the dashboard close this bot's positions, if DASHBOARD_COMMANDS
@@ -164,8 +188,38 @@ class DashboardReporter:
             return
         self._close = close
         with self._lock:
-            self._bot["acceptsCommands"] = ["close"]
+            self._bot["acceptsCommands"] = ["close", *self._bot["acceptsCommands"]]
         logging.getLogger(__name__).info("The dashboard can close this bot's positions (DASHBOARD_COMMANDS is on).")
+
+    def accept_broadcasts(self, preview, open_trade, symbols) -> None:
+        """Take the dashboard's broadcast trades, if DASHBOARD_BROADCAST is on
+        (shared/broadcast.py). `preview(command)` and `open_trade(command)`
+        each return (a short line saying what it would do / did, {figures}),
+        or raise CommandError (broadcast.Declined) saying why not. They run on
+        the bot's thread, inside sleep() or run_commands(). `symbols` are the
+        instrument names the bot can map, for the dashboard's list."""
+        if not self.enabled:
+            return
+        if not BROADCAST_ON:
+            self.broadcast_off("Broadcast trades are switched off in this bot (DASHBOARD_BROADCAST).")
+            logging.getLogger(__name__).info(
+                "Broadcast trades from the dashboard are off (set DASHBOARD_BROADCAST=1 to take them).")
+            return
+        self._broadcast = (preview, open_trade)
+        with self._lock:
+            self._bot["acceptsCommands"] = [*self._bot["acceptsCommands"], "broadcast"]
+            self._bot["broadcast"] = {"symbols": list(symbols)}
+        logging.getLogger(__name__).info("This bot takes broadcast trades from the dashboard (DASHBOARD_BROADCAST is on).")
+
+    def broadcast_off(self, why: str) -> None:
+        """Tell the dashboard this bot takes no broadcast trades, and why."""
+        with self._lock:
+            self._bot["broadcast"] = {"off": why}
+
+    def tag_rows(self, tagger) -> None:
+        """`tagger(row)` returns fields to add to a position or trade row the
+        bot reports ({} for none) - a broadcast's tags (broadcast.Book.tags)."""
+        self._tagger = tagger
 
     def run_commands(self) -> int:
         """Carry out the commands the dashboard has sent, one by one, and
@@ -179,29 +233,54 @@ class DashboardReporter:
                     break
                 command = self._inbox.popleft()
             ran += 1
-            symbol, ref, size = command.get("symbol"), command.get("ref"), command.get("size")
-            direction = command.get("direction")
-            what = f"close {symbol} {direction}" + (f" (ref {ref})" if ref else "") + (
-                f", size {size}" if size else ", all of it")
-            log.info(f"Dashboard asks: {what}.")
+            data = None
             try:
-                if command.get("action") != "close" or not symbol or direction not in ("long", "short"):
-                    raise CommandError(f"This bot doesn't know the command {command.get('action')!r}.")
-                if self._close is None:
-                    raise CommandError("Commands from the dashboard are switched off in this bot.")
-                if size is not None and (not isinstance(size, (int, float)) or size <= 0):
-                    raise CommandError(f"{size!r} isn't a size.")
-                message, ok = str(self._close(symbol, None if ref is None else str(ref), direction, size) or "Done."), True
+                if command.get("action") in BROADCAST_ACTIONS:
+                    message, data = self._run_broadcast(command)
+                else:
+                    message = self._run_close(command)
+                ok = True
             except Exception as e:  # the bot carries on whatever happens
                 message, ok = (str(e) if isinstance(e, CommandError) else f"{type(e).__name__}: {e}"), False
+                data = e.data if isinstance(e, CommandError) else None
             (log.info if ok else log.warning)(f"Dashboard command {'done' if ok else 'not done'}: {message}")
+            answer = {"id": command["id"], "ok": ok, "message": message[:255]}
+            if data:
+                answer["data"] = data
             with self._lock:
-                self._answers.append({"id": command["id"], "ok": ok, "message": message[:255]})
+                self._answers.append(answer)
         if ran:
             # due() at once; the update() it brings sends the answer straight
             # away, with the positions as they are now.
             self._last_snapshot = 0.0
         return ran
+
+    def _run_close(self, command: dict) -> str:
+        symbol, ref, size = command.get("symbol"), command.get("ref"), command.get("size")
+        direction = command.get("direction")
+        what = f"close {symbol} {direction}" + (f" (ref {ref})" if ref else "") + (
+            f", size {size}" if size else ", all of it")
+        logging.getLogger(__name__).info(f"Dashboard asks: {what}.")
+        if command.get("action") != "close" or not symbol or direction not in ("long", "short"):
+            raise CommandError(f"This bot doesn't know the command {command.get('action')!r}.")
+        if self._close is None:
+            raise CommandError("Commands from the dashboard are switched off in this bot.")
+        if size is not None and (not isinstance(size, (int, float)) or size <= 0):
+            raise CommandError(f"{size!r} isn't a size.")
+        return str(self._close(symbol, None if ref is None else str(ref), direction, size) or "Done.")
+
+    def _run_broadcast(self, command: dict) -> tuple:
+        payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+        logging.getLogger(__name__).info(
+            f"Dashboard asks: {command['action']} for broadcast #{payload.get('broadcastId')} - "
+            f"{payload.get('side')} {payload.get('symbol')}"
+            + (f", {payload['quantity']:g} exposure" if isinstance(payload.get("quantity"), (int, float)) else "")
+            + ".")
+        if self._broadcast is None:
+            raise CommandError("Broadcast trades are switched off in this bot.", data={"reason": "paused"})
+        preview, open_trade = self._broadcast
+        message, data = (preview if command["action"] == "broadcast-preview" else open_trade)(command)
+        return str(message or "Done."), data
 
     def report_soon(self, *delays: float) -> None:
         """Make due() come round after each of these delays in seconds
@@ -254,6 +333,9 @@ class DashboardReporter:
         with the broker's "ref" - only new or changed ones are sent."""
         if not self.enabled:
             return
+        if self._tagger is not None:
+            positions = None if positions is None else [self._tag(p) for p in positions]
+            trades = [self._tag(t) for t in trades or ()]
         with self._lock:
             if account is not None:
                 self._account = account
@@ -264,6 +346,14 @@ class DashboardReporter:
             if self._answers or self._send_now:
                 self._send_now = False
                 self._wake.set()  # a command's answer, or a trade, goes out now, not in up to 10 s
+
+    def _tag(self, row: dict) -> dict:
+        try:
+            extra = self._tagger(row)
+        except Exception as e:  # a row goes out untagged rather than not at all
+            logging.getLogger(__name__).warning(f"Couldn't tag a dashboard row: {e}")
+            return row
+        return {**row, **extra} if extra else row
 
     def trade(self, trade: dict) -> None:
         """Record one trade as it happens (e.g. a close the bot made itself)."""

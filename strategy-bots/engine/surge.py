@@ -280,6 +280,8 @@ class FollowerBot(runner.StrategyBot):
         s, p, log = self.settings, self.p, self.log
         account = self.broker.connect()
         self.currency = account.currency
+        if self.watch is not None:
+            self.watch.currency = self.currency
         # Positions it had open before a restart: its notes name each share.
         held = sorted({notes.get("requested") or symbol for symbol, notes in self.state.positions.items()})
         if held:
@@ -295,6 +297,8 @@ class FollowerBot(runner.StrategyBot):
                  f"max {s.max_positions} positions ({self.slice_cap():,.2f} each) | spread max "
                  f"{p['max_spread_percent']:g}% of the stop")
         log.info(self.strategy.summary())
+        if self.watch is not None:
+            log.info(self.watch.book.describe(self.currency))
         log.info(f"Trades the US shares the surge scanner signals, as {self.broker.name} names them "
                  f"({s.symbol_format.format('AAPL')} for AAPL)" + ("" if self.broker.can_short else " - buys only"))
         if self.markets:
@@ -307,7 +311,11 @@ class FollowerBot(runner.StrategyBot):
         config.update({k: v for k, v in p.items() if k not in ("risk_percent", "max_leverage", "max_spread_percent")})
         if getattr(self.broker, "magic", None):
             config["magicNumber"] = self.broker.magic
-        self.dashboard.describe(account=account.id, currency=self.currency, config=config)
+        if self.watch is not None:
+            config.update(self.watch.book.config())
+        self.dashboard.describe(account=account.id, currency=self.currency, config=config,
+                                account_mode=self.broker.account_mode)
+        self.dashboard.broadcast_off("A surge follower trades only the surge scanner's signals - no broadcast trades.")
 
         self.started_at = time.time()
         self.dashboard.accept_closes(self.close_from_dashboard)

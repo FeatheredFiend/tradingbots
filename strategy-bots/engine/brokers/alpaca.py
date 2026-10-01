@@ -17,11 +17,15 @@ here, on US-listed funds (SPY, QQQ, GLD, ...), with these differences:
 - Alpaca holds one position per fund, so the bot manages a fund's position
   only if it bought it (its saved notes say so), and doesn't buy a fund
   someone else holds.
+- A close is a market sell Alpaca accepts and fills a moment later, so the
+  stagnancy timeout counts it done once the position has gone, then looks
+  up what the order filled at.
 """
 
 import math
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 
 import alpaca_trade_api as tradeapi
@@ -52,6 +56,9 @@ class AlpacaBroker(Broker):
     native_stops = False
     can_short = False
     max_leverage = 1.0
+    fills_on_close = False      # close_position() is a sell order, filled after it's accepted
+    account_mode = "demo" if "paper-api" in BASE_URL else "live"
+    size_unit = "shares"
 
     def __init__(self, settings, dashboard, log):
         super().__init__(settings, dashboard, log)
@@ -59,6 +66,7 @@ class AlpacaBroker(Broker):
         self._is_open = False
         self._clock_until = 0.0
         self._session = (None, None)  # (New York date, that day's opening time), from Alpaca's calendar
+        self._close_rows = {}         # symbol -> the dashboard record sent at its last close
 
     def _call(self, what: str, fn, *args, **kwargs):
         try:
@@ -199,12 +207,16 @@ class AlpacaBroker(Broker):
         notional = math.floor(size * quote.ask * 100) / 100
         if notional < MIN_NOTIONAL_USD:
             self.log.info(f"{market.symbol}: a ${notional:.2f} buy is under Alpaca's $1 minimum; skipping.")
+            self.open_problem = f"a ${notional:.2f} buy is under Alpaca's $1 minimum"
             return False
+        # A broadcast's label goes in the client order ID, which must be unique.
+        label = {"client_order_id": f"{self.order_tag}-{uuid.uuid4().hex[:8]}"} if self.order_tag else {}
         try:
             order = self.api.submit_order(symbol=market.symbol, notional=notional, side="buy", type="market",
-                                          time_in_force="day")
+                                          time_in_force="day", **label)
         except (APIError, requests.exceptions.RequestException) as e:
             self.log.error(f"{market.symbol}: buy refused: {e}")
+            self.open_problem = str(e)
             return False
         levels = "" if stop is None else (
             f" (stop {stop:.2f}, take-profit {f'{take_profit:.2f}' if take_profit is not None else 'none'}, "
@@ -223,14 +235,47 @@ class AlpacaBroker(Broker):
         p = position.raw
         if p is not None:  # priced as Alpaca valued the position just before the sell
             share = 1.0 if size is None else size / float(p.qty)
-            self.dashboard.trade({
+            row = {
                 "ref": str(order.id), "symbol": p.symbol, "direction": "long",
                 "size": float(p.qty) if size is None else size,
                 "entryPrice": float(p.avg_entry_price), "exitPrice": float(p.current_price),
                 "closedAt": datetime.now(timezone.utc).isoformat(), "pnl": float(p.unrealized_pl) * share,
                 "closeReason": reason,
-            })
+            }
+            self._close_rows[market.symbol] = row
+            self.dashboard.trade(row)
         return True
+
+    def net_pnl(self, market: Market, position: Position, quote) -> float:
+        """Alpaca values a position at the last trade; selling gets the bid."""
+        if quote is not None and quote.bid > 0:
+            return (quote.bid - position.entry) * position.size
+        return position.pnl
+
+    def close_fill(self, market: Market):
+        """What the last close's sell order filled at, once it has: the record
+        sent at the close is corrected to it."""
+        row = self._close_rows.get(market.symbol) if market is not None else None
+        if row is None:
+            return None
+        try:
+            order = self.api.get_order(row["ref"])
+        except (APIError, requests.exceptions.RequestException) as e:
+            self.log.warning(f"{market.symbol}: couldn't look up close order {row['ref']}: {e}")
+            return None
+        if order.filled_avg_price is None or not float(order.filled_qty or 0):
+            return None
+        price, qty = float(order.filled_avg_price), float(order.filled_qty)
+        row.update(exitPrice=price, size=qty, pnl=round((price - row["entryPrice"]) * qty, 2),
+                   closedAt=pd.Timestamp(order.filled_at).isoformat() if order.filled_at else row["closedAt"])
+        return {"price": price, "pnl": row["pnl"], "refs": (row["ref"],)}
+
+    def attach_exit(self, market: Market, fields: dict) -> None:
+        """Alpaca's records are sent by close() itself: send it again with the timeout's fields."""
+        row = self._close_rows.get(market.symbol)
+        if row is not None:
+            row.update(fields)
+            self.dashboard.trade(dict(row))
 
     # -- dashboard ------------------------------------------------------------------
     def report(self, markets: dict, notes: dict) -> None:

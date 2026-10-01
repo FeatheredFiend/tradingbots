@@ -32,6 +32,15 @@ Strategy — momentum streak, buys only
 - Buys only : fractional shares can't be sold short on Alpaca, and short
   selling needs a $2,000+ margin account, so a falling streak only ever
   closes a position — it never opens a short.
+- Stagnancy : a position that has gone nowhere for a while is logged
+  (shadow, the default) or sold with the reason TIMEOUT_STAGNANT, freeing
+  its slot once Alpaca's sell has filled (SCANNER_STAGNANT_* settings; see
+  shared/stagnancy.py).
+- Broadcasts: with DASHBOARD_BROADCAST=1 it takes broadcast buys from the
+  dashboard (shared/broadcast.py) - the admin's share, its own slice (or
+  less), stop and take-profit, and limits; never a sell. A share outside the
+  pool is managed until it's sold (its stop order, take-profit, closing time,
+  the stagnancy timeout) but never bought or sold on a streak.
 
 Sizing
 ------
@@ -86,6 +95,9 @@ from alpaca_trade_api.rest import APIError, TimeFrame, TimeFrameUnit
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
+import broadcast  # noqa: E402 - needs the path above
+import stagnancy  # noqa: E402 - needs the path above
+import symbols  # noqa: E402 - needs the path above
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -93,6 +105,7 @@ from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - n
 API_KEY = os.environ.get("APCA_API_KEY_ID", "")
 API_SECRET = os.environ.get("APCA_API_SECRET_KEY", "")
 BASE_URL = "https://paper-api.alpaca.markets"  # Paper trading only — do not change.
+ACCOUNT_MODE = "demo" if "paper-api" in BASE_URL else "live"  # for the dashboard's broadcast previews
 
 # ~30 liquid US large caps across sectors. Anything that turns out not to be
 # tradable or fractionable is skipped at startup with a warning, not fatal.
@@ -147,6 +160,7 @@ STOP_CANCEL_TIMEOUT_SECONDS = 10
 LOOP_INTERVAL_SECONDS = min(60, int(BAR_LENGTH.total_seconds()) // 4)  # Risk checks run this often; bars refresh once per bar.
 CLOSED_MARKET_SLEEP_SECONDS = 300
 MAX_CONSECUTIVE_ERRORS = 10         # Safety cutoff to avoid an unattended error loop.
+BROADCASTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "broadcasts.json")
 
 assert STREAK_LENGTH >= 2, "STREAK_LENGTH must be at least 2 to mean anything"
 assert MAX_OPEN_POSITIONS >= 1, "BOT_MAX_POSITIONS must be at least 1"
@@ -170,6 +184,13 @@ log = logging.getLogger("alpaca_momentum_bot")
 
 # Off unless DASHBOARD_URL and DASHBOARD_TOKEN are set (see shared/dashboard_reporter.py).
 dashboard = DashboardReporter("alpaca-momentum-scanner", "Alpaca momentum scanner", broker="Alpaca", strategy="Momentum streak (buys only)")
+broadcasts = broadcast.Book(path=BROADCASTS_FILE, log=log)  # the broadcast trades it acted on (shared/broadcast.py)
+guests = set()  # shares outside the pool holding a broadcast trade: managed (stop, take-profit, closing time), never traded
+
+
+def managed(pool: list) -> list:
+    """The pool, plus the shares outside it holding a broadcast trade."""
+    return [*pool, *sorted(guests - set(pool))]
 
 
 # ---------------------------------------------------------------------------
@@ -276,19 +297,30 @@ def streak_gain(closes: list) -> float:
 # ---------------------------------------------------------------------------
 # ORDER EXECUTION
 # ---------------------------------------------------------------------------
-def submit_buy(api: tradeapi.REST, symbol: str) -> bool:
+_open_problem = ""  # why the last submit_buy() was refused, for a broadcast's answer
+
+
+def submit_buy(api: tradeapi.REST, symbol: str, notional: float = None, tag: str = None) -> bool:
+    """A market buy of one slice, or `notional` dollars (a broadcast's) - its
+    client order ID starting with `tag` if given. True if Alpaca took it."""
+    global _open_problem
+    _open_problem = ""
+    notional = TRADE_NOTIONAL_USD if notional is None else notional
+    label = {"client_order_id": f"{tag}-{uuid.uuid4().hex[:8]}"} if tag else {}
     try:
         order = api.submit_order(
             symbol=symbol,
-            notional=TRADE_NOTIONAL_USD,
+            notional=notional,
             side="buy",
             type="market",
             time_in_force="day",
+            **label,
         )
-        log.info(f"BUY submitted -> {symbol} notional=${TRADE_NOTIONAL_USD:.2f} order_id={order.id}")
+        log.info(f"BUY submitted -> {symbol} notional=${notional:.2f} order_id={order.id}")
         return True
     except (APIError, requests.exceptions.RequestException) as e:
         log.error(f"Error submitting BUY for {symbol}; will retry next loop: {e}")
+        _open_problem = str(e)
         return False
 
 
@@ -470,10 +502,124 @@ def close_from_dashboard(api: tradeapi.REST, symbols, symbol: str, ref, directio
     return answer
 
 
-def has_cash_for_a_slice(api: tradeapi.REST) -> bool:
+def has_cash_for_a_slice(api: tradeapi.REST, notional: float = None) -> bool:
     """Fractional buys can't use margin, so check settled-cash buying power."""
     account = api.get_account()
-    return float(account.non_marginable_buying_power) >= TRADE_NOTIONAL_USD
+    return float(account.non_marginable_buying_power) >= (TRADE_NOTIONAL_USD if notional is None else notional)
+
+
+# ---------------------------------------------------------------------------
+# BROADCAST TRADES FROM THE DASHBOARD (shared/broadcast.py)
+# ---------------------------------------------------------------------------
+def restore_guests(pool: list) -> None:
+    """After a restart: the shares outside the pool its open broadcast trades are in."""
+    for symbol in sorted(broadcasts.open_symbols() - set(pool)):
+        guests.add(symbol)
+        log.info(f"{symbol}: managing its broadcast trade (not in the pool).")
+
+
+def tradable_share(api: tradeapi.REST, symbol: str) -> bool:
+    try:
+        asset = api.get_asset(symbol)
+    except (APIError, requests.exceptions.RequestException):
+        return False
+    return getattr(asset, "class", None) == "us_equity" and asset.tradable and asset.fractionable
+
+
+def broadcast_plan(api: tradeapi.REST, pool: list, request, now: float, most: float = None) -> dict:
+    """The buy this bot would make for a broadcast, every limit applied - or
+    broadcast.Declined saying why not."""
+    if request.side != "buy":
+        raise broadcast.Declined(broadcast.UNAVAILABLE, "This bot only buys - fractional shares can't be sold short "
+                                                        "on Alpaca.")
+    found = symbols.candidates("alpaca", request.symbol)
+    symbol = candidate = None
+    for candidate in found:
+        code = candidate.code.upper()
+        if code in pool or code in guests or tradable_share(api, code):
+            symbol = code
+            break
+    if symbol is None:
+        raise broadcast.Declined(broadcast.UNAVAILABLE, f"{request.symbol} isn't a share or fund this bot can buy on "
+                                                        f"Alpaca (fractional)"
+                                 + (f" - looked for {', '.join(c.code for c in found)}." if found else "."))
+    clock = api.get_clock()
+    if not clock.is_open:
+        raise broadcast.Declined(broadcast.CLOSED, f"The US market is closed (it opens {clock.next_open}).")
+    if buys_paused(clock):
+        raise broadcast.Declined(broadcast.CLOSED, f"No buys in the last {max(LAST_ENTRY_MINUTES, FLAT_MINUTES):g} min "
+                                                   f"before the close.")
+    positions = {p.symbol: p for p in api.list_positions()}
+    if symbol in positions:
+        raise broadcast.Declined(broadcast.NO_SLOT, f"The account already holds {symbol}.")
+    held = [s for s in positions if s in pool or s in guests]
+    if len(held) >= MAX_OPEN_POSITIONS:
+        raise broadcast.Declined(broadcast.NO_SLOT, f"{len(held)} positions are already open (max {MAX_OPEN_POSITIONS}).")
+    if watch is not None and watch.cooling(symbol, now):
+        raise broadcast.Declined(broadcast.RISK, f"{symbol}: the stagnancy timeout sold it lately (cooldown).")
+    bid, ask = latest_prices(api, [symbol]).get(symbol, (None, None))
+    if not ask:
+        raise broadcast.Declined(broadcast.CLOSED, f"{symbol}: no price right now.")
+    notional, capped = broadcast.exposure_for(request, TRADE_NOTIONAL_USD, "USD", "budget slice")
+    if most is not None:  # no more shares than previewed (to the cent: the preview's shares are rounded)
+        notional = min(notional, round(most * ask, 2))
+    notional = int(round(notional * 100, 6)) / 100  # whole cents
+    if notional < 1.00:
+        raise broadcast.Declined(broadcast.RISK, f"${notional:.2f} is under Alpaca's $1 minimum order.")
+    if not has_cash_for_a_slice(api, notional):
+        raise broadcast.Declined(broadcast.RISK, f"Not enough settled cash for a ${notional:.2f} buy.")
+    shares = round(notional / ask, 6)
+    rule = watch.book.rule(symbol) if watch is not None else None
+    exits = (f"stop-loss {STOP_LOSS_PCT * 100:g}% (a stop order at Alpaca) / take-profit {TAKE_PROFIT_PCT * 100:g}%; "
+             + (f"sold {FLAT_MINUTES:g} min before the close" if FLAT_MINUTES else "held overnight")
+             + ("; falling streak" if symbol in pool else "; managed until it's sold (not in the pool)")
+             + (f"; stagnancy timeout ({rule.mode})" if rule and rule.mode != "off" else ""))
+    return {"symbol": symbol, "notional": notional, "shares": shares, "capped": capped,
+            "figures": broadcast.figures(
+                symbol=symbol, size=shares, sizeUnit="shares", exposure=notional,
+                risk=round(notional * STOP_LOSS_PCT, 2), currency="USD", entry=ask,
+                stopLoss=round(ask * (1 - STOP_LOSS_PCT), 2), takeProfit=round(ask * (1 + TAKE_PROFIT_PCT), 2),
+                accountMode=ACCOUNT_MODE, exits=exits, capped=capped or None,
+                standIn=candidate.canonical if candidate.stand_in else None, previewedAt=now)}
+
+
+def broadcast_preview(api: tradeapi.REST, pool: list, command: dict) -> tuple:
+    """What this bot would do with a broadcast trade: (a line, {figures})."""
+    request = broadcast.Request.parse(command)
+    plan = broadcast_plan(api, pool, request, time.time())
+    f = plan["figures"]
+    line = (f"Would buy ${plan['notional']:.2f} of {f['symbol']} (~{f['size']:g} shares at {f['entry']:g}): stop-loss "
+            f"{f['stopLoss']:g}, take-profit {f['takeProfit']:g}" + (f" ({plan['capped']})" if plan["capped"] else ""))
+    log.info(f"Broadcast #{request.id}: {line}")
+    return line + ".", f
+
+
+def broadcast_open(api: tradeapi.REST, pool: list, command: dict) -> tuple:
+    """Buy for a broadcast the admin confirmed - every limit checked again on
+    fresh prices, never more shares than previewed. (a line, {figures})."""
+    now = time.time()
+    request = broadcast.Request.parse(command)
+    broadcasts.check_new(request)
+    request.check_age(now)
+    plan = broadcast_plan(api, pool, request, now, most=request.size)
+    symbol = plan["symbol"]
+    broadcasts.opening(request, symbol, (), now)
+    if not submit_buy(api, symbol, plan["notional"], tag=f"broadcast-{request.id}"):
+        broadcasts.failed(request)
+        raise CommandError(f"Alpaca refused the buy: {_open_problem or 'see the bot log'}.")
+    broadcasts.opened(request, (), now)  # its rows are matched by share and time: Alpaca's positions carry no ID
+    if symbol not in pool:
+        guests.add(symbol)
+        log.info(f"{symbol}: not in the pool - managing its broadcast trade until it's sold, never trading it on a "
+                 f"streak.")
+    entry = plan["figures"]["entry"]
+    return f"Bought ${plan['notional']:.2f} of {symbol} (~{plan['shares']:g} shares at {entry:g}).", \
+        {"symbol": symbol, "size": plan["shares"], "price": entry}
+
+
+def broadcast_symbols(pool: list) -> list:
+    """The instrument names the dashboard can offer for this bot."""
+    return sorted(set(symbols.names("alpaca")) | set(pool))
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +635,11 @@ def report_to_dashboard(api: tradeapi.REST, symbols) -> None:
         positions = api.list_positions()
     except Exception:
         return
+    # Broadcast trades no longer held have been sold; their shares outside the pool stop being managed.
+    now = time.time()
+    broadcasts.sync({p.symbol for p in positions}, now)
+    broadcasts.prune(now)
+    guests.intersection_update(broadcasts.open_symbols())
     unrealized = sum(float(p.unrealized_pl) for p in positions)
     dashboard.update(
         account={"balance": float(account.equity) - unrealized, "equity": float(account.equity), "unrealizedPl": unrealized},
@@ -521,7 +672,115 @@ def report_closed_trade(order, position, reason: str, qty=None) -> None:
         "closedAt": datetime.now(timezone.utc).isoformat(),
         "pnl": float(position.unrealized_pl) * share,
         "closeReason": reason.split(",")[0],
+        **(watch.shadow_fields(position.symbol) if watch is not None else {}),  # what the stagnancy timeout saw
     })
+
+
+# ---------------------------------------------------------------------------
+# STAGNANCY TIMEOUT (shared/stagnancy.py)
+# ---------------------------------------------------------------------------
+watch = None            # the timeout, set up in run_bot()
+_opened = {}            # symbol -> (qty, when its latest buy filled): Alpaca's positions don't say when they opened
+_timeout_closes = {}    # symbol -> the TIMEOUT_STAGNANT sell: {"order": id, "entry": price, "row": its fill, once known}
+
+
+def latest_prices(api: tradeapi.REST, symbols: list) -> dict:
+    """{symbol: (bid, ask)} - IEX often shows one side only; then the last trade stands for both."""
+    quotes = api.get_latest_quotes(symbols, feed=DATA_FEED) if symbols else {}
+    prices = {}
+    for symbol in symbols:
+        quote = quotes.get(symbol)
+        bid, ask = (float(quote.bp or 0), float(quote.ap or 0)) if quote is not None else (0.0, 0.0)
+        if bid > 0 and ask >= bid:
+            prices[symbol] = (bid, ask)
+    missing = [s for s in symbols if s not in prices]
+    trades = api.get_latest_trades(missing, feed=DATA_FEED) if missing else {}
+    for symbol in missing:
+        if symbol in trades:
+            prices[symbol] = (float(trades[symbol].p), float(trades[symbol].p))
+    return prices
+
+
+def opened_at(api: tradeapi.REST, position):
+    """When the position's latest buy filled, looked up once per position size."""
+    cached = _opened.get(position.symbol)
+    if cached is not None and cached[0] == position.qty:
+        return cached[1]
+    orders = api.list_orders(status="closed", symbols=[position.symbol], limit=20, direction="desc")
+    filled = [pd.Timestamp(o.filled_at).timestamp() for o in orders if o.side == "buy" and o.filled_at]
+    _opened[position.symbol] = (position.qty, max(filled) if filled else None)
+    return _opened[position.symbol][1]
+
+
+def stagnancy_pass(api: tradeapi.REST, pool: list, positions: dict, stops: dict, closes_by_symbol: dict,
+                   acted_on_bar: dict) -> None:
+    """The stagnancy timeout over the pool's positions: one that has gone
+    nowhere for a while is logged (shadow) or sold (enforce). Alpaca fills
+    the sell a moment after taking it, so its slot is free once the position
+    has gone; the record sent with the sell is then corrected to the fill."""
+    now = time.time()
+    held_positions = {s: p for s, p in positions.items() if s in pool}
+    prices = latest_prices(api, sorted(held_positions))
+    held = []
+    for symbol, p in held_positions.items():
+        bid, ask = prices.get(symbol, (None, None))
+        watch.observe(symbol, now, bid, ask, symbol in prices)
+        qty, entry = float(p.qty), float(p.avg_entry_price)
+        held.append((stagnancy.Held(
+            key=symbol, symbol=symbol, direction="long", size=qty, entry=entry, opened_at=opened_at(api, p),
+            # Alpaca values a position at the last trade; selling gets the bid. No commission.
+            pnl=(bid - entry) * qty if bid else float(p.unrealized_pl),
+            risk=qty * entry * STOP_LOSS_PCT,
+        ), symbol in prices))
+
+    def close(h):
+        result = close_for_timeout(api, h, positions, stops)
+        if result.get("done"):  # as after any sell of its own: not bought straight back on the same bar
+            acted_on_bar[h.symbol] = closes_by_symbol.get(h.symbol, (None, None))[0]
+        return result
+
+    for symbol, fields in watch.run(held, now, close, fill_of=lambda s: timeout_fill(api, s)):
+        sold = _timeout_closes.pop(symbol, None)
+        if sold is not None:
+            dashboard.trade({"ref": sold["order"], **sold.get("row", {}), **fields})
+
+
+def close_for_timeout(api: tradeapi.REST, held, positions: dict, stops: dict) -> dict:
+    """Sell the position for the stagnancy timeout - its stop order at Alpaca
+    cancelled first, as Alpaca won't sell shares a stop order holds."""
+    symbol, position = held.symbol, positions.get(held.symbol)
+    try:
+        if stops.get(symbol) and not cancel_stops(api, symbol, stops[symbol]):
+            # The stop filled first: the next pass finds the position gone, and keeps the stop's reason.
+            return {"done": False, "problem": "its stop order at Alpaca filled first"}
+        order = api.close_position(symbol)
+    except (APIError, requests.exceptions.RequestException, RuntimeError) as e:
+        log.error(f"Error closing {symbol} ({stagnancy.TIMEOUT_REASON}): {e}")
+        return {"done": False, "problem": str(e)}
+    log.info(f"CLOSE submitted ({stagnancy.TIMEOUT_REASON}) -> {symbol} order_id={order.id}")
+    report_closed_trade(order, position, stagnancy.TIMEOUT_REASON)  # priced before the fill; corrected after
+    _timeout_closes[symbol] = {"order": str(order.id), "entry": float(position.avg_entry_price)}
+    return {"done": True, "filled": False, "refs": (str(order.id),)}
+
+
+def timeout_fill(api: tradeapi.REST, symbol: str):
+    """What the TIMEOUT_STAGNANT sell filled at, once the position has gone."""
+    sold = _timeout_closes.get(symbol)
+    if sold is None:
+        return None
+    try:
+        order = api.get_order(sold["order"])
+    except (APIError, requests.exceptions.RequestException) as e:
+        log.warning(f"{symbol}: couldn't look up sell order {sold['order']}: {e}")
+        return None
+    if not order.filled_avg_price or not float(order.filled_qty or 0):
+        return None
+    price, qty = float(order.filled_avg_price), float(order.filled_qty)
+    pnl = round((price - sold["entry"]) * qty, 2)
+    sold["row"] = {"symbol": symbol, "direction": "long", "size": qty, "entryPrice": sold["entry"],
+                   "exitPrice": price, "closedAt": pd.Timestamp(order.filled_at).isoformat(), "pnl": pnl,
+                   "closeReason": stagnancy.TIMEOUT_REASON}
+    return {"price": price, "pnl": pnl, "refs": (sold["order"],)}
 
 
 # ---------------------------------------------------------------------------
@@ -552,11 +811,15 @@ def scan_pool(api: tradeapi.REST, pool: list, positions: dict, stops: dict, clos
     `stops` symbol -> this bot's open stop orders. `acted_on_bar` remembers
     the bar each symbol was last bought, skipped or sold on, so a symbol is
     bought at most once per bar — and never straight back after a stop-loss
-    while the bar's streak still looks the same. Returns whether it bought."""
-    held = {s: p for s, p in positions.items() if s in pool}
+    while the bar's streak still looks the same. Returns whether it bought.
+    A broadcast trade's share outside the pool holds a slot and gets the
+    same exits, but no falling-streak sell: it has no bars here."""
+    held = {s: p for s, p in positions.items() if s in pool or s in guests}
 
     # Exits first, so any slot they free is available to this loop's buys.
     for symbol, position in list(held.items()):
+        if watch is not None and watch.closing(symbol):
+            continue  # its TIMEOUT_STAGNANT sell is under way; it holds its slot until that fills
         bar_time, closes = closes_by_symbol.get(symbol, (None, None))
         reason = exit_reason(position, closes, watch_stop=symbol not in stops)
         if reason and close_open_position(api, symbol, reason, position, stops.get(symbol, ())):
@@ -579,6 +842,9 @@ def scan_pool(api: tradeapi.REST, pool: list, positions: dict, stops: dict, clos
         if len(held) >= MAX_OPEN_POSITIONS:
             log.info(f"{symbol}: rising streak ({gain:+.2%}), but {MAX_OPEN_POSITIONS} "
                      f"positions are already open; skipping this bar.")
+        elif watch is not None and watch.cooling(symbol, time.time()):  # only with SCANNER_STAGNANT_COOLDOWN set
+            log.info(f"{symbol}: rising streak ({gain:+.2%}), but the stagnancy timeout sold it lately (cooldown); "
+                     f"skipping this bar.")
         elif not has_cash_for_a_slice(api):
             log.info(f"{symbol}: rising streak ({gain:+.2%}), but not enough cash for "
                      f"a ${TRADE_NOTIONAL_USD:.2f} buy; skipping this bar.")
@@ -654,6 +920,10 @@ def run_bot() -> None:
         + (f", no buys from {max(LAST_ENTRY_MINUTES, FLAT_MINUTES):g} min before it"
            if max(LAST_ENTRY_MINUTES, FLAT_MINUTES) else "")
     )
+    global watch
+    watch = stagnancy.start_watch("scanner", "alpaca", "alpaca-momentum-scanner", "Alpaca", log,
+                                  bar_seconds=BAR_LENGTH.total_seconds(), loop_seconds=LOOP_INTERVAL_SECONDS,
+                                  currency="USD")
     log.info("=" * 78)
 
     try:
@@ -665,13 +935,17 @@ def run_bot() -> None:
     except (APIError, requests.exceptions.RequestException) as e:
         log.error(f"Couldn't fetch account info at startup: {e}")
 
-    dashboard.describe(currency="USD", config={
+    dashboard.describe(currency="USD", account_mode=ACCOUNT_MODE, config={
         "pool": pool, "budgetUsd": BUDGET_USD, "maxPositions": MAX_OPEN_POSITIONS,
         "tradeUsd": TRADE_NOTIONAL_USD, "timeframe": TIMEFRAME, "streakLength": STREAK_LENGTH,
         "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
-        "flatMinutes": FLAT_MINUTES, "lastEntryMinutes": LAST_ENTRY_MINUTES,
+        "flatMinutes": FLAT_MINUTES, "lastEntryMinutes": LAST_ENTRY_MINUTES, **watch.book.config(),
     })
-    dashboard.accept_closes(lambda *command: close_from_dashboard(api, pool, *command))
+    dashboard.accept_closes(lambda *command: close_from_dashboard(api, managed(pool), *command))
+    restore_guests(pool)
+    dashboard.tag_rows(broadcasts.tags)
+    dashboard.accept_broadcasts(lambda command: broadcast_preview(api, pool, command),
+                                lambda command: broadcast_open(api, pool, command), broadcast_symbols(pool))
 
     closes_by_symbol = {}
     bars_as_of = None
@@ -683,13 +957,13 @@ def run_bot() -> None:
     while True:
         try:
             if dashboard.due():
-                report_to_dashboard(api, pool)
+                report_to_dashboard(api, managed(pool))
 
             clock = api.get_clock()
             if not clock.is_open:
                 log.info(f"Market is closed. Next open at {clock.next_open}. "
                          f"Sleeping {CLOSED_MARKET_SLEEP_SECONDS}s.")
-                dashboard.sleep(CLOSED_MARKET_SLEEP_SECONDS, lambda: report_to_dashboard(api, pool))
+                dashboard.sleep(CLOSED_MARKET_SLEEP_SECONDS, lambda: report_to_dashboard(api, managed(pool)))
                 continue
 
             positions = {p.symbol: p for p in api.list_positions()}
@@ -706,7 +980,7 @@ def run_bot() -> None:
                     log.info(f"Closing time: selling everything {FLAT_MINUTES:g} minutes before the "
                              f"{clock.next_close.tz_convert(MARKET_TZ):%H:%M} ET close, and no more buys today.")
                 for symbol, position in positions.items():
-                    if symbol in pool:
+                    if symbol in managed(pool) and not watch.closing(symbol):  # a TIMEOUT_STAGNANT sell is already out
                         close_open_position(api, symbol, "closing time", position, stops.get(symbol, ()))
                 last_seen = {}
             else:
@@ -716,12 +990,16 @@ def run_bot() -> None:
                     bars_as_of = settled
                     log_bar_summary(closes_by_symbol, positions, pool)
 
+                if watch.book.active:
+                    stagnancy_pass(api, managed(pool), positions, stops, closes_by_symbol, acted_on_bar)
                 if scan_pool(api, pool, positions, stops, closes_by_symbol, acted_on_bar,
                              buys_allowed=not buys_paused(clock)):
                     time.sleep(2)  # let the buys fill, so their stop orders go on straight away
                 positions = {p.symbol: p for p in api.list_positions()}
-                protect(api, pool, positions, own_stops(api))
-                last_seen = {s: p for s, p in positions.items() if s in pool}
+                # no new stop order for a position whose TIMEOUT_STAGNANT sell is filling
+                protect(api, managed(pool), {s: p for s, p in positions.items() if not watch.closing(s)},
+                        own_stops(api))
+                last_seen = {s: p for s, p in positions.items() if s in managed(pool)}
             seen_at = pd.Timestamp.now(tz="UTC")
         except Exception as e:  # anything unexpected counts toward the safety cutoff, not a crash
             consecutive_errors += 1
@@ -730,7 +1008,7 @@ def run_bot() -> None:
             continue
 
         consecutive_errors = 0
-        dashboard.sleep(LOOP_INTERVAL_SECONDS, lambda: report_to_dashboard(api, pool))  # reports fall due while it waits
+        dashboard.sleep(LOOP_INTERVAL_SECONDS, lambda: report_to_dashboard(api, managed(pool)))  # reports fall due while it waits
 
 
 if __name__ == "__main__":

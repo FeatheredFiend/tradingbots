@@ -1,0 +1,37 @@
+{
+  "_comment": "Exceptions to the stagnancy timeout's launcher settings (STAGNANT_MODE and <TYPE>_STAGNANT_*), for one broker or one market on it - these win. Copy this file to stagnancy.json (gitignored) to use it; bots read it when they start. Bot types: scalper, surge-follower, index-reversion, session-breakout, commodity-trend, ema, scanner. Brokers: oanda, pepperstone, capital, ig, alpaca. Settings: mode (off / shadow / enforce), min_age, window and cooldown (90s, 15m, 2h or 4bars), range (0.05% or 0.25atr) and pnl (1.50 or 0.2R). Markets go by the broker's own symbol (IG: the epic or the market's name). Keys starting with _ are notes.",
+
+  "scanner": {
+    "oanda": {
+      "_why": "Close the OANDA scanner's stagnant trades for real, and keep it out of that market for 15 minutes after.",
+      "mode": "enforce",
+      "cooldown": "15m"
+    },
+    "pepperstone": {
+      "symbols": {
+        "XAUUSD": {"_why": "Gold moves more than the FX pairs: a wider range still counts as going nowhere.", "range": "0.25%"}
+      }
+    }
+  },
+
+  "scalper": {
+    "ig": {
+      "_why": "IG's scalper reads prices every 10s at best: give it a longer look before calling a trade stagnant.",
+      "min_age": "3m",
+      "window": "2m"
+    },
+    "oanda": {
+      "symbols": {
+        "SPX500_USD": {"range": "0.015%"}
+      }
+    }
+  },
+
+  "commodity-trend": {
+    "pepperstone": {
+      "symbols": {
+        "SpotBrent": {"window": "24bars"}
+      }
+    }
+  }
+}
