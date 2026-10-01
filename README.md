@@ -1155,7 +1155,23 @@ for new windows):
 then restart the bots. Each sends a heartbeat with its new log lines every
 10 seconds and, every 15 seconds, its account, positions and recent trades
 (the IG bots once a minute, since IG's request limit is tight). If the dashboard is down, the bot keeps trading and holds back up
-to 2,000 log lines to send later. What each broker can report:
+to 2,000 log lines to send later.
+
+The bots' reports all go out through **one relay**. The dashboard's host
+hangs up a connection after 5 idle seconds, so each bot's report every 10
+seconds needed a new connection. With 25 bots that was ~150 a minute, and the
+host started leaving some unanswered (`[dashboard] couldn't report ...
+(<urlopen error timed out>)`). Now the first bot to report also runs a
+relay on `127.0.0.1:47817` (its console says "Passing every bot's dashboard
+reports on from here"), and every bot hands its reports to it. The relay
+sends them on over a few connections that stay open because they're kept
+busy. Reports still go every 10 seconds, and trades still show within
+seconds. When the relaying bot stops, the next bot to report takes over. If
+something else holds the port, or the relay stops answering, a bot reports
+straight to the dashboard for a minute and then tries the relay again.
+`DASHBOARD_RELAY_PORT` picks another port, or `0` to switch the relay off.
+
+What each broker can report:
 
 | Bots | Account, positions, trades | Extra broker calls |
 |---|---|---|

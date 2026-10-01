@@ -24,18 +24,37 @@ sleep() or run_commands(), never on the reporting thread, and the answer
 goes out straight away. Commands only ever close (part of) the bot's own
 positions; each one is carried out once at most.
 
+One relay for every bot on the PC
+---------------------------------
+The dashboard's host hangs up a connection after 5 idle seconds, so a bot
+reporting every 10 seconds needs a new HTTPS connection for every report.
+With 25 bots that's ~150 a minute, and the host began leaving some of them
+unanswered ("<urlopen error timed out>"). So the first bot to report also
+runs a small relay on 127.0.0.1:DASHBOARD_RELAY_PORT (default 47817), and
+every bot hands its reports to it; the relay passes them on over a few
+connections that are kept busy enough to stay open. Each bot still gets its
+own reply (and commands) back, and nothing gets slower. When the relaying
+bot stops, the next bot to report takes over. DASHBOARD_RELAY_PORT=0 turns
+it off - every bot posts straight to the dashboard - and a bot also does
+that for a minute whenever the relay can't be used.
+
 Standard library only, so it works in every bot's venv.
 """
 
 import atexit
 import collections
+import http.client
+import http.server
 import json
 import logging
 import os
+import socket
+import socketserver
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -50,6 +69,23 @@ TIMEOUT_SECONDS = 10
 MAX_LOG_BACKLOG = 2000        # lines kept while the dashboard is unreachable
 MAX_LOGS_PER_REPORT = 500
 COMPLAIN_EVERY_SECONDS = 600  # how often a failing dashboard is mentioned on the console
+
+
+def _relay_port(value) -> int:
+    value = (value or "").strip().lower()
+    if value in ("0", "off", "no", "false"):
+        return 0
+    return int(value) if value.isdigit() and 0 < int(value) < 65536 else 47817
+
+
+RELAY_PORT = _relay_port(os.environ.get("DASHBOARD_RELAY_PORT"))  # 0 = no relay
+RELAY_PATH = "/tradingbots-dashboard-relay"
+RELAY_HEADER = "X-Dashboard-Relay"   # the relay's answers carry it, naming the bot that runs it
+RELAY_CONNECTIONS = 6         # reports the relay passes on at once; more wait their turn
+RELAY_QUEUE_SECONDS = 5       # ...this long at most
+RELAY_WAIT_SECONDS = TIMEOUT_SECONDS + RELAY_QUEUE_SECONDS + 5  # a bot's wait for the relay's answer
+RELAY_MISSES = 3              # unanswered reports in a row before a bot stops using the relay...
+RELAY_RETRY_SECONDS = 60      # ...for this long, posting straight to the dashboard instead
 
 
 class CommandError(Exception):
@@ -84,6 +120,9 @@ class DashboardReporter:
         self._soon = []               # monotonic times due() comes round early - see report_soon()
         self._send_now = False        # the next update() goes out straight away, not with the next report
         self._last_complaint = 0.0
+        self._relay_misses = 0        # reports in a row the relay didn't answer
+        self._relay_off_until = 0.0   # monotonic time until which reports skip the relay
+        self._last_relay_note = 0.0
         self._stop = threading.Event()
         self._thread = None
 
@@ -294,10 +333,19 @@ class DashboardReporter:
                     self._inbox.append(command)
 
     def _post(self, report: dict):
-        """The dashboard's reply (a dict) if it took the report, else None."""
+        """The dashboard's reply (a dict) if it took the report, else None.
+        Goes through the relay unless that's off or can't be used just now."""
+        body = json.dumps(report, default=_json_default).encode()
+        if RELAY_PORT and time.monotonic() >= self._relay_off_until:
+            reply = self._post_via_relay(body)
+            if reply is not _NO_RELAY:
+                return reply
+        return self._post_direct(body)
+
+    def _post_direct(self, body: bytes):
         request = urllib.request.Request(
             URL + "/api/ingest",
-            data=json.dumps(report, default=_json_default).encode(),
+            data=body,
             method="POST",
             headers={"Content-Type": "application/json", "X-Dashboard-Token": TOKEN,
                      "User-Agent": "tradingbots-dashboard-reporter/1"},
@@ -306,16 +354,56 @@ class DashboardReporter:
             with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
                 if not 200 <= response.status < 300:
                     return None
-                try:
-                    reply = json.loads(response.read() or b"{}")
-                except ValueError:
-                    reply = {}
-                return reply if isinstance(reply, dict) else {}
+                return _reply(response.read())
         except urllib.error.HTTPError as e:
             self._complain(f"HTTP {e.code}: {e.read(300).decode(errors='replace')}")
         except Exception as e:
             self._complain(str(e))
         return None
+
+    def _post_via_relay(self, body: bytes):
+        """Like _post_direct, but through the relay - which this bot starts
+        if no other bot is running one. _NO_RELAY if it can't be used, and
+        then the report goes straight to the dashboard instead."""
+        for _ in range(3):
+            try:
+                status, relayed_by, data = _ask_relay(body)
+                break
+            except ConnectionRefusedError:
+                # No relay running, or its bot just stopped: run it here, unless another bot just did.
+                if not _host_relay(self._bot["slug"]):
+                    time.sleep(0.2)
+            except (ConnectionResetError, ConnectionAbortedError):  # the relaying bot is stopping
+                time.sleep(0.2)
+            except (_NotARelay, http.client.HTTPException) as e:
+                return self._skip_relay(str(e) or type(e).__name__)
+            except OSError as e:  # no answer in time
+                self._relay_misses += 1
+                if self._relay_misses >= RELAY_MISSES:
+                    self._relay_off_until = time.monotonic() + RELAY_RETRY_SECONDS
+                self._complain(f"no answer from the reports relay: {e}")
+                return None
+        else:
+            return self._skip_relay("couldn't start it or reach it")
+
+        self._relay_misses = 0
+        if 200 <= status < 300:
+            return _reply(data)
+        try:
+            problem = json.loads(data)["relayError"]
+        except (ValueError, TypeError, KeyError):
+            problem = f"HTTP {status}: {data[:300].decode(errors='replace')}"
+        self._complain(f"{problem}; passed on by {relayed_by}")
+        return None
+
+    def _skip_relay(self, why: str):
+        self._relay_off_until = time.monotonic() + RELAY_RETRY_SECONDS
+        now = time.monotonic()
+        if now - self._last_relay_note >= COMPLAIN_EVERY_SECONDS:
+            self._last_relay_note = now
+            print(f"[dashboard] not using the reports relay on 127.0.0.1:{RELAY_PORT} ({why}); "
+                  f"reporting straight to the dashboard for now.", file=sys.stderr)
+        return _NO_RELAY
 
     def _complain(self, problem: str) -> None:
         # Straight to stderr, not logging - a logged complaint would itself be
@@ -348,3 +436,200 @@ def _json_default(value):
     if hasattr(value, "item"):
         return value.item()
     return str(value)
+
+
+def _reply(data: bytes) -> dict:
+    try:
+        reply = json.loads(data or b"{}")
+    except ValueError:
+        reply = {}
+    return reply if isinstance(reply, dict) else {}
+
+
+# -- the relay (see "One relay for every bot on the PC" at the top) ----------
+_NO_RELAY = object()
+_relay_server = None          # this process's relay, if it runs it
+_relay_server_lock = threading.Lock()
+
+
+class _NotARelay(Exception):
+    """Something else answers on the relay's port, or a relay for another dashboard."""
+
+
+def _ask_relay(body: bytes):
+    """Hand one report to the relay: (HTTP status, the bot running the
+    relay, the dashboard's answer). Raises ConnectionRefusedError when no
+    relay is running."""
+    connection = http.client.HTTPConnection("127.0.0.1", RELAY_PORT, timeout=RELAY_WAIT_SECONDS)
+    try:
+        # HTTP/1.1 with no "Connection: close": the relay waits for us to hang
+        # up, so the closed connection lingers on this side, not the relay's port.
+        connection.request("POST", RELAY_PATH, body, {
+            "Content-Type": "application/json", "X-Dashboard-Token": TOKEN, "X-Dashboard-Url": URL})
+        response = connection.getresponse()
+        data = response.read()
+    finally:
+        connection.close()
+    relayed_by = response.getheader(RELAY_HEADER)
+    if relayed_by is None:
+        raise _NotARelay(f"something else answers there (HTTP {response.status})")
+    if response.status == 421:
+        raise _NotARelay(_reply(data).get("relayError") or "it reports to another dashboard")
+    return response.status, relayed_by, data
+
+
+def _host_relay(slug: str) -> bool:
+    """Start the relay in this process. False if the port is taken - most
+    likely another bot has just started it."""
+    global _relay_server
+    with _relay_server_lock:
+        if _relay_server is None:
+            try:
+                server = _RelayServer(("127.0.0.1", RELAY_PORT), _RelayHandler)
+            except OSError:
+                return False
+            server.relay = _Relay(URL)
+            server.slug = slug
+            threading.Thread(target=server.serve_forever, name="dashboard-relay", daemon=True).start()
+            _relay_server = server
+            logging.getLogger(__name__).info(
+                f"Passing every bot's dashboard reports on from here (relay on 127.0.0.1:{RELAY_PORT}).")
+    return True
+
+
+def _stop_relay() -> None:
+    """Stop this process's relay, if it runs one (for tests)."""
+    global _relay_server
+    with _relay_server_lock:
+        server, _relay_server = _relay_server, None
+    if server is not None:
+        server.shutdown()
+        server.server_close()
+        server.relay.close()
+
+
+class _RelayServer(http.server.ThreadingHTTPServer):
+    # Never share the port: on Windows SO_REUSEADDR would let a second bot
+    # bind it too, so ask for it exclusively instead.
+    allow_reuse_address = False
+    allow_reuse_port = False
+    request_queue_size = 64
+    block_on_close = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        socketserver.TCPServer.server_bind(self)  # not HTTPServer's: its reverse DNS lookup can take seconds
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+class _RelayHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    timeout = 60  # a bot that never hangs up
+
+    def do_POST(self):
+        try:
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        except ValueError:
+            return self._answer(400, {"relayError": "no Content-Length"})
+        relay = self.server.relay
+        if self.path != RELAY_PATH:
+            self._answer(404, {"relayError": f"the relay takes reports at {RELAY_PATH}"})
+        elif self.headers.get("X-Dashboard-Url", "") != relay.url:
+            self._answer(421, {"relayError": f"the relay on this port reports to {relay.url}"})
+        else:
+            self._answer(*relay.forward(body, self.headers.get("X-Dashboard-Token", "")))
+
+    def _answer(self, status: int, data) -> None:
+        if isinstance(data, dict):
+            data = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header(RELAY_HEADER, self.server.slug)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, format, *args):
+        pass  # else a line per report on the relaying bot's console
+
+
+class _Relay:
+    """Passes reports on to the dashboard, reusing connections while the
+    dashboard's server would still keep them open, and opening a new one
+    only when none is free."""
+
+    def __init__(self, url: str):
+        self.url = url
+        parts = urllib.parse.urlsplit(url)
+        self._connection_class = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+        self._address = (parts.hostname, parts.port)
+        self._path = parts.path + "/api/ingest"
+        self._lock = threading.Lock()
+        self._idle = []           # (connection, reusable until), most recently used last
+        self._slots = threading.BoundedSemaphore(RELAY_CONNECTIONS)
+        self.opened = 0           # connections opened so far
+
+    def forward(self, body: bytes, token: str):
+        """(HTTP status, answer) - the dashboard's, or a "relayError" one."""
+        if not self._slots.acquire(timeout=RELAY_QUEUE_SECONDS):
+            return 503, {"relayError": f"the relay is busy ({RELAY_CONNECTIONS} reports already on their way)"}
+        try:
+            for attempt in range(2):
+                connection, reused = self._take(new=attempt > 0)
+                try:
+                    connection.request("POST", self._path, body, {
+                        "Content-Type": "application/json", "X-Dashboard-Token": token,
+                        "User-Agent": "tradingbots-dashboard-relay/1"})
+                    response = connection.getresponse()
+                    data = response.read()
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
+                    connection.close()
+                    if reused:
+                        continue  # the server hung up the kept connection first; once more on a new one
+                    return 502, {"relayError": str(e) or type(e).__name__}
+                except Exception as e:
+                    connection.close()
+                    return 502, {"relayError": str(e) or type(e).__name__}
+                self._keep(connection, response)
+                return response.status, data
+        finally:
+            self._slots.release()
+
+    def _take(self, new: bool):
+        now = time.monotonic()
+        with self._lock:
+            stale = [connection for connection, until in self._idle if until <= now]
+            self._idle = [(connection, until) for connection, until in self._idle if until > now]
+            connection = self._idle.pop()[0] if self._idle and not new else None
+            if connection is None:
+                self.opened += 1
+        for old in stale:
+            old.close()
+        if connection is not None:
+            return connection, True
+        return self._connection_class(*self._address, timeout=TIMEOUT_SECONDS), False
+
+    def _keep(self, connection, response) -> None:
+        if connection.sock is None:
+            return  # the server closed it (e.g. after its 100th request)
+        until = time.monotonic() + _reusable_for(response.getheader("Keep-Alive"))
+        with self._lock:
+            self._idle.append((connection, until))
+
+    def close(self) -> None:
+        with self._lock:
+            idle, self._idle = self._idle, []
+        for connection, _ in idle:
+            connection.close()
+
+
+def _reusable_for(keep_alive) -> float:
+    """How long a connection may sit idle and still be used: a second less
+    than the server's Keep-Alive timeout (Hostinger's LiteSpeed says
+    "timeout=5, max=100"), or 4 seconds if it doesn't say."""
+    for part in (keep_alive or "").split(","):
+        name, _, value = part.strip().partition("=")
+        if name.lower() == "timeout" and value.strip().isdigit():
+            return max(0, min(int(value) - 1, 60))
+    return 4
