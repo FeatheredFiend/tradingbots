@@ -18,7 +18,8 @@ Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
 - A reversal streak closes an opposing open position; the same-direction
   streak while already positioned is a no-op (no pyramiding).
 - Risk mgmt : 2% stop-loss / 5% take-profit by default (STOP_LOSS_PERCENT /
-  TAKE_PROFIT_PERCENT env vars), attached natively to the order (same
+  TAKE_PROFIT_PERCENT env vars, shared with the other scanners;
+  IG_TAKE_PROFIT_PERCENT sets this bot's own take-profit), attached natively to the order (same
   mechanism as ig_cfd_ema_bot.py — IG's CFD orders support this directly,
   no manual polling needed).
 - Loss caps : IG's smallest trade is still big, so money limits sit on top
@@ -27,6 +28,11 @@ Strategy — momentum streak (no smoothing, reacts fast, whipsaws more)
   £25, at most 5 positions are open at once, and once the day is £250
   down the bot closes its positions and opens nothing until the next
   daily rollover. See "Loss limits" in the configuration below.
+- Profit/time: optional, all off by default (IG_MAX_TRADE_PROFIT /
+  IG_DAILY_GIVEBACK / IG_PAUSE_TIMES): a take-profit is pulled in wherever
+  reaching it would make more than a set amount, a day that has been up
+  stops once it gives back a set amount from its best, and streaks open
+  nothing during set UK times. See "Profit and time limits" below.
 - Overnight : the positions it opened are closed 15 minutes before the
   daily rollover (22:00 UK), so no overnight funding is paid, and nothing
   new opens from an hour before it to 45 minutes after
@@ -126,6 +132,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from dashboard_reporter import CommandError, DashboardReporter  # noqa: E402 - needs the path above
 import broadcast  # noqa: E402 - needs the path above
 import rollover  # noqa: E402 - needs the path above
+from engine import clock  # noqa: E402 - rollover puts strategy-bots on the path
 import stagnancy  # noqa: E402 - needs the path above
 import symbols  # noqa: E402 - needs the path above
 
@@ -177,7 +184,19 @@ BROADCASTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "broa
 # minimum stop/limit distance per market, so a very tight value can get a
 # trade rejected (the rejection reason is logged).
 STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PERCENT", "2")) / 100
-TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PERCENT", "5")) / 100
+
+
+def _take_profit_setting() -> float:
+    """IG_TAKE_PROFIT_PERCENT, this bot's own take-profit, or the
+    TAKE_PROFIT_PERCENT the scanners share when it's empty - as a fraction.
+    IG_MAX_TRADE_LOSS pulls most stops here far closer than
+    STOP_LOSS_PERCENT (Japan 225: about 0.1%, not 0.5%), so the shared
+    target can be 15 times the stop - over 1,000 points on Japan 225."""
+    text = os.environ.get("IG_TAKE_PROFIT_PERCENT", "").strip() or os.environ.get("TAKE_PROFIT_PERCENT", "5")
+    return float(text) / 100
+
+
+TAKE_PROFIT_PCT = _take_profit_setting()
 
 
 def _limit_setting(name: str, default: float) -> float:
@@ -209,6 +228,42 @@ DAILY_LOSS_LIMIT = _limit_setting("IG_DAILY_LOSS_LIMIT", 250)
 # after one of the bot's positions closes.
 DAY_TRADES_EVERY_SECONDS = 120
 
+
+def _pause_times(text: str) -> list:
+    """IG_PAUSE_TIMES, e.g. "13:00-17:00" or "13:00-17:00,19:30-21:00" (UK
+    time), as [(start, end)] pairs of datetime.time. A window may run past
+    midnight, e.g. "23:00-01:00"."""
+    windows = []
+    for part in text.split(","):
+        if not part.strip():
+            continue
+        try:
+            start, end = (clock.parse_hhmm(t) for t in part.split("-"))
+        except ValueError:
+            raise ValueError(f"IG_PAUSE_TIMES: {part.strip()!r} isn't a UK time window like 13:00-17:00") from None
+        if start == end:
+            raise ValueError(f"IG_PAUSE_TIMES: {part.strip()!r} starts and ends at the same time")
+        windows.append((start, end))
+    return windows
+
+
+# Profit and time limits, in the account's currency; 0 (or empty) switches
+# one off, and all three are off by default:
+# - MAX_TRADE_PROFIT pulls a trade's take-profit in closer than the
+#   percentage wherever reaching it would make more than this, the way
+#   MAX_TRADE_LOSS pulls the stop in. 1.5% is about £400 on Japan 225 but
+#   £13 on an EUR/USD Mini, so only the big contracts' targets move.
+# - DAILY_GIVEBACK: once the day (counted as DAILY_LOSS_LIMIT counts it) has
+#   been this much up, falling this far below its best closes the bot's
+#   positions and opens nothing more until the rollover - so a day that got
+#   that far ends at about break-even or better. The best is rebuilt from
+#   the day's closed trades at a restart (open positions' highs are lost).
+# - PAUSE_TIMES: UK times when a streak opens nothing (closes still happen,
+#   and so do the dashboard's broadcast trades).
+MAX_TRADE_PROFIT = _limit_setting("IG_MAX_TRADE_PROFIT", 0)
+DAILY_GIVEBACK = _limit_setting("IG_DAILY_GIVEBACK", 0)
+PAUSE_TIMES = _pause_times(os.environ.get("IG_PAUSE_TIMES", ""))
+
 # No fixed loop interval: the rate limiter below paces every request, so a
 # full pass over ~15 symbols naturally takes well under a minute — each
 # symbol gets sampled many times per 15-minute bar, so a bar's close is
@@ -223,7 +278,8 @@ ERROR_BACKOFF_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
 
 assert STREAK_LENGTH >= 2, "STREAK_LENGTH must be at least 2 to mean anything"
-assert STOP_LOSS_PCT > 0 and TAKE_PROFIT_PCT > 0, "STOP_LOSS_PERCENT and TAKE_PROFIT_PERCENT must be positive"
+assert STOP_LOSS_PCT > 0 and TAKE_PROFIT_PCT > 0, \
+    "STOP_LOSS_PERCENT and TAKE_PROFIT_PERCENT (or IG_TAKE_PROFIT_PERCENT) must be positive"
 
 # ---------------------------------------------------------------------------
 # LOGGING
@@ -658,6 +714,29 @@ def stop_distance_for(name: str, epic: str, details: dict, price: float, directi
     return capped
 
 
+def limit_distance_for(details: dict, price: float) -> float:
+    """TAKE_PROFIT_PCT from the price, in points, pulled in closer where
+    reaching it would make more than MAX_TRADE_PROFIT - but never closer
+    than IG's minimum distance."""
+    distance = compute_point_distance(price, TAKE_PROFIT_PCT, details["scaling_factor"])
+    per_point = money_per_point(details) if MAX_TRADE_PROFIT else None
+    if not per_point:  # off, or no exchange rate yet (the stop skips the trade then anyway)
+        return distance
+    capped = math.floor(MAX_TRADE_PROFIT / per_point * 10 + 1e-9) / 10  # IG takes tenths of a point
+    if capped >= distance:
+        return distance
+    return max(capped, math.ceil(closest_stop(details, price) * 10 - 1e-9) / 10)
+
+
+def paused_window(now: float = None) -> Optional[str]:
+    """The IG_PAUSE_TIMES window `now` falls in, e.g. "13:00-17:00", or None."""
+    t = clock.local("london", time.time() if now is None else now).time()
+    for start, end in PAUSE_TIMES:
+        if (start <= t < end) if start < end else (t >= start or t < end):
+            return f"{start:%H:%M}-{end:%H:%M}"
+    return None
+
+
 def deal_outcome(result) -> str:
     """'ACCEPTED', or e.g. 'REJECTED (INSUFFICIENT_FUNDS)' — IG's deal
     confirmation says why a deal failed, and the status alone doesn't."""
@@ -692,7 +771,7 @@ def open_position(ig_service: IGService, epic: str, name: str, details: dict, pr
     if stop_distance is None:
         _open_problem = "its stop can't be placed within the loss limit (see the log)"
         return False
-    limit_distance = compute_point_distance(price, TAKE_PROFIT_PCT, details["scaling_factor"])
+    limit_distance = limit_distance_for(details, price)
     try:
         result = ig_service.create_open_position(
             currency_code=details["currency"], direction=direction, epic=epic, expiry=details["expiry"],
@@ -832,14 +911,17 @@ def close_for_timeout(ig_service: IGService, held, name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# LOSS LIMITS (MAX_POSITIONS, DAILY_LOSS_LIMIT - MAX_TRADE_LOSS is in the stop)
+# LOSS LIMITS (MAX_POSITIONS, DAILY_LOSS_LIMIT, DAILY_GIVEBACK - MAX_TRADE_LOSS
+# is in the stop)
 # ---------------------------------------------------------------------------
-DAILY_LOSS_REASON = "daily loss limit"  # the close reason the log shows
+DAILY_LOSS_REASON = "daily loss limit"  # the close reasons the log shows
+GIVEBACK_REASON = "daily giveback"
 
 
 class _LossLimits:
-    """Where the position cap and the daily loss limit stand. The main loop
-    calls update() once a pass, with that pass's positions."""
+    """Where the position cap, the daily loss limit and the daily giveback
+    stand. The main loop calls update() once a pass, with that pass's
+    positions."""
 
     def __init__(self):
         self.open_positions = 0   # in the pool's markets; open_position() adds the ones it opens
@@ -848,31 +930,35 @@ class _LossLimits:
         self.read_at = None       # time.monotonic() of that read; None = read on the next pass
         self.own_open = set()     # the bot's positions open at the last pass
         self.day_pl = 0.0         # closed_pl + the bot's open positions, as of the last pass
-        self.stopped = False      # the daily loss limit was reached this trading day
+        self.best = 0.0           # the day's best day_pl so far (its start counts as 0)
+        self.stopped = None       # why the bot stopped for the day (the close reason), or None
 
     def why_no_new_trades(self) -> Optional[str]:
         """Why a new trade mustn't open now, or None if it may."""
+        until = f"no new trades until the rollover at {rollover.next_rollover_uk()} UK"
+        if self.stopped == GIVEBACK_REASON:
+            return (f"the day gave back IG_DAILY_GIVEBACK={DAILY_GIVEBACK:g} {CURRENCY_CODE} from its best "
+                    f"({self.best:+.2f}) - {until}")
         if self.stopped:
-            return (f"the day's loss reached IG_DAILY_LOSS_LIMIT={DAILY_LOSS_LIMIT:g} {CURRENCY_CODE} - no new "
-                    f"trades until the rollover at {rollover.next_rollover_uk()} UK")
+            return f"the day's loss reached IG_DAILY_LOSS_LIMIT={DAILY_LOSS_LIMIT:g} {CURRENCY_CODE} - {until}"
         if MAX_POSITIONS and self.open_positions >= MAX_POSITIONS:
             return f"{self.open_positions} positions are open already (IG_MAX_POSITIONS={MAX_POSITIONS})"
         return None
 
     def update(self, ig_service: IGService, positions: Optional[pd.DataFrame], pool: list):
-        """Counts the open positions and checks the day's loss, closing the
-        bot's positions once it's over the limit. Returns `positions`
-        without any it closed."""
+        """Counts the open positions and checks the day's loss and giveback,
+        closing the bot's positions once either is reached. Returns
+        `positions` without any it closed."""
         rows = _pool_positions(positions, pool)
         self.open_positions = len(rows)
-        if not DAILY_LOSS_LIMIT:
+        if not DAILY_LOSS_LIMIT and not DAILY_GIVEBACK:
             return positions
 
         day_start = rollover.trading_day_start()
         if day_start != self.day_start:
             if self.stopped:
-                log.info("A new trading day has started: the daily loss limit is reset, new trades are allowed again.")
-            self.day_start, self.stopped, self.read_at = day_start, False, None
+                log.info(f"A new trading day has started: the {self.stopped} is reset, new trades are allowed again.")
+            self.day_start, self.stopped, self.read_at, self.best = day_start, None, None, 0.0
         own = [p for p in rows if p["dealId"] in own_trades]
         own_open = {p["dealId"] for p in own}
         if self.own_open - own_open:  # a stop, a take-profit or a close since the last pass
@@ -883,18 +969,31 @@ class _LossLimits:
                 trades = fetch_closed_trades(ig_service, pool, since=day_start, page_size=500)
                 self.closed_pl = sum(t["pnl"] or 0.0 for t in trades)
                 self.read_at = time.monotonic()
+                # The best the closed trades reached in turn - so a restart remembers a good morning.
+                running = 0.0
+                for t in sorted(trades, key=lambda t: t["closedAt"]):
+                    running += t["pnl"] or 0.0
+                    self.best = max(self.best, running)
             except Exception as e:  # keep the last total and try again next pass
-                log.warning(f"Couldn't read the day's closed trades for the daily loss limit: "
+                log.warning(f"Couldn't read the day's closed trades for the daily loss limits: "
                             f"{e or 'empty response - likely rate limited'}")
 
         self.day_pl = self.closed_pl + sum(position_pnl(p) or 0.0 for p in own)
-        if not self.stopped and self.day_pl <= -DAILY_LOSS_LIMIT:
-            self.stopped = True
+        self.best = max(self.best, self.day_pl)
+        if not self.stopped and DAILY_LOSS_LIMIT and self.day_pl <= -DAILY_LOSS_LIMIT:
+            self.stopped = DAILY_LOSS_REASON
             log.warning(f"Daily loss limit reached: the day is {self.day_pl:.2f} {CURRENCY_CODE} (closed trades "
                         f"{self.closed_pl:.2f}), limit {DAILY_LOSS_LIMIT:g}. Closing this bot's {len(own)} "
                         f"position(s); no new trades until the rollover at {rollover.next_rollover_uk()} UK.")
+        elif (not self.stopped and DAILY_GIVEBACK and self.best >= DAILY_GIVEBACK
+              and self.day_pl <= self.best - DAILY_GIVEBACK):
+            self.stopped = GIVEBACK_REASON
+            log.warning(f"Daily giveback reached: the day is {self.day_pl:+.2f} {CURRENCY_CODE} (closed trades "
+                        f"{self.closed_pl:+.2f}), down {DAILY_GIVEBACK:g} from its best of {self.best:+.2f}. "
+                        f"Closing this bot's {len(own)} position(s); no new trades until the rollover at "
+                        f"{rollover.next_rollover_uk()} UK.")
         if self.stopped and own:
-            positions = close_own_positions(ig_service, positions, pool, DAILY_LOSS_REASON)
+            positions = close_own_positions(ig_service, positions, pool, self.stopped)
             self.open_positions = len(_pool_positions(positions, pool))
         return positions
 
@@ -1041,10 +1140,11 @@ def broadcast_plan(ig_service: IGService, pool: list, request, now: float, most:
         capped = "IG always trades the market's minimum size"
     sign = 1 if direction == "BUY" else -1
     entry = float(details["offer"] if sign > 0 else details["bid"])
-    limit_distance = compute_point_distance(price, TAKE_PROFIT_PCT, details["scaling_factor"])
+    limit_distance = limit_distance_for(details, price)
     rule = watch.book.rule(epic, (name,)) if watch is not None else None
     exits = (f"stop-loss {STOP_LOSS_PCT * 100:g}% (closer if it would lose over {MAX_TRADE_LOSS:g}) / take-profit "
-             f"{TAKE_PROFIT_PCT * 100:g}% at IG; "
+             f"{TAKE_PROFIT_PCT * 100:g}%"
+             + (f" (closer if it would make over {MAX_TRADE_PROFIT:g})" if MAX_TRADE_PROFIT else "") + " at IG; "
              + (f"closed {rollover.FLAT_MINUTES} min before the rollover" if rollover.FLAT_MINUTES else "held overnight")
              + ("; streak reversal" if any(i["epic"] == epic for i in pool) else "; managed until it closes (not in the pool)")
              + (f"; stagnancy timeout ({rule.mode})" if rule and rule.mode != "off" else ""))
@@ -1314,6 +1414,11 @@ def trading_cycle(ig_service: IGService, item: dict, positions: Optional[pd.Data
         # only with SCANNER_STAGNANT_COOLDOWN set
         log.info(f"{name} ({epic}): {signal} streak, but the stagnancy timeout closed it lately (cooldown); skipping.")
         return
+    window = paused_window() if position is None and signal else None
+    if window:
+        log.info(f"{name} ({epic}): {signal} streak, but new trades are paused {window} UK (IG_PAUSE_TIMES); "
+                 f"skipping.")
+        return
 
     closed = False
     if signal == "bullish":
@@ -1358,6 +1463,12 @@ def run_bot() -> None:
         f"Loss limits ({CURRENCY_CODE}, 0 = off): a trade's stop loses at most {MAX_TRADE_LOSS:g} | "
         f"at most {MAX_POSITIONS} positions open | stops for the day {DAILY_LOSS_LIMIT:g} down"
     )
+    log.info(
+        f"Profit and time limits (0 = off): a trade's take-profit makes at most {MAX_TRADE_PROFIT:g} | "
+        f"stops for the day {DAILY_GIVEBACK:g} below its best, once that far up | streaks open nothing "
+        + (", ".join(f"{start:%H:%M}-{end:%H:%M}" for start, end in PAUSE_TIMES) + " UK" if PAUSE_TIMES
+           else "never (IG_PAUSE_TIMES empty)")
+    )
     pass_seconds = (len(pool) + 1) * 60 / REQUESTS_PER_MINUTE
     if pass_seconds > BAR_SECONDS / 3:
         log.warning(f"A pass over {len(pool)} markets takes about {pass_seconds:.0f}s at IG's pace, so each "
@@ -1372,6 +1483,8 @@ def run_bot() -> None:
         "markets": [item["name"] for item in pool], "timeframe": TIMEFRAME, "streakLength": STREAK_LENGTH,
         "stopLossPercent": STOP_LOSS_PCT * 100, "takeProfitPercent": TAKE_PROFIT_PCT * 100,
         "maxTradeLoss": MAX_TRADE_LOSS, "maxPositions": MAX_POSITIONS, "dailyLossLimit": DAILY_LOSS_LIMIT,
+        "maxTradeProfit": MAX_TRADE_PROFIT, "dailyGiveback": DAILY_GIVEBACK,
+        "pauseTimes": [f"{start:%H:%M}-{end:%H:%M}" for start, end in PAUSE_TIMES],
         **watch.book.config(),
     })
     dashboard.accept_closes(lambda *command: close_from_dashboard(ig_service, managed(pool), *command))

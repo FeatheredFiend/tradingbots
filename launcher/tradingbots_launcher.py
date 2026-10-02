@@ -648,6 +648,8 @@ SETTING_GROUPS = [
                 number=True),
         Sub("Scanner and EMA bot"),
         Setting("IG_POOL", "Scanner markets", "Comma-separated - empty for the default 15"),
+        Setting("IG_TAKE_PROFIT_PERCENT", "Scanner take-profit %", "Of the entry price, for the IG scanner alone - "
+                                                                   "empty = the scanners' Take-profit %", number=True),
         Setting("IG_WATCHLIST", "EMA bot markets", "Comma-separated names, or Name:EPIC"),
         Sub("Scanner loss limits"),
         Setting("IG_MAX_TRADE_LOSS", "Max loss a trade", "Account currency; pulls the stop in so a stop-out loses at "
@@ -656,6 +658,14 @@ SETTING_GROUPS = [
         Setting("IG_DAILY_LOSS_LIMIT", "Daily loss limit", "Account currency; once the day is this far down it closes "
                                                            "its trades until the 22:00 UK rollover - default 250, "
                                                            "0 = off", number=True),
+        Sub("Scanner profit and time limits"),
+        Setting("IG_MAX_TRADE_PROFIT", "Max profit a trade", "Account currency; pulls the take-profit in so it makes "
+                                                             "at most this - default 0 = off", number=True),
+        Setting("IG_DAILY_GIVEBACK", "Daily giveback", "Account currency; once the day is this far up, falling this "
+                                                       "far below its best stops it until the rollover - default "
+                                                       "0 = off", number=True),
+        Setting("IG_PAUSE_TIMES", "Pause new trades", "UK time, e.g. 13:00-17:00 (commas for more) - streaks open "
+                                                      "nothing then; empty = never"),
         *_strategy_bot_settings("ig"),
     ]),
 ]

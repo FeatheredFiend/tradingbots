@@ -151,7 +151,10 @@ and is hardcoded to the demo account. Optional env vars: `SCANNER_TIMEFRAME`
 (bar length: `M1`, `M5`, `M15` or `M30`, default `M15`; shared by every
 scanner), `STREAK_LENGTH` (default `3`), `IG_POOL` (comma-separated override of the whole scanning
 pool), and `STOP_LOSS_PERCENT` / `TAKE_PROFIT_PERCENT` (defaults `2` and
-`5`, in percent of the entry price — e.g. `0.5` for 0.5%). IG has a minimum
+`5`, in percent of the entry price — e.g. `0.5` for 0.5%), and
+`IG_TAKE_PROFIT_PERCENT`, the take-profit for this bot alone in place of the
+shared `TAKE_PROFIT_PERCENT` (empty = the shared one; see "Take-profit"
+below for why it differs here). IG has a minimum
 stop/limit distance per market, so a very tight value can get a trade
 rejected; the reason is logged. A pass samples each market once and IG's
 request limit stretches a pass to about 35 seconds for the default pool,
@@ -183,6 +186,70 @@ currency, and 0 switches one off:
 A tighter stop cuts each loss sooner, but the market's normal wiggle then
 hits it more often. The limits make the losses smaller and more even. They
 don't give the streak signal an edge (see the backtest below).
+
+**Take-profit.** `IG_MAX_TRADE_LOSS` pulls the stop in, but the shared
+`TAKE_PROFIT_PERCENT` stays a percentage, so on the big contracts the target
+ends up many times the stop: with a 0.5%/1.5% setting, Japan 225 risks
+about 66 points (£25) to make about 1,045 (£400), and gold risks 2.5 points
+to make 62. Those targets are almost never reached. 3 of 837 trades did on
+30 Sep-2 Oct 2026, and the rest ended another way: the stop, the stagnancy
+timeout, a reversal or the rollover close. Two settings bring it closer, for
+this bot alone:
+
+- `IG_TAKE_PROFIT_PERCENT`: the percentage itself (empty = the shared
+  `TAKE_PROFIT_PERCENT`).
+- `IG_MAX_TRADE_PROFIT` (default `0` = off): where reaching the target would
+  make more than this, it's pulled in, the way `IG_MAX_TRADE_LOSS` pulls the
+  stop in (never closer than IG's minimum distance). 1.5% is worth about
+  £1-£23 on the FX Minis and US crude, £35 on silver, £150 on Brent,
+  £115-£230 on the indices other than Japan 225, £385 on Japan 225 and £625
+  on gold. So at `30` the FX Minis and US crude keep 1.5%, silver barely
+  moves, and the big contracts' targets come right in.
+
+A replay of those 837 real trades (Pepperstone ticks for the same markets;
+a trade banks the target if the price reached it before the trade really
+closed) came out like this:
+
+| Take-profit | 30 Sep | 1 Oct | 2 Oct | Total |
+|---|---|---|---|---|
+| 1.5% (what ran) | -£1,233 | -£121 | -£262 | -£1,616 |
+| 0.1% | -£612 | +£268 | -£223 | -£567 |
+| 0.2% | -£652 | -£116 | -£234 | -£1,002 |
+| 0.5% | -£1,133 | -£115 | -£124 | -£1,373 |
+| 1.5%, at most £25 | -£468 | -£195 | -£19 | -£682 |
+| 1.5%, at most £30 | -£459 | -£114 | -£43 | -£617 |
+| 1.5%, at most £50 | -£970 | -£76 | +£93 | -£953 |
+| 1.5%, at most £100 | -£1,241 | -£86 | -£260 | -£1,587 |
+
+30 Sep ran without the £25 stop cap. A closer target loses less, but it
+doesn't make the bot profitable, and the results jump about from one setting
+to the next (0.15% made +£49 over 1-2 Oct, 0.2% lost £350), which is what
+noise looks like. A flat percentage is also a different size against each
+market's stop: 0.1% is about 1x the stop on Japan 225, 1.7x on gold and
+0.4x on Brent. A money cap keeps it the same size against the £25 stop on
+every big contract.
+
+**Giveback and quiet hours.** On 2 Oct the bot was about £350 up by
+lunchtime, then lost it all after the US open: one streak at 14:45 opened
+longs on most indices together, and they hit their stops together. Two more
+settings, both off by default:
+
+- `IG_DAILY_GIVEBACK`: once the day (counted as for `IG_DAILY_LOSS_LIMIT`)
+  has been this much up, falling this far below its best closes the bot's
+  own positions and opens nothing until the rollover. So a day that got that
+  far ends at about break-even or better. A restart remembers the best the
+  day's closed trades reached (not open positions' highs).
+- `IG_PAUSE_TIMES`: UK times when a streak opens nothing, e.g.
+  `13:00-17:00`, or several separated by commas. Positions already open
+  carry on, reversals still close them, and the dashboard's broadcast
+  trades still open.
+
+Over the same 837 trades, positions opened 13:00-16:59 UK lost £1,649 and
+the mornings made £470. Replayed with a £30 target cap, no new trades
+13:00-17:00 and a £150 giveback, the three days come out at -£322, +£384
+and +£202 (+£264 in all, against -£1,616 as run). Those settings were
+picked on the same three days they're scored on, so expect less on fresh
+days. Mostly they help by trading less on the days that go wrong.
 
 **Resolution is intentionally looser here than `ig-cfd-ema-bot/`:** that bot
 hard-exits on any ambiguous or unresolved name, because getting one specific

@@ -306,7 +306,7 @@ class PepperstoneScannerTests(ScannerTestCase):
 class IGScannerTests(ScannerTestCase):
     bot = ig_scanner
     guests = list
-    settings = {"MAX_TRADE_LOSS": 25.0, "MAX_POSITIONS": 5}
+    settings = {"MAX_TRADE_LOSS": 25.0, "MAX_POSITIONS": 5, "MAX_TRADE_PROFIT": 0.0, "DAILY_GIVEBACK": 0.0}
     POOL = [{"term": "US 500", "epic": "IX.D.SPTRD.IFS.IP", "name": "US 500"}]
 
     def setUp(self):
@@ -345,7 +345,7 @@ class IGScannerTests(ScannerTestCase):
     def test_its_loss_limits_still_apply(self):
         self.assertIn("more than the 100.00 asked for", self.declined(broadcast.RISK, lambda: ig_scanner.broadcast_preview(
             self.service, self.POOL, command(symbol="US500", quantity=100))))
-        self.limits.stopped = True
+        self.limits.stopped = ig_scanner.DAILY_LOSS_REASON
         self.declined(broadcast.PAUSED, lambda: ig_scanner.broadcast_preview(self.service, self.POOL,
                                                                              command(symbol="US500")))
 
