@@ -331,5 +331,78 @@ class RotationBotTests(unittest.TestCase):
         self.assertIsNone(broker.orders[1][4])                 # no stop on a fund
 
 
+class EtfTrendTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        patcher = mock.patch.object(runner, "STATE_DIR", self.tmp.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+        up = [c * (1 + i * 0.002) for i, c in enumerate(alternating(600, 0.01))]
+        down = [c * (1 - i * 0.001) for i, c in enumerate(alternating(600, 0.01))]
+        self.history = {"UP": daily(up), "DOWN": daily(down), "BIL": daily([90.0] * 600)}
+        self.quotes = {"UP": quote(up[-1]), "DOWN": quote(down[-1]), "BIL": quote(90.0)}
+        self.vol = annual_volatility(self.history["UP"], 60)
+
+    def bot(self, positions=None, budget=1000.0, **env):
+        s = settings("etf-trend", ["UP", "DOWN"], budget=budget, **env)
+        broker = FakeBroker(s, self.history, self.quotes, positions, min_size=0.0, step=1e-6)
+        bot = RebalanceBot(s, rebalancer.EtfTrend(s.params), broker, mock.Mock(), mock.Mock())
+        bot.markets = broker.resolve(s.markets + ["BIL"])
+        return bot, broker
+
+    def targets(self, bot):
+        return bot.strategy.targets(bot.markets, self.history, self.quotes, bot.settings.budget, bot.broker, 0)
+
+    def test_settings(self):
+        p = strategy_params("etf-trend")
+        self.assertEqual((p["cash_fund"], p["target_volatility"], p["rebalance_band"], p["max_leverage"]),
+                         ("BIL", 10, 25, 1.0))
+        with mock.patch.dict(os.environ, {"ETF_TREND_SLOW_EMA": "20"}), self.assertRaises(SettingsError):
+            strategy_params("etf-trend")
+
+    def test_once_a_week_after_the_open(self):
+        s = rebalancer.EtfTrend(strategy_params("etf-trend"))
+        monday = utc(2026, 10, 5, 13, 30)
+        broker = mock.Mock(session_opened_at=mock.Mock(return_value=monday))
+        self.assertIsNone(s.period(broker, monday + 10 * 60))
+        self.assertEqual(s.period(broker, monday + 31 * 60), "2026-W41")
+        broker.session_opened_at.return_value = monday + 2 * DAY      # Wednesday: the same week, so done already
+        self.assertEqual(s.period(broker, monday + 2 * DAY + 31 * 60), "2026-W41")
+        broker.session_opened_at.return_value = None
+        self.assertIsNone(s.period(broker, monday + 31 * 60))
+
+    def test_holds_what_trends_up_by_volatility_and_the_rest_in_cash(self):
+        t = self.targets(self.bot()[0])
+        up_dollars = 1000 * 0.10 / math.sqrt(2) / self.vol
+        self.assertAlmostEqual(t["UP"].size * self.quotes["UP"].mid, up_dollars, places=3)
+        self.assertEqual(t["DOWN"].size, 0)                            # falling: not held, never shorted
+        self.assertIn("not held", t["DOWN"].note)
+        self.assertAlmostEqual(t["BIL"].size * 90, 1000 - up_dollars, places=3)
+        self.assertAlmostEqual(t["UP"].band * self.quotes["UP"].mid, up_dollars * 0.25, places=3)
+
+    def test_never_more_than_the_budget(self):
+        t = self.targets(self.bot(ETF_TREND_TARGET_VOLATILITY="50")[0])  # would want ~1,900 of UP
+        self.assertAlmostEqual(t["UP"].size * self.quotes["UP"].mid, 1000, places=3)
+        self.assertEqual(t["BIL"].size, 0)
+
+    def test_under_a_dollar_isnt_bought(self):
+        t = self.targets(self.bot(budget=2.0)[0])                       # UP's share is ~$0.75
+        self.assertEqual(t["UP"].size, 0)
+        self.assertIn("raise the budget", t["UP"].note)
+
+    def test_weekly_rebalance_sells_before_it_buys(self):
+        mine = {"DOWN": Position("DOWN", "long", 2.0, 50.0)}
+        bot, broker = self.bot(mine)
+        bot.state.positions = {"DOWN": {"direction": "long"}}
+        with mock.patch.object(bot.strategy, "period", return_value="2026-W41"):
+            bot.cycle()
+            self.assertEqual([o[:3] for o in broker.orders],
+                             [("close", "DOWN", None), ("open", "UP", "long"), ("open", "BIL", "long")])
+            broker.orders.clear()
+            bot.cycle()                                                 # the same week again: nothing
+        self.assertEqual(broker.orders, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -29,7 +29,22 @@ each position towards it on a schedule.
    (holding all five: ~6% a year, 44% worst fall) - an investment, not an
    edge.
 
-Both run on the strategy bots' runner (StrategyBot: saved notes and own
+3. Weekly ETF trend rotation (Alpaca, `etf-trend`, ETF_TREND_*) - the slow
+   trend's signal and sizing on 35 US funds (shares, bonds, property,
+   commodities, currencies), bought only: a fund is held while its signal
+   is long (EMA 50/200 and the year's move both up) and sold when it isn't,
+   each sized so its usual moves add TARGET_VOLATILITY (10%) / sqrt(35) of
+   the budget a year. Never more than the budget in all (scaled down when
+   they'd add up to more); the rest sits in the cash fund (BIL, 1-3 month
+   Treasury bills). Rebalanced once a week, MINUTES_AFTER_OPEN (30) into the
+   week's first session, with the slow trend's 25% band. Backtested
+   2008-2026: ~3% a year, 6% volatility, 14% worst fall - below the 5-fund
+   rotation (4.6%, 14%) and a plain 60/40 (8.3%, 31%) - run to compare
+   against the rotation, not because it tested better. Funds the other
+   Alpaca bots trade are swapped for near-twins (IVV for SPY, IAU for GLD,
+   ...), so they can share the account.
+
+All three run on the strategy bots' runner (StrategyBot: saved notes and own
 trades only, anyone else's position left alone, dashboard reports and
 closes, the error cutoff) and the same broker adapters. A position closed
 from the dashboard is taken back to its target at the next rebalance (the
@@ -272,8 +287,75 @@ class EtfRotation(PortfolioStrategy):
                 f"left alone")
 
 
+class EtfTrend(PortfolioStrategy):
+    key = "etf-trend"
+
+    def __init__(self, params: dict):
+        super().__init__(params)
+        self.history_bars = max(3 * params["slow_ema"], params["momentum_days"] * 5 // 7 + 60)
+
+    def extra_markets(self) -> list:
+        return [self.p["cash_fund"]]
+
+    def period(self, broker, now: float):
+        """Once a week, MINUTES_AFTER_OPEN into the first session the bot sees."""
+        opened = broker.session_opened_at(now)
+        if opened is None or now < opened + self.p["minutes_after_open"] * 60:
+            return None
+        return clock.local("new_york", now).strftime("%G-W%V")
+
+    def targets(self, markets: dict, history: dict, quotes: dict, budget: float, broker, now: float) -> dict:
+        p, cash = self.p, self.p["cash_fund"]
+        funds = [s for s in markets if s != cash]
+        per_fund = p["target_volatility"] / 100 / math.sqrt(len(funds))
+        views, dollars = {}, {}
+        for symbol in funds:
+            bars = history.get(symbol)
+            if not bars:
+                views[symbol] = Target(symbol, note="no daily bars")
+                continue
+            signal, why = trend_signal(bars, p["fast_ema"], p["slow_ema"], p["momentum_days"])
+            volatility = annual_volatility(bars, p["volatility_bars"])
+            if signal is None or not volatility:
+                views[symbol] = Target(symbol, note=why if signal is None else "can't measure its volatility")
+                continue
+            if signal <= 0:
+                views[symbol] = Target(symbol, size=0.0, note=f"{why} -> {('down', 'mixed')[signal + 1]}, not held")
+                continue
+            dollars[symbol] = budget * per_fund / volatility
+            views[symbol] = Target(symbol, size=0.0, note=f"{why} -> up | volatility {volatility:.0%}")
+        # never more than the budget in all: scaled down together, the rest in cash
+        total = sum(dollars.values())
+        scale = min(1.0, budget * p["max_leverage"] / total) if total else 1.0
+        dollars = {s: d * scale for s, d in dollars.items()}
+        dollars[cash] = max(budget - sum(dollars.values()), 0.0)
+        views[cash] = Target(cash, size=0.0, note=f"cash: {dollars[cash] / budget:.0%} of the budget")
+        for symbol, amount in dollars.items():
+            t, quote = views[symbol], quotes.get(symbol)
+            if quote is None or not quote.mid:
+                t.size, t.note = None, t.note + " | no price"
+                continue
+            if amount < MIN_ORDER:
+                t.note += f" | ${amount:,.2f} is under Alpaca's ${MIN_ORDER:g} order - raise the budget to hold it"
+                continue
+            t.size = broker.round_size(markets[symbol], amount / quote.mid)
+            t.band = max(MIN_ORDER, amount * p["rebalance_band"] / 100) / quote.mid
+            t.note += f" | ${amount:,.2f}"
+        return views
+
+    def summary(self) -> str:
+        p = self.p
+        return (f"Weekly ETF trend rotation: each fund held while EMA{p['fast_ema']} is above EMA{p['slow_ema']} and "
+                f"it's up on {p['momentum_days']} days ago (daily bars), sized for {p['target_volatility']:g}% a year "
+                f"of volatility in all, never more than the budget; the rest in {p['cash_fund']}; rebalanced once a "
+                f"week, {p['minutes_after_open']} min after the open, when {p['rebalance_band']:g}% off")
+
+
+MIN_ORDER = 1.0  # dollars - Alpaca's smallest fractional order
+
+
 def make_portfolio_strategy(key: str, params: dict) -> PortfolioStrategy:
-    return {"slow-trend": SlowTrend, "etf-rotation": EtfRotation}[key](params)
+    return {"slow-trend": SlowTrend, "etf-rotation": EtfRotation, "etf-trend": EtfTrend}[key](params)
 
 
 def plan(current: float, target: Target, market, broker) -> list:
@@ -363,6 +445,9 @@ class RebalanceBot(StrategyBot):
         self.history_for = None  # fetched again, fresh, at the rebalance
         if self.strategy.key == "slow-trend":
             when = f"weekdays from {self.p['trade_time']} London - today's straight away if it's past then"
+        elif self.strategy.key == "etf-trend":
+            when = (f"in each week's first session, {self.p['minutes_after_open']} min after the open - this "
+                    f"week's straight away if the market's open")
         else:
             when = (f"in each month's first session, {self.p['minutes_after_open']} min after the open - this "
                     f"month's straight away if the market's open")

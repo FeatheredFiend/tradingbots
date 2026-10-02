@@ -71,10 +71,11 @@ FAMILIES = {
     "surge": "Opening surge (scanner + followers)",
     "slow-trend": "Slow trend (daily, commodities)",
     "etf-rotation": "Monthly ETF rotation",
+    "etf-trend": "Weekly ETF trend rotation (35 funds)",
 }
 # Portfolio bots (strategy-bots/engine/rebalancer.py) hold all their markets
 # at once, so they have no max positions.
-PORTFOLIO_FAMILIES = ("slow-trend", "etf-rotation")
+PORTFOLIO_FAMILIES = ("slow-trend", "etf-rotation", "etf-trend")
 # The strategy bots in strategy-bots/: each of these on every broker, except
 # forex on Alpaca, which has none. (key, env prefix, default markets per broker).
 STRATEGY_BOTS = {
@@ -94,6 +95,9 @@ STRATEGY_BOTS = {
     "slow-trend": ("SLOW_TREND", {
         "oanda": "BCO_USD, WTICO_USD, NATGAS_USD, XAU_USD, XAG_USD, XCU_USD, CORN_USD, WHEAT_USD, SOYBN_USD, SUGAR_USD"}),
     "etf-rotation": ("ROTATION", {"alpaca": "VOO, EFA, IEF, DBC, VNQ"}),
+    "etf-trend": ("ETF_TREND", {"alpaca": "IVV, QQQM, VTWO, IEFA, EEM, EWJ, VGK, FXI, VGIT, TLT, TIP, LQD, HYG, "
+                                          "EMB, BWX, IYR, IAU, SIVR, PDBC, DBO, UNG, DBA, DBB, CPER, CORN, WEAT, "
+                                          "BNO, PPLT, PALL, UUP, FXE, FXY, FXA, FXF, FXB"}),
 }
 # Each strategy bot's own budget, when <BROKER>_<PREFIX>_BUDGET is empty (IG bots have none).
 STRATEGY_BOT_BUDGETS = {
@@ -103,7 +107,7 @@ STRATEGY_BOT_BUDGETS = {
     ("capital", "index-reversion"): 200, ("capital", "commodity-trend"): 100,
     ("alpaca", "index-reversion"): 100, ("alpaca", "commodity-trend"): 100,
     ("oanda", "scalper"): 100, ("pepperstone", "scalper"): 1000, ("capital", "scalper"): 100, ("alpaca", "scalper"): 100,
-    ("oanda", "slow-trend"): 5000, ("alpaca", "etf-rotation"): 100,
+    ("oanda", "slow-trend"): 5000, ("alpaca", "etf-rotation"): 100, ("alpaca", "etf-trend"): 5000,
 }
 
 CLASSIC_BOTS = [
@@ -584,6 +588,24 @@ SETTING_GROUPS = [
         Setting("ROTATION_REBALANCE_BAND", "Rebalance band", "Drift under this % of a fund's share is left alone - "
                                                              "default 5", number=True),
         Setting("ROTATION_MAX_SPREAD_PERCENT", "Max spread", "% of the price - default 0.5", number=True),
+    ]),
+    ("Weekly ETF trend rotation (Alpaca)", "The slow trend's rules on 35 US funds (shares, bonds, property, "
+                                           "commodities, currencies), bought only: each fund held while it's "
+                                           "trending up, sized by its volatility, the rest in a cash fund; "
+                                           "rebalanced once a week. Backtested 2008-2026 it did worse than the "
+                                           "5-fund monthly rotation (~3% a year against ~4.6%) - run to compare.", [
+        Setting("ETF_TREND_MINUTES_AFTER_OPEN", "Trade at", "Minutes into the week's first session - default 30",
+                number=True),
+        Setting("ETF_TREND_TARGET_VOLATILITY", "Target volatility", "% of the budget a year, all its funds "
+                                                                    "together - default 10", number=True),
+        Setting("ETF_TREND_REBALANCE_BAND", "Rebalance band", "Resize a fund only when it's this % off its "
+                                                              "target - default 25", number=True),
+        Setting("ETF_TREND_CASH_FUND", "Cash fund", "Ticker - default BIL (1-3 month Treasury bills)"),
+        Setting("ETF_TREND_FAST_EMA", "Fast EMA", "Days - default 50", number=True),
+        Setting("ETF_TREND_SLOW_EMA", "Slow EMA", "Days - default 200", number=True),
+        Setting("ETF_TREND_MOMENTUM_DAYS", "Momentum look-back", "Calendar days - default 365", number=True),
+        Setting("ETF_TREND_VOLATILITY_BARS", "Volatility span", "Daily bars - default 60", number=True),
+        Setting("ETF_TREND_MAX_SPREAD_PERCENT", "Max spread", "% of the price - default 0.5", number=True),
     ]),
     ("OANDA","Practice account: hub > Tools > API > Generate. Give bots that trade the same markets "
               "sub-accounts of their own - OANDA nets a market's trades together.", [

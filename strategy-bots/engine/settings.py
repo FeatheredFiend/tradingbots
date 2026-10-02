@@ -7,7 +7,7 @@ Two kinds:
 - Strategy settings, shared by that strategy on every broker (like the
   scanners' STREAK_LENGTH): BREAKOUT_*, REVERSION_*, TREND_*, SCALPER_*,
   SURGE_* (the opening surge scanner and its followers), and the two
-  portfolio bots' SLOW_TREND_* (OANDA) and ROTATION_* (Alpaca).
+  portfolio bots' SLOW_TREND_* (OANDA), ROTATION_* and ETF_TREND_* (Alpaca).
 - Per-bot settings, one set per broker and strategy:
   <BROKER>_<BREAKOUT|REVERSION|TREND|SCALPER>_MARKETS / _BUDGET / _MAX_POSITIONS,
   plus _ACCOUNT_ID on OANDA and Capital.com (falling back to the broker's
@@ -32,14 +32,15 @@ STRATEGY_NAMES = {
     "surge-follower": "Opening surge follower",
     "slow-trend": "Slow trend (daily, commodities)",
     "etf-rotation": "Monthly ETF rotation",
+    "etf-trend": "Weekly ETF trend rotation (35 funds)",
 }
 STRATEGY_PREFIX = {"session-breakout": "BREAKOUT", "index-reversion": "REVERSION", "commodity-trend": "TREND",
                    "scalper": "SCALPER", "surge-follower": "SURGE", "slow-trend": "SLOW_TREND",
-                   "etf-rotation": "ROTATION"}
+                   "etf-rotation": "ROTATION", "etf-trend": "ETF_TREND"}
 # The portfolio bots (engine/rebalancer.py): they hold every one of their
 # markets at a target size and rebalance on a schedule, rather than trading
 # one signal at a time.
-REBALANCERS = ("slow-trend", "etf-rotation")
+REBALANCERS = ("slow-trend", "etf-rotation", "etf-trend")
 
 # The surge followers trade the US shares the surge scanner finds, on the
 # brokers that offer them: how each writes a ticker ("{}" is the ticker).
@@ -82,6 +83,16 @@ DEFAULT_MARKETS = {
     # US shares, the rest of the world's, US Treasuries, commodities and US
     # property. VOO rather than SPY, which the Alpaca index bot trades.
     ("alpaca", "etf-rotation"): "VOO,EFA,IEF,DBC,VNQ",
+    # The weekly trend rotation's 35 funds: US large/tech/small, developed,
+    # emerging, Japan, Europe, China shares; Treasuries, TIPS, corporate,
+    # high-yield, emerging and world bonds; US property; gold, silver, broad
+    # commodities, oil, gas, farm goods, base metals, copper, corn, wheat,
+    # Brent, platinum, palladium; the dollar, euro, yen, Aussie dollar, Swiss
+    # franc and pound. Near-twins replace what the other Alpaca bots trade:
+    # IVV/QQQM/VTWO for SPY/QQQ/IWM, IEFA/VGIT/IYR/PDBC for the rotation's
+    # EFA/IEF/VNQ/DBC, IAU/SIVR/DBO for the commodity bot's GLD/SLV/USO.
+    ("alpaca", "etf-trend"): "IVV,QQQM,VTWO,IEFA,EEM,EWJ,VGK,FXI,VGIT,TLT,TIP,LQD,HYG,EMB,BWX,IYR,"
+                             "IAU,SIVR,PDBC,DBO,UNG,DBA,DBB,CPER,CORN,WEAT,BNO,PPLT,PALL,UUP,FXE,FXY,FXA,FXF,FXB",
 }
 
 # The budget each bot treats as its whole account, in the account's
@@ -97,11 +108,12 @@ DEFAULT_BUDGET = {
     ("oanda", "scalper"): 100, ("pepperstone", "scalper"): 1000, ("capital", "scalper"): 100,
     ("ig", "scalper"): 10000, ("alpaca", "scalper"): 100,
     ("alpaca", "surge-follower"): 100, ("capital", "surge-follower"): 200, ("pepperstone", "surge-follower"): 1000,
-    ("oanda", "slow-trend"): 5000, ("alpaca", "etf-rotation"): 100,
+    ("oanda", "slow-trend"): 5000, ("alpaca", "etf-rotation"): 100, ("alpaca", "etf-trend"): 5000,
 }
 # The portfolio bots hold all their markets at once, so theirs isn't used.
 DEFAULT_MAX_POSITIONS = {"session-breakout": 2, "index-reversion": 2, "commodity-trend": 2, "scalper": 2,
-                         "surge-follower": 3, "slow-trend": 50, "etf-rotation": 50}
+                         "surge-follower": 3, "slow-trend": 50, "etf-rotation": 50,
+                         "etf-trend": 50}
 
 # MetaTrader 5 tags each bot's positions with its own number; the
 # Pepperstone scanner and EMA bot use 928001 and 928002.
@@ -301,6 +313,26 @@ def strategy_params(strategy: str) -> dict:
             "max_spread_percent": number(p + "MAX_SPREAD_PERCENT", 0.5, minimum=0.01, maximum=10),
             "max_leverage": 1.0,  # bought outright, never on margin
         }
+    if strategy == "etf-trend":
+        p = "ETF_TREND_"
+        cash_fund = (_raw(p + "CASH_FUND") or "BIL").upper()
+        if not cash_fund.replace(".", "").isalnum():
+            raise SettingsError(f"{p}CASH_FUND={cash_fund!r} must be one ticker, e.g. BIL")
+        params = {
+            "fast_ema": number(p + "FAST_EMA", 50, minimum=2, whole=True),
+            "slow_ema": number(p + "SLOW_EMA", 200, minimum=3, whole=True),
+            "momentum_days": number(p + "MOMENTUM_DAYS", 365, minimum=20, maximum=1000, whole=True),
+            "volatility_bars": number(p + "VOLATILITY_BARS", 60, minimum=10, maximum=500, whole=True),
+            "target_volatility": number(p + "TARGET_VOLATILITY", 10, minimum=1, maximum=50),
+            "rebalance_band": number(p + "REBALANCE_BAND", 25, minimum=0, maximum=100),
+            "cash_fund": cash_fund,
+            "minutes_after_open": number(p + "MINUTES_AFTER_OPEN", 30, minimum=0, maximum=360, whole=True),
+            "max_spread_percent": number(p + "MAX_SPREAD_PERCENT", 0.5, minimum=0.01, maximum=10),
+            "max_leverage": 1.0,  # bought outright, never on margin
+        }
+        if params["fast_ema"] >= params["slow_ema"]:
+            raise SettingsError("ETF_TREND_FAST_EMA must be shorter than ETF_TREND_SLOW_EMA")
+        return params
     raise SettingsError(f"unknown strategy {strategy!r}")
 
 

@@ -7,10 +7,11 @@ each broker - a momentum scanner and an EMA crossover bot, plus four
 index mean reversion, commodity trend, and an "HFT-style" tick scalper),
 an [opening surge](#opening-surge-strategy-botssurge_) scanner that
 watches the whole US stock market at the open and passes what it finds to
-a follower bot on each broker with US shares, and two
-[portfolio bots](#portfolio-bots-slow-trend-and-monthly-etf-rotation) that
+a follower bot on each broker with US shares, and three
+[portfolio bots](#portfolio-bots-slow-trend-and-etf-rotations) that
 hold a whole portfolio and rebalance it on a schedule (slow trend on OANDA
-commodities, a monthly ETF rotation on Alpaca) - 35 bots in all. What
+commodities, a monthly 5-fund and a weekly 35-fund ETF rotation on
+Alpaca) - 36 bots in all. What
 differs between brokers is how small a trade can be:
 
 | Broker | API access | Smallest trade | Runs on |
@@ -929,12 +930,12 @@ movers - over six months and found nothing before costs and a loss after
 the spread, which is widest just when prices move fast. This tries it
 second by second, right at the open; treat the demo accounts as the test.
 
-## Portfolio bots: slow trend and monthly ETF rotation
+## Portfolio bots: slow trend and ETF rotations
 
 **Concept.** Every other bot here trades one signal at a time, with a stop
-and a target. These two hold all of their markets at a target size and
-move each position towards it on a schedule - once a day, once a month
-(`strategy-bots/engine/rebalancer.py`). They came out of a study of bonds
+and a target. These three hold all of their markets at a target size and
+move each position towards it on a schedule - once a day, a week or a
+month (`strategy-bots/engine/rebalancer.py`). They came out of a study of bonds
 and commodities on 30 September 2026 (below): the only approach tested
 in this repo with an edge before costs is slow, daily trend following
 spread over many markets.
@@ -943,17 +944,19 @@ spread over many markets.
 |---|---|---|
 | `oanda_slow_trend_bot.py` (**OANDA slow trend**) | ig-bot-env | 10 commodity CFDs, long, flat or short: Brent, WTI, natural gas, gold, silver, copper, corn, wheat, soybeans, sugar (budget 5,000) |
 | `alpaca_etf_rotation_bot.py` (**Alpaca monthly ETF rotation**) | alpaca-bot-env | 5 funds, bought outright: VOO (US shares), EFA (other developed markets), IEF (7-10 year Treasuries), DBC (commodities), VNQ (US property) - or SHY (1-3 year Treasuries) in their place (budget $100) |
+| `alpaca_etf_trend_bot.py` (**Alpaca weekly ETF trend rotation**) | alpaca-bot-env | Up to 35 funds, bought outright, whichever are trending up: US, developed, emerging, Japanese, European and Chinese shares; Treasuries, TIPS, corporate, high-yield, emerging and world bonds; US property; gold, silver, broad commodities, oil, gas, farm goods, metals; six currencies - the rest in BIL (1-3 month Treasury bills) (budget $5,000) |
 
 ```powershell
 python strategy-bots\oanda_slow_trend_bot.py       # ig-bot-env
 python strategy-bots\alpaca_etf_rotation_bot.py    # alpaca-bot-env
+python strategy-bots\alpaca_etf_trend_bot.py       # alpaca-bot-env
 ```
 
-Both run on the strategy bots' runner, so `STRATEGY_DRY_RUN`, the
+All three run on the strategy bots' runner, so `STRATEGY_DRY_RUN`, the
 own-trades-only rule, the saved notes in `strategy-bots/state/` and
 closing from the dashboard all work as there (a position closed from the
 dashboard is put back at the next rebalance). On starting, each logs where
-every market stands and what it would hold. Neither compounds: the budget
+every market stands and what it would hold. None compounds: the budget
 stays the budget.
 
 **Slow trend (`SLOW_TREND_*`).**
@@ -1001,6 +1004,27 @@ stays the budget.
   someone else holds on the account - VOO rather than SPY, which the
   Alpaca index bot trades.
 
+**Weekly ETF trend rotation (`ETF_TREND_*`).**
+- The slow trend's signal on each of 35 funds' daily bars (Alpaca's,
+  adjusted for dividends): held while the 50-day EMA (`FAST_EMA`) is above
+  the 200-day (`SLOW_EMA`) **and** it's up on `MOMENTUM_DAYS` (365) ago;
+  sold when either turns. Buys only - never short.
+- Size: like the slow trend, each fund held gets `TARGET_VOLATILITY` (10%)
+  / √35 of the budget a year of usual movement, so quiet funds (the
+  dollar, high-yield bonds) get more money than wild ones (oil). Never more
+  than the budget in all: when the funds trending up would add up to more,
+  they're all scaled down together. Whatever's left goes into
+  `CASH_FUND` (BIL). A fund whose share comes to under $1 (Alpaca's
+  smallest order) isn't bought - at the default $5,000 that's rare.
+- When: once a week, `MINUTES_AFTER_OPEN` (30) into the week's first
+  session (or the first time the bot runs that week). Sells first, then
+  buys; a fund within `REBALANCE_BAND` (25%) of its target is left alone.
+- Funds the other Alpaca bots trade are swapped for near-twins so they can
+  share the paper account: IVV, QQQM and VTWO for SPY, QQQ and IWM (index
+  and scalper bots); IEFA, VGIT, IYR and PDBC for the rotation's EFA, IEF,
+  VNQ and DBC; IAU, SIVR and DBO for the commodity bot's GLD, SLV and USO.
+  Override the list with `ALPACA_ETF_TREND_MARKETS`.
+
 **Backtest (30 September 2026; research scripts, not in the repo).** Daily,
 2008-2026, textbook rules, no tuning. OANDA's commodity and bond prices
 leave out the futures roll - its natural gas was 11.06 in 2005 and 2.89
@@ -1035,12 +1059,32 @@ The rotation, monthly, 2007-2026, 5 bps a trade:
 | All five, held | 5.9% | 12.3% | -44% | -27% | -11% | 6.5% |
 | SPY alone | 10.8% | 15.5% | -51% | -37% | -18% | 12.1% |
 
+The weekly 35-fund version, tested 2 October 2026 against the 5-fund
+rotation on the same terms (Yahoo total-return prices, 2008-01 to
+2026-10, decisions on the previous close, half the spread on every trade,
+idle cash in BIL, no leverage; the backtest used the original tickers -
+SPY, GLD, ... - not the near-twins):
+
+| | A year | Volatility | Sharpe | Worst fall | 2008 | 2022 |
+|---|---|---|---|---|---|---|
+| 5-fund monthly rotation | 4.6% | 8.0% | 0.43 | -14% | -2% | -9% |
+| 35 funds, same 10-month rule | 2.9% | 6.1% | 0.28 | -15% | -3% | -1% |
+| **35 funds, weekly trend (this bot)** | **3.0%** | **6.4%** | **0.27** | **-14%** | **-1%** | **-2%** |
+| 35 funds, trend long and short | 1.8% | 6.7% | 0.09 | -19% | +11% | +8% |
+| 60% SPY / 40% IEF, monthly | 8.3% | 11.1% | 0.65 | -31% | -18% | -17% |
+| Cash (BIL) | 1.3% | 0.5% | - | -1% | +1% | +1% |
+
+Widening made it worse, not better: more funds means more of the budget
+in quiet bonds and currencies, which trended poorly after 2008.
+
 **What to expect.** Slow trend: about nothing after OANDA's costs, with
 long flat or losing stretches and falls of a third of the budget at the
 default size. It trades a few times a week, so a demo run needs months
 to show anything. The rotation is an investment that mostly sidesteps
 big falls, not a trading edge: since 2022 it has only just beaten cash,
-and holding US shares made twice as much.
+and holding US shares made twice as much. The weekly 35-fund version
+expects less than the 5-fund one, with similar falls; run it to compare
+the two side by side.
 
 ## IG position sizing (both IG bots)
 

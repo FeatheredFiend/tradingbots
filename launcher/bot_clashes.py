@@ -57,10 +57,10 @@ UNWORKABLE_DEFAULTS = {
     "ig-ema-bot": ("IG_WATCHLIST", "IG gives no share prices over its API, so it can't trade its default share "
                                    "watchlist - set IG_WATCHLIST to other markets to use it"),
 }
-HOLDING_FAMILIES = ("slow-trend", "etf-rotation")  # the portfolio bots
+HOLDING_FAMILIES = ("slow-trend", "etf-rotation", "etf-trend")  # the portfolio bots
 # When several sets fit the same number of bots: keep the portfolio bots
 # (the only ones with a tested edge), then the scanners, and the EMA bots last.
-PRIORITY = ("slow-trend", "etf-rotation", "momentum", "surge", "session-breakout", "index-reversion",
+PRIORITY = ("slow-trend", "etf-rotation", "etf-trend", "momentum", "surge", "session-breakout", "index-reversion",
             "commodity-trend", "scalper", "ema")
 ACCOUNT_BROKERS = ("oanda", "capital")  # the brokers where a bot can have an account of its own
 
