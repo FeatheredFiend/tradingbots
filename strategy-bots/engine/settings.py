@@ -6,10 +6,11 @@ default below.
 Two kinds:
 - Strategy settings, shared by that strategy on every broker (like the
   scanners' STREAK_LENGTH): BREAKOUT_*, REVERSION_*, TREND_*, SCALPER_*,
-  SURGE_* (the opening surge scanner and its followers), and the two
-  portfolio bots' SLOW_TREND_* (OANDA), ROTATION_* and ETF_TREND_* (Alpaca).
+  SURGE_* (the opening surge scanner and its followers), INTRADAY_* (intraday
+  momentum), and the portfolio bots' SLOW_TREND_* (OANDA), ROTATION_* and
+  ETF_TREND_* (Alpaca).
 - Per-bot settings, one set per broker and strategy:
-  <BROKER>_<BREAKOUT|REVERSION|TREND|SCALPER>_MARKETS / _BUDGET / _MAX_POSITIONS,
+  <BROKER>_<BREAKOUT|REVERSION|TREND|SCALPER|INTRADAY>_MARKETS / _BUDGET / _MAX_POSITIONS,
   plus _ACCOUNT_ID on OANDA and Capital.com (falling back to the broker's
   OANDA_ACCOUNT_ID / CAPITAL_ACCOUNT_ID). The surge followers have no
   market list - they trade whatever the scanner finds - but a
@@ -33,10 +34,11 @@ STRATEGY_NAMES = {
     "slow-trend": "Slow trend (daily, commodities)",
     "etf-rotation": "Monthly ETF rotation",
     "etf-trend": "Weekly ETF trend rotation (35 funds)",
+    "intraday-momentum": "Intraday momentum (Nasdaq 100)",
 }
 STRATEGY_PREFIX = {"session-breakout": "BREAKOUT", "index-reversion": "REVERSION", "commodity-trend": "TREND",
                    "scalper": "SCALPER", "surge-follower": "SURGE", "slow-trend": "SLOW_TREND",
-                   "etf-rotation": "ROTATION", "etf-trend": "ETF_TREND"}
+                   "etf-rotation": "ROTATION", "etf-trend": "ETF_TREND", "intraday-momentum": "INTRADAY"}
 # The portfolio bots (engine/rebalancer.py): they hold every one of their
 # markets at a target size and rebalance on a schedule, rather than trading
 # one signal at a time.
@@ -93,6 +95,13 @@ DEFAULT_MARKETS = {
     # EFA/IEF/VNQ/DBC, IAU/SIVR/DBO for the commodity bot's GLD/SLV/USO.
     ("alpaca", "etf-trend"): "IVV,QQQM,VTWO,IEFA,EEM,EWJ,VGK,FXI,VGIT,TLT,TIP,LQD,HYG,EMB,BWX,IYR,"
                              "IAU,SIVR,PDBC,DBO,UNG,DBA,DBB,CPER,CORN,WEAT,BNO,PPLT,PALL,UUP,FXE,FXY,FXA,FXF,FXB",
+    # Intraday momentum on the Nasdaq 100, the market it held up on (QQQ,
+    # 2016-2026); on the S&P 500 it didn't after the paper came out.
+    ("oanda", "intraday-momentum"): "NAS100_USD",
+    ("pepperstone", "intraday-momentum"): "NAS100",
+    ("capital", "intraday-momentum"): "US100",
+    ("ig", "intraday-momentum"): "US Tech 100:IX.D.NASDAQ.IFS.IP",
+    ("alpaca", "intraday-momentum"): "QQQ",
 }
 
 # The budget each bot treats as its whole account, in the account's
@@ -109,16 +118,19 @@ DEFAULT_BUDGET = {
     ("ig", "scalper"): 10000, ("alpaca", "scalper"): 100,
     ("alpaca", "surge-follower"): 100, ("capital", "surge-follower"): 200, ("pepperstone", "surge-follower"): 1000,
     ("oanda", "slow-trend"): 5000, ("alpaca", "etf-rotation"): 100, ("alpaca", "etf-trend"): 5000,
+    # Pepperstone's smallest NAS100 trade (0.1 lot) is worth about 2,400 GBP.
+    ("oanda", "intraday-momentum"): 2000, ("pepperstone", "intraday-momentum"): 3000,
+    ("capital", "intraday-momentum"): 1000, ("ig", "intraday-momentum"): 10000, ("alpaca", "intraday-momentum"): 1000,
 }
 # The portfolio bots hold all their markets at once, so theirs isn't used.
 DEFAULT_MAX_POSITIONS = {"session-breakout": 2, "index-reversion": 2, "commodity-trend": 2, "scalper": 2,
                          "surge-follower": 3, "slow-trend": 50, "etf-rotation": 50,
-                         "etf-trend": 50}
+                         "etf-trend": 50, "intraday-momentum": 1}
 
 # MetaTrader 5 tags each bot's positions with its own number; the
 # Pepperstone scanner and EMA bot use 928001 and 928002.
 MT5_MAGIC = {"session-breakout": 928003, "index-reversion": 928004, "commodity-trend": 928005, "scalper": 928006,
-             "surge-follower": 928007}
+             "surge-follower": 928007, "intraday-momentum": 928008}
 
 TIMEFRAMES = {"M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400}
 
@@ -333,6 +345,28 @@ def strategy_params(strategy: str) -> dict:
         if params["fast_ema"] >= params["slow_ema"]:
             raise SettingsError("ETF_TREND_FAST_EMA must be shorter than ETF_TREND_SLOW_EMA")
         return params
+    if strategy == "intraday-momentum":
+        p = "INTRADAY_"
+        params = {
+            # Checks at every 30-minute bar's close, as published. Fixed: the CFD
+            # brokers' hourly bars start on the hour, not at the 09:30 open.
+            "timeframe": "M30",
+            # At most 18: the look-back's 30-minute bars must fit the 1,000 Capital.com sends at once.
+            "lookback_days": number(p + "LOOKBACK_DAYS", 14, minimum=5, maximum=18, whole=True),
+            "band_multiplier": number(p + "BAND_MULTIPLIER", 1.0, minimum=0.5, maximum=3),
+            "first_check": clock_time(p + "FIRST_CHECK", "10:00"),
+            "last_entry_minutes": number(p + "LAST_ENTRY_MINUTES", 30, minimum=0, maximum=180, whole=True),
+            "flat_minutes": number(p + "FLAT_MINUTES", 2, minimum=1, maximum=60, whole=True),
+            "vwap_trail": flag(p + "VWAP_TRAIL", True),
+            "max_trades_per_day": number(p + "MAX_TRADES_PER_DAY", 4, minimum=1, whole=True),
+            # The stop sits at the far band, usually 1-2% away, so 2% risk leaves
+            # the leverage cap (1x: a trade worth the budget) as the usual limit;
+            # only on the widest days does the risk limit make the trade smaller.
+            **_risk(p, risk=2.0, spread=5, leverage=1.0),
+        }
+        if not "09:30" < params["first_check"] < "16:00":
+            raise SettingsError("INTRADAY_FIRST_CHECK must be after the 09:30 New York open and before 16:00")
+        return params
     raise SettingsError(f"unknown strategy {strategy!r}")
 
 
@@ -358,10 +392,10 @@ def choice(name: str, default: str, options: tuple) -> str:
     return text
 
 
-def _risk(prefix: str, risk: float, spread: float = 10) -> dict:
+def _risk(prefix: str, risk: float, spread: float = 10, leverage: float = 5) -> dict:
     return {
         "risk_percent": number(prefix + "RISK_PERCENT", risk, minimum=0.01, maximum=10),
-        "max_leverage": number(prefix + "MAX_LEVERAGE", 5, minimum=0.1, maximum=30),
+        "max_leverage": number(prefix + "MAX_LEVERAGE", leverage, minimum=0.1, maximum=30),
         "max_spread_percent": number(prefix + "MAX_SPREAD_PERCENT", spread, minimum=0, maximum=100),
     }
 

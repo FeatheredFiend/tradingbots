@@ -51,12 +51,13 @@ BOTS = launcher_bots()
 KEYS = {b.key for b in BOTS}
 
 # The account layout worked out on 30 Sep 2026: OANDA strategy bots on the
-# primary account with the slow trend on its own, Capital.com's four strategy
-# bots and the surge follower each on an account of their own.
+# primary account with the slow trend on its own, Capital.com's strategy
+# bots (intraday momentum joined them on 7 Oct) and the surge follower each
+# on an account of their own.
 USER_ENV = {
     "OANDA_ACCOUNT_ID": "101-001", "OANDA_SLOW_TREND_ACCOUNT_ID": "101-002",
     "CAPITAL_ACCOUNT_ID": "cap-main", "CAPITAL_SURGE_ACCOUNT_ID": "cap-surge",
-    **{f"CAPITAL_{p}_ACCOUNT_ID": "cap-strategy" for p in ("BREAKOUT", "REVERSION", "TREND", "SCALPER")},
+    **{f"CAPITAL_{p}_ACCOUNT_ID": "cap-strategy" for p in ("BREAKOUT", "REVERSION", "TREND", "SCALPER", "INTRADAY")},
 }
 
 
@@ -156,6 +157,7 @@ class Pick(unittest.TestCase):
             "alpaca-ema-bot", "alpaca-surge-follower",            # the Alpaca scanner wins the tie
             "ig-ema-bot",                                         # no share prices on IG
             "ig-session-breakout", "ig-index-reversion", "ig-commodity-trend", "ig-scalper",  # the IG scanner's markets
+            "ig-intraday-momentum",
         })
         self.assertEqual(chosen, KEYS - set(left_out))
         self.assertIn("surge-scanner", chosen)

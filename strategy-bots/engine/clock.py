@@ -131,3 +131,83 @@ INDEX_SESSIONS = {
     "eu": Session("eu", "German cash session (Frankfurt 09:00-17:30)", "frankfurt", dtime(9, 0), dtime(17, 30)),
     "jp": Session("jp", "Japan cash session (Tokyo 09:00-15:00)", "tokyo", dtime(9, 0), dtime(15, 0)),
 }
+
+
+# ---------------------------------------------------------------------------
+# The New York Stock Exchange's calendar - its holidays and 13:00 early
+# closes, by the exchange's standing rules (one-off closures, like a national
+# day of mourning, can't be foreseen). CFDs on US indices keep trading on
+# these days, on the futures, with no stock market behind them.
+# ---------------------------------------------------------------------------
+NYSE_OPEN, NYSE_CLOSE, NYSE_EARLY_CLOSE = dtime(9, 30), dtime(16, 0), dtime(13, 0)
+
+
+def _easter(year: int) -> date:
+    """Western Easter Sunday (the anonymous Gregorian algorithm)."""
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    g = (8 * b + 13) // 25
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    return date(year, month, (h + l - 7 * m + 114) % 31 + 1)
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """The n-th `weekday` (Monday 0) of a month; n=-1 for the last."""
+    if n > 0:
+        first = date(year, month, 1)
+        return first + timedelta(days=(weekday - first.weekday()) % 7, weeks=n - 1)
+    last = date(year + month // 12, month % 12 + 1, 1) - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _observed(day: date) -> date:
+    """A fixed-date holiday on a weekend moves to the Friday before or the Monday after."""
+    return day - timedelta(days=1) if day.weekday() == 5 else day + timedelta(days=1) if day.weekday() == 6 else day
+
+
+def nyse_holidays(year: int) -> set:
+    days = {
+        _nth_weekday(year, 1, 0, 3),     # Martin Luther King Jr. Day
+        _nth_weekday(year, 2, 0, 3),     # Washington's Birthday
+        _easter(year) - timedelta(days=2),  # Good Friday
+        _nth_weekday(year, 5, 0, -1),    # Memorial Day
+        _observed(date(year, 7, 4)),     # Independence Day
+        _nth_weekday(year, 9, 0, 1),     # Labor Day
+        _nth_weekday(year, 11, 3, 4),    # Thanksgiving
+        _observed(date(year, 12, 25)),   # Christmas
+    }
+    if date(year, 1, 1).weekday() != 5:  # a Saturday New Year isn't moved back into the old year
+        days.add(_observed(date(year, 1, 1)))
+    if year >= 2022:
+        days.add(_observed(date(year, 6, 19)))  # Juneteenth
+    return days
+
+
+def nyse_early_closes(year: int) -> set:
+    """13:00 closes: 3 July and Christmas Eve when they fall Monday-Thursday,
+    and the day after Thanksgiving."""
+    days = {_nth_weekday(year, 11, 3, 4) + timedelta(days=1)}
+    for day in (date(year, 7, 3), date(year, 12, 24)):
+        if day.weekday() <= 3:
+            days.add(day)
+    return days
+
+
+def nyse_hours(day: date):
+    """(open, close) of the NYSE on `day` as Unix seconds, or None when it's shut."""
+    if day.weekday() >= 5 or day in nyse_holidays(day.year):
+        return None
+    closes = NYSE_EARLY_CLOSE if day in nyse_early_closes(day.year) else NYSE_CLOSE
+    return at("new_york", day, NYSE_OPEN), at("new_york", day, closes)
+
+
+def previous_nyse_day(day: date) -> date:
+    """The last day before `day` the NYSE was open."""
+    day -= timedelta(days=1)
+    while nyse_hours(day) is None:
+        day -= timedelta(days=1)
+    return day

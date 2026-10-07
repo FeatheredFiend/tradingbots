@@ -59,9 +59,10 @@ UNWORKABLE_DEFAULTS = {
 }
 HOLDING_FAMILIES = ("slow-trend", "etf-rotation", "etf-trend")  # the portfolio bots
 # When several sets fit the same number of bots: keep the portfolio bots
-# (the only ones with a tested edge), then the scanners, and the EMA bots last.
-PRIORITY = ("slow-trend", "etf-rotation", "etf-trend", "momentum", "surge", "session-breakout", "index-reversion",
-            "commodity-trend", "scalper", "ema")
+# (a tested edge), then the scanners, intraday momentum (tested too, but
+# newer than the scanners it would push out), and the EMA bots last.
+PRIORITY = ("slow-trend", "etf-rotation", "etf-trend", "momentum", "intraday-momentum", "surge", "session-breakout",
+            "index-reversion", "commodity-trend", "scalper", "ema")
 ACCOUNT_BROKERS = ("oanda", "capital")  # the brokers where a bot can have an account of its own
 
 

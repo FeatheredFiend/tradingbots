@@ -429,7 +429,15 @@ class StrategyBot:
                 self.log.info(f"Retrying in {backoff}s...")
                 time.sleep(backoff)
                 continue
-            self.dashboard.sleep(self.loop_seconds, self.report, self.broker.dashboard_every)
+            self.dashboard.sleep(self.wait_seconds(), self.report, self.broker.dashboard_every)
+
+    def wait_seconds(self) -> float:
+        """The pause before the next pass: LOOP_SECONDS, or for a prompt
+        strategy only until its next bar is due (10s after it closes)."""
+        if not getattr(self.strategy, "prompt", False) or not self.feeds:  # the portfolio strategies have none
+            return self.loop_seconds
+        due = min(feed.next_check for feeds in self.feeds.values() for feed in feeds.values())
+        return max(1.0, min(self.loop_seconds, due - time.time()))
 
     def report(self) -> None:
         """Account, positions and trades for the dashboard - when due, which

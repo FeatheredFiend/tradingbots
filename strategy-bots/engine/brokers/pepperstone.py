@@ -23,6 +23,8 @@ TIMEFRAME = {"M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFR
              "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4}
 DEVIATION_POINTS = 20          # accepted slippage, where the symbol's execution mode honours it
 STALE_TICK_SECONDS = 300       # no price for this long = market closed
+HISTORY_SYNC_READS = 5         # a symbol's first bars are read again until two reads agree, at most this often...
+HISTORY_SYNC_PAUSE = 2.0       # ...this many seconds apart
 DEAL_REASONS = {
     mt5.DEAL_REASON_SL: "stop-loss", mt5.DEAL_REASON_TP: "take-profit", mt5.DEAL_REASON_EXPERT: "closed by the bot",
     mt5.DEAL_REASON_CLIENT: "closed by hand", mt5.DEAL_REASON_MOBILE: "closed by hand (phone)",
@@ -41,6 +43,7 @@ class PepperstoneBroker(Broker):
         self.comment = settings.strategy[:31]
         self.currency = None
         self._correction = 0   # seconds the server clock differs from Pepperstone's usual New York close + 7h
+        self._synced = set()   # (symbol, timeframe) whose history the terminal has caught up on
 
     # -- server time --------------------------------------------------------------
     @staticmethod
@@ -136,10 +139,25 @@ class PepperstoneBroker(Broker):
 
     # -- prices -----------------------------------------------------------------
     def bars(self, market: Market, timeframe: str, count: int) -> list:
-        """MT5's own bars (built from bid prices), position 0 being the one still forming."""
+        """MT5's own bars (built from bid prices), position 0 being the one still forming.
+        The terminal can answer a symbol's first request from its own out-of-date copy of the
+        history while it downloads the rest - on 7 Oct 2026 a first read of NAS100 had no 6 Oct
+        at all - so the first read is repeated until two reads agree."""
         rates = mt5.copy_rates_from_pos(market.symbol, TIMEFRAME[timeframe], 1, count)
         if rates is None:
             raise BrokerError(f"no {timeframe} bars for {market.symbol}: {mt5.last_error()}")
+        if (market.symbol, timeframe) not in self._synced:
+            for _ in range(HISTORY_SYNC_READS):
+                time.sleep(HISTORY_SYNC_PAUSE)
+                again = mt5.copy_rates_from_pos(market.symbol, TIMEFRAME[timeframe], 1, count)
+                if again is None:
+                    break
+                same = len(again) == len(rates) and len(rates) and (again[0]["time"], again[-1]["time"]) == (
+                    rates[0]["time"], rates[-1]["time"])
+                rates = again
+                if same:
+                    break
+            self._synced.add((market.symbol, timeframe))
         return [Bar(self._to_utc(float(r["time"])), float(r["open"]), float(r["high"]), float(r["low"]),
                     float(r["close"]), float(r["tick_volume"])) for r in rates]
 

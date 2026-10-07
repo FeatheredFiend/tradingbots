@@ -57,6 +57,12 @@ if /i "%BOT%"=="pepperstone-scalper" (set "SCRIPT=strategy-bots\pepperstone_scal
 if /i "%BOT%"=="capital-scalper" (set "SCRIPT=strategy-bots\capital_scalper_bot.py" & set "VENV=%TRADINGBOTS_CAPITAL_ENV%")
 if /i "%BOT%"=="ig-scalper" (set "SCRIPT=strategy-bots\ig_scalper_bot.py" & set "VENV=%TRADINGBOTS_IG_ENV%")
 if /i "%BOT%"=="alpaca-scalper" (set "SCRIPT=strategy-bots\alpaca_scalper_bot.py" & set "VENV=%TRADINGBOTS_ALPACA_ENV%")
+rem Intraday momentum on the Nasdaq 100 (QQQ on Alpaca, the NAS100 CFD elsewhere).
+if /i "%BOT%"=="oanda-intraday-momentum" (set "SCRIPT=strategy-bots\oanda_intraday_momentum_bot.py" & set "VENV=%TRADINGBOTS_OANDA_ENV%")
+if /i "%BOT%"=="pepperstone-intraday-momentum" (set "SCRIPT=strategy-bots\pepperstone_intraday_momentum_bot.py" & set "VENV=%TRADINGBOTS_PEPPERSTONE_ENV%")
+if /i "%BOT%"=="capital-intraday-momentum" (set "SCRIPT=strategy-bots\capital_intraday_momentum_bot.py" & set "VENV=%TRADINGBOTS_CAPITAL_ENV%")
+if /i "%BOT%"=="ig-intraday-momentum" (set "SCRIPT=strategy-bots\ig_intraday_momentum_bot.py" & set "VENV=%TRADINGBOTS_IG_ENV%")
+if /i "%BOT%"=="alpaca-intraday-momentum" (set "SCRIPT=strategy-bots\alpaca_intraday_momentum_bot.py" & set "VENV=%TRADINGBOTS_ALPACA_ENV%")
 rem The opening surge: one scanner (Alpaca market data, no trades) and a follower per broker with US shares.
 if /i "%BOT%"=="surge-scanner" (set "SCRIPT=strategy-bots\surge_scanner_bot.py" & set "VENV=%TRADINGBOTS_ALPACA_ENV%")
 if /i "%BOT%"=="alpaca-surge-follower" (set "SCRIPT=strategy-bots\alpaca_surge_follower_bot.py" & set "VENV=%TRADINGBOTS_ALPACA_ENV%")
@@ -76,7 +82,7 @@ if not defined SCRIPT (
     echo   ig-momentum-scanner      ig-ema-bot
     echo or a strategy bot, ^<broker^>-^<strategy^>:
     echo   brokers: oanda pepperstone capital ig alpaca
-    echo   strategies: session-breakout ^(not on alpaca^) index-reversion commodity-trend scalper
+    echo   strategies: session-breakout ^(not on alpaca^) index-reversion commodity-trend scalper intraday-momentum
     echo or the opening surge: surge-scanner, and alpaca-surge-follower
     echo   capital-surge-follower  pepperstone-surge-follower
     echo or a portfolio bot: oanda-slow-trend  alpaca-etf-rotation  alpaca-etf-trend

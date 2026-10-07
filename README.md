@@ -517,8 +517,9 @@ position in the scanner's markets as its own, as described above.
 
 ## Strategy bots (`strategy-bots/`)
 
-Four strategies, each on every broker - 19 bots, since Alpaca has no
-forex. Unlike the bots above, the strategies are written once
+Five strategies, each on every broker - 24 bots, since Alpaca has no
+forex (the fifth, intraday momentum, has [its own section](#intraday-momentum-strategy-bots_intraday_momentum_botpy)).
+Unlike the bots above, the strategies are written once
 (`strategy-bots/engine/strategies.py`, and `engine/scalper.py` for the
 tick scalper), run by one loop (`engine/runner.py`) and reach each broker
 through a small adapter (`engine/brokers/`) built from that broker's
@@ -530,6 +531,7 @@ existing bot. Each bot is a two-line script naming its broker and strategy:
 | Index mean reversion | `oanda_index_reversion_bot.py` | `pepperstone_…` | `capital_…` | `ig_…` | SPY, QQQ, DIA, IWM |
 | Commodity trend (4H/15M) | `oanda_commodity_trend_bot.py` | `pepperstone_…` | `capital_…` | `ig_…` | GLD, SLV, USO |
 | Tick scalper (HFT-style) | `oanda_scalper_bot.py` | `pepperstone_…` | `capital_…` | `ig_…` | SPY, QQQ (buys only) |
+| Intraday momentum (Nasdaq 100) | `oanda_intraday_momentum_bot.py` | `pepperstone_…` | `capital_…` | `ig_…` | QQQ (buys only) |
 
 Run them from the launcher, or in the broker's Python environment (the same
 ones as the other bots - nothing new to install):
@@ -843,6 +845,74 @@ previews, opens, limits and guest markets against a fake broker;
 `test_broadcast_bots.py` runs them in the scanners. No broker is contacted. Run them in
 `ig-bot-env`, which has everything they import (the Alpaca ones are
 skipped there - run those from `alpaca-bot-env`).
+
+## Intraday momentum (`strategy-bots/*_intraday_momentum_bot.py`)
+
+**Concept.** On days when the Nasdaq 100 moves further from its 09:30
+New York open than it usually does by that time of day, it tends to keep
+going into the close (Gao, Han, Li & Zhou, *Market intraday momentum*,
+2018; the rules here are Zarattini, Aziz & Barbon, *Beat the Market*,
+2024). The bot follows those moves, checking every half hour, and is
+always flat at the close - so never an overnight swap. QQQ on Alpaca
+(buys only, like every Alpaca bot), the NAS100 CFD elsewhere.
+
+**Rules** (New York time; settings `INTRADAY_*`):
+
+- **Noise area.** For each half hour of the NYSE session, the average over
+  the last `LOOKBACK_DAYS` (14) sessions of |price / that day's open - 1|
+  at that time of day, x `BAND_MULTIPLIER` (1). Upper band = max(today's
+  open, yesterday's close) x (1 + that); lower band = min(...) x (1 - that).
+- **Entries**, at every 30-minute bar's close from `FIRST_CHECK` (10:00)
+  to `LAST_ENTRY_MINUTES` (30) before the close: a close above the upper
+  band and the session VWAP -> long; below the lower band and the VWAP ->
+  short. One position, at most `MAX_TRADES_PER_DAY` (4) a day.
+- **Exits.** At a check, a close back below max(upper band, VWAP) for a
+  long (above min(lower band, VWAP) for a short); `VWAP_TRAIL=0` drops the
+  VWAP from both. A stop-loss at the opposite band covers the bot not
+  running. Everything closes `FLAT_MINUTES` (2) before the NYSE close.
+- **Calendar.** No trading on NYSE holidays (CFDs still trade then, on the
+  futures); half days end at 13:00 (`engine/clock.py` `nyse_hours()`). No
+  trade either when the bars lack the previous session, whose close is one
+  of the bands' anchors.
+- **Size.** The stop is the far band, usually 1-2% away, so at the default
+  2% risk the leverage cap decides: a trade worth the budget x
+  `MAX_LEVERAGE` (1x). Only on the widest days does the risk limit make it
+  smaller.
+- **Speed.** The bot wakes for each bar's close (about 10 s after it)
+  instead of every 30 s like the other strategy bots: in the replay,
+  filling a minute later cost about 1% a year.
+
+**The evidence** (scratch replays, 7 Oct 2026; Alpaca SIP 1-minute bars
+2016 - Oct 2026, fills at the next minute's open, 0.5 bp a side):
+
+| | a year | Sharpe | worst fall | since the paper (May 2024) |
+|---|---|---|---|---|
+| QQQ, long and short, 1x | +10.0% | 1.22 (t 4.0) | -8.5% | Sharpe 0.75 |
+| QQQ, buys only (Alpaca) | +5.8% | 1.07 (t 3.5) | -5.4% | Sharpe 0.51 |
+| QQQ at 1 bp a side | +7.4% | 0.92 | -9.8% | |
+| SPY, long and short | +3.7% | 0.58 | -12% | **-0.21** |
+
+Every year from 2017 to 2026 was positive on QQQ (2018 +39%, 2016 -2%),
+and it held up across band widths (x0.8-1.5) and check intervals (15, 30,
+60 min). On SPY it didn't survive the paper's publication, which is why
+the bot trades the Nasdaq 100 only - and why the QQQ result may be partly
+luck. Mostly it makes money on volatile days (2018, 2022).
+
+**Bots and accounts.** `oanda-`, `pepperstone-`, `capital-`, `ig-` and
+`alpaca-intraday-momentum` (MT5 magic 928008). Budgets: OANDA 2,000,
+Pepperstone 3,000 (its smallest NAS100 trade, 0.1 lot, is worth about
+2,400 GBP), Capital.com 1,000, Alpaca $1,000; IG trades its minimum. Give
+the OANDA and Capital.com ones the strategy accounts like the other
+strategy bots (`OANDA_INTRADAY_ACCOUNT_ID`, `CAPITAL_INTRADAY_ACCOUNT_ID`):
+their scanners treat every NAS100 / US100 position on their own account as
+theirs. IG has one account, so the IG bot can't run beside the IG scanner
+(which trades US Tech 100) - the launcher's clash check says so.
+
+**What to expect.** Trades on about 6 days in 10, 1-2 a day, each worth a
+few basis points; at 1x on 1,000 that's well under 1 a trade. A few
+months of demo results can't confirm a Sharpe near 1 - what they can
+check is whether real fills match the replay's, which is what sank the
+earlier bots. Tests: `strategy-bots/tests/test_intraday_momentum.py`.
 
 ## Opening surge (`strategy-bots/surge_*`)
 

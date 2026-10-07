@@ -72,6 +72,7 @@ FAMILIES = {
     "slow-trend": "Slow trend (daily, commodities)",
     "etf-rotation": "Monthly ETF rotation",
     "etf-trend": "Weekly ETF trend rotation (35 funds)",
+    "intraday-momentum": "Intraday momentum (Nasdaq 100)",
 }
 # Portfolio bots (strategy-bots/engine/rebalancer.py) hold all their markets
 # at once, so they have no max positions.
@@ -98,6 +99,9 @@ STRATEGY_BOTS = {
     "etf-trend": ("ETF_TREND", {"alpaca": "IVV, QQQM, VTWO, IEFA, EEM, EWJ, VGK, FXI, VGIT, TLT, TIP, LQD, HYG, "
                                           "EMB, BWX, IYR, IAU, SIVR, PDBC, DBO, UNG, DBA, DBB, CPER, CORN, WEAT, "
                                           "BNO, PPLT, PALL, UUP, FXE, FXY, FXA, FXF, FXB"}),
+    "intraday-momentum": ("INTRADAY", {
+        "oanda": "NAS100_USD", "pepperstone": "NAS100", "capital": "US100", "ig": "US Tech 100:IX.D.NASDAQ.IFS.IP",
+        "alpaca": "QQQ"}),
 }
 # Each strategy bot's own budget, when <BROKER>_<PREFIX>_BUDGET is empty (IG bots have none).
 STRATEGY_BOT_BUDGETS = {
@@ -108,7 +112,11 @@ STRATEGY_BOT_BUDGETS = {
     ("alpaca", "index-reversion"): 100, ("alpaca", "commodity-trend"): 100,
     ("oanda", "scalper"): 100, ("pepperstone", "scalper"): 1000, ("capital", "scalper"): 100, ("alpaca", "scalper"): 100,
     ("oanda", "slow-trend"): 5000, ("alpaca", "etf-rotation"): 100, ("alpaca", "etf-trend"): 5000,
+    ("oanda", "intraday-momentum"): 2000, ("pepperstone", "intraday-momentum"): 3000,
+    ("capital", "intraday-momentum"): 1000, ("alpaca", "intraday-momentum"): 1000,
 }
+# Each strategy bot's max positions when <BROKER>_<PREFIX>_MAX_POSITIONS is empty.
+STRATEGY_BOT_MAX_POSITIONS = {"intraday-momentum": 1}
 
 CLASSIC_BOTS = [
     Bot("oanda-momentum-scanner", "OANDA momentum scanner", "oanda", "Momentum streak",
@@ -346,7 +354,8 @@ def _strategy_bot_settings(broker: str) -> list:
             rows.append(Setting(p + "BUDGET", "Budget", "Its own money, in the account's currency - default "
                                 f"{STRATEGY_BOT_BUDGETS[(broker, family)]:,}", number=True))
         if family not in PORTFOLIO_FAMILIES:
-            rows.append(Setting(p + "MAX_POSITIONS", "Max positions", "Open at once - default 2", number=True))
+            rows.append(Setting(p + "MAX_POSITIONS", "Max positions",
+                                f"Open at once - default {STRATEGY_BOT_MAX_POSITIONS.get(family, 2)}", number=True))
         if broker in ("oanda", "capital"):
             rows.append(Setting(p + "ACCOUNT_ID", "Account ID", f"Its own sub-account - empty for the "
                                                                 f"{broker.upper()}_ACCOUNT_ID one"))
@@ -369,12 +378,13 @@ def _surge_follower_settings(broker: str) -> list:
     return rows
 
 
-def _risk_settings(prefix: str, risk: str, spread: str = "10") -> list:
+def _risk_settings(prefix: str, risk: str, spread: str = "10", leverage: str = "5") -> list:
     return [
         Sub("Risk"),
         Setting(prefix + "RISK_PERCENT", "Risk per trade %", f"Of the bot's budget, lost if the stop-loss is hit - default {risk}",
                 number=True),
-        Setting(prefix + "MAX_LEVERAGE", "Max leverage", "Open trades worth at most budget x this - default 5", number=True),
+        Setting(prefix + "MAX_LEVERAGE", "Max leverage", f"Open trades worth at most budget x this - default {leverage}",
+                number=True),
         Setting(prefix + "MAX_SPREAD_PERCENT", "Max spread", f"As a % of the stop distance - default {spread}", number=True),
     ]
 
@@ -556,6 +566,23 @@ SETTING_GROUPS = [
         Setting("SURGE_MAX_HOLD_MINUTES", "Time stop", "Minutes - default 15", number=True),
         *_risk_settings("SURGE_", "0.5", spread="25"),
         *_stagnancy_settings("SURGE"),
+    ]),
+    ("Intraday momentum (Nasdaq 100)", "Shared by the intraday momentum bot on every broker (QQQ on Alpaca, buys "
+                                       "only; the NAS100 CFD elsewhere). Every half hour it follows a break out of "
+                                       "the day's usual range from the 09:30 New York open, and is flat before the "
+                                       "close. Replayed on QQQ 2016-2026: ~10% a year at 1x, Sharpe ~1.2 net. "
+                                       "Times are New York time.", [
+        Setting("INTRADAY_LOOKBACK_DAYS", "Usual range of", "Sessions averaged - default 14, at most 18", number=True),
+        Setting("INTRADAY_BAND_MULTIPLIER", "Band width", "Times the usual move from the open - default 1",
+                number=True),
+        Setting("INTRADAY_FIRST_CHECK", "First check", "New York time - default 10:00"),
+        Setting("INTRADAY_LAST_ENTRY_MINUTES", "Last entry", "Minutes before the close - default 30", number=True),
+        Setting("INTRADAY_VWAP_TRAIL", "VWAP trail", "1 = also exit at a check past the session VWAP (default), "
+                                                     "0 = only back inside the band"),
+        Setting("INTRADAY_FLAT_MINUTES", "Close before the close", "Minutes before the NYSE close - default 2",
+                number=True),
+        Setting("INTRADAY_MAX_TRADES_PER_DAY", "Trades per day", "Default 4", number=True),
+        *_risk_settings("INTRADAY_", "2", spread="5", leverage="1"),
     ]),
     ("Slow trend (OANDA)", "Daily trend following on commodity CFDs: each market long, flat or short by its 50/200-day "
                            "EMAs and its move on a year ago, sized by its volatility, rebalanced once a weekday. "

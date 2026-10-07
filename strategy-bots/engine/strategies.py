@@ -76,6 +76,35 @@ on 15-minute bars. This one holds overnight, so it watches the swap.
   that direction costs more than MAX_SWAP_PERCENT (0.05%) of the trade's
   value per night.
 
+6. Intraday momentum (intraday-momentum, settings INTRADAY_*)
+----------------------------------------------------------------
+The Nasdaq 100 (QQQ on Alpaca, the NAS100 CFD elsewhere), following moves
+that break out of the day's usual range, after Zarattini, Aziz & Barbon,
+"Beat the Market" (2024). Replayed on QQQ's 1-minute bars 2016-2026 this
+way: about 10% a year, Sharpe ~1.2 net of costs, every year since 2017
+positive. (On the S&P 500 it didn't hold up after the paper came out.)
+Always flat at the close, so never an overnight swap.
+
+- Noise area: for each half hour of the NYSE session, sigma = the average
+  over the last LOOKBACK_DAYS (14) sessions of |close / that day's 09:30
+  open - 1| at that time of day, x BAND_MULTIPLIER (1.0). Upper band =
+  max(today's open, yesterday's close) x (1 + sigma); lower band = min(...)
+  x (1 - sigma).
+- Checks: at every 30-minute bar's close from FIRST_CHECK (10:00 New York)
+  to LAST_ENTRY_MINUTES (30) before the close: a close above the upper band
+  (and above the session VWAP, with VWAP_TRAIL on) -> long; below the lower
+  band (and the VWAP) -> short.
+- Exits: at a check, a close back below max(upper band, VWAP) for a long,
+  above min(lower band, VWAP) for a short (just the band with VWAP_TRAIL
+  off); a stop-loss at the opposite band, for when the bot isn't running;
+  FLAT_MINUTES (2) before the NYSE close, whatever happens. At most
+  MAX_TRADES_PER_DAY (4) a day; no trading on NYSE holidays, and half days
+  end at 13:00.
+- Sizing: the stop is the far band, 1-2% away, so with the default 2% risk
+  the leverage cap usually decides: a trade worth the budget x MAX_LEVERAGE
+  (1). The runner wakes for each bar's close: filling a minute later cost
+  about 1% a year in the replay.
+
 Broadcast trades
 ----------------
 A broadcast trade from the dashboard (shared/broadcast.py) overrides the
@@ -137,6 +166,7 @@ class Strategy:
     holds_overnight = False
     uses_prices = False          # True: trades on live price reads every few seconds, not closed bars (engine/scalper.py)
     uses_signals = False         # True: trades another bot's signals, not its own markets (engine/surge.py)
+    prompt = False               # True: the runner wakes the moment a bar is due, not at its next 30-second pass
     # True: the bot closes at its own stop-loss / take-profit, checked on every
     # pass, because the broker's may sit further out (at its minimum distance).
     checks_own_levels = False
@@ -621,7 +651,171 @@ class CommodityTrend(Strategy):
                 f"max swap {p['max_swap_percent']:g}%/night | {p['max_trades_per_day']} trade(s)/day")
 
 
-STRATEGIES = {cls.key: cls for cls in (SessionBreakout, IndexReversion, CommodityTrend)}
+# ---------------------------------------------------------------------------
+# 6. Intraday momentum
+# ---------------------------------------------------------------------------
+@dataclass
+class Levels:
+    """Where the latest bar's close stands against today's noise area."""
+    close: float
+    upper: float
+    lower: float
+    vwap: float
+    sigma: float                   # the noise at this time of day, as a fraction of the price
+    checked_at: float              # the bar's close: the check it belongs to
+    session_close: float
+
+
+class IntradayMomentum(Strategy):
+    key = "intraday-momentum"
+    prompt = True
+
+    def __init__(self, params: dict):
+        super().__init__(params)
+        self.first_check = clock.parse_hhmm(params["first_check"])
+
+    def feeds(self) -> dict:
+        # The look-back's sessions and a few days over, for holidays and gaps - but no more
+        # than the 1,000 bars Capital.com sends at once (18 sessions' worth of a CFD's).
+        return {"exec": (self.timeframe, min((self.p["lookback_days"] + 3) * 86400 // self.bar_seconds, 1000))}
+
+    def prepare(self, markets: dict, log) -> dict:
+        usable = {}
+        for symbol, market in markets.items():
+            key = market.session_hint or guess_session(market.requested, market.symbol, market.name)
+            if key != "us":
+                log.warning(f"Skipping {symbol}: this strategy trades US indices on New York's hours - add @us to "
+                            f"its name in the market list if it is one (e.g. {market.requested}@us).")
+                continue
+            usable[symbol] = market
+        return usable
+
+    def sessions(self, series: list) -> list:
+        """[(open time, close time, its bars)] of every NYSE session the bars reach, oldest first."""
+        tf, by_day = self.bar_seconds, {}
+        for bar in series:
+            by_day.setdefault(clock.local_date("new_york", bar.time), []).append(bar)
+        out = []
+        for day in sorted(by_day):
+            hours = clock.nyse_hours(day)
+            if hours is None:
+                continue
+            opens, closes = hours
+            bars = [b for b in by_day[day] if opens <= b.time and b.time + tf <= closes]
+            if bars:
+                out.append((opens, closes, bars))
+        return out
+
+    def levels(self, series: list):
+        """(Levels, "") for the latest bar, or (None, why there are none)."""
+        p, tf = self.p, self.bar_seconds
+        if not series:
+            return None, "no bars yet"
+        bar = series[-1]
+        sessions = self.sessions(series)
+        if not sessions or sessions[-1][2][-1] is not bar:
+            if clock.nyse_hours(clock.local_date("new_york", bar.time)) is None:
+                return None, "the NYSE is shut today"
+            return None, "outside the NYSE session"
+        opens, closes, today = sessions[-1]
+        if today[0].time != opens:
+            return None, "no bar from the 09:30 open, so today's move can't be measured"
+        yesterday = clock.previous_nyse_day(clock.local_date("new_york", opens))
+        if len(sessions) < 2 or clock.local_date("new_york", sessions[-2][0]) != yesterday:
+            # Its close is one of the band's anchors. (MetaTrader can answer from a stale copy of its
+            # history while it downloads the rest: on 7 Oct 2026 a first read had no 6 Oct.)
+            return None, f"no {yesterday:%a %d %b} session in the bars, so no previous close - a gap in the history?"
+        prev_close = sessions[-2][2][-1].close
+        slot = round((bar.time - opens) / tf)
+        moves = [abs(b.close / bars[0].open - 1)
+                 for start, _, bars in sessions[:-1][-p["lookback_days"]:] if bars[0].time == start
+                 for b in bars if round((b.time - start) / tf) == slot]
+        need = max(5, p["lookback_days"] // 2)
+        if len(moves) < need:
+            return None, (f"only {len(moves)} of the last {p['lookback_days']} sessions reach this time of day "
+                          f"(needs {need})")
+        sigma = p["band_multiplier"] * sum(moves) / len(moves)
+        day_open = today[0].open
+        return Levels(close=bar.close, upper=max(day_open, prev_close) * (1 + sigma),
+                      lower=min(day_open, prev_close) * (1 - sigma), vwap=session_vwap(today)[0][-1], sigma=sigma,
+                      checked_at=bar.time + tf, session_close=closes), ""
+
+    def exit_line(self, levels: Levels, direction: str) -> float:
+        """A long holds while the close stays above this (a short, below)."""
+        if direction == "long":
+            return max(levels.upper, levels.vwap) if self.p["vwap_trail"] else levels.upper
+        return min(levels.lower, levels.vwap) if self.p["vwap_trail"] else levels.lower
+
+    def describe(self, levels: Levels) -> str:
+        return (f"noise area {_fmt(levels.lower)}-{_fmt(levels.upper)} (+/-{levels.sigma:.2%}) | VWAP "
+                f"{_fmt(levels.vwap)} | close {_fmt(levels.close)}")
+
+    def assess(self, market, bars: dict, now: float) -> Assessment:
+        p = self.p
+        levels, why = self.levels(bars["exec"])
+        if levels is None:
+            return Assessment(note=why)
+        note = self.describe(levels)
+        if clock.local("new_york", levels.checked_at).time() < self.first_check:
+            return Assessment(note=note + f" | before the first check ({p['first_check']} New York)")
+        if levels.checked_at > levels.session_close - p["last_entry_minutes"] * 60:
+            return Assessment(note=note + f" | no entries in the last {p['last_entry_minutes']} min of the session")
+        close = levels.close
+        if close > self.exit_line(levels, "long"):
+            direction, stop, beyond = "long", levels.lower, close - levels.upper
+        elif close < self.exit_line(levels, "short"):
+            direction, stop, beyond = "short", levels.upper, levels.lower - close
+        elif levels.lower <= close <= levels.upper:
+            return Assessment(note=note + " | inside the noise area")
+        else:
+            return Assessment(note=note + " | past a band but on the wrong side of the VWAP")
+        width = levels.sigma * close
+        return Assessment(
+            signal=Signal(direction, stop=stop, score=beyond / width if width else 0.0,
+                          why=f"{direction}: closed {'above' if direction == 'long' else 'below'} the noise area "
+                              f"({beyond / width if width else 0:.1f}x its width beyond the band)"),
+            note=note + f" | MOMENTUM {direction.upper()}",
+        )
+
+    def exit_on_bar(self, market, bars: dict, position, state: dict, now: float):
+        levels, _ = self.levels(bars["exec"])
+        if levels is None:
+            return None  # outside the session: exit_on_time closes it
+        line = self.exit_line(levels, position.direction)
+        long = position.direction == "long"
+        if (levels.close < line) if long else (levels.close > line):
+            band = levels.upper if long else levels.lower
+            what = "band" if line == band else "VWAP"
+            return f"momentum gone - closed {_fmt(levels.close)}, {'below' if long else 'above'} the {what} {_fmt(line)}"
+        return None
+
+    def exit_on_time(self, market, position, state: dict, now: float):
+        opened = state.get("opened_at") or position.opened_at or now
+        day = clock.local_date("new_york", opened)
+        hours = clock.nyse_hours(day)
+        closes = hours[1] if hours else clock.at("new_york", day, clock.NYSE_CLOSE)
+        if now >= closes - self.p["flat_minutes"] * 60 or clock.local_date("new_york", now) != day:
+            return f"{self.p['flat_minutes']} min before the NYSE close - never held overnight"
+        return None
+
+    def trade_day(self, market, now: float) -> str:
+        return clock.local_date("new_york", now).isoformat()
+
+    def exits(self) -> str:
+        p = self.p
+        return (f"out at a check back inside the band{' or past the VWAP' if p['vwap_trail'] else ''}; stop at the "
+                f"far band; flat {p['flat_minutes']} min before the NYSE close")
+
+    def summary(self) -> str:
+        p = self.p
+        return (f"Noise area: average move from the open over {p['lookback_days']} sessions x "
+                f"{p['band_multiplier']:g} | checks every 30 min from {p['first_check']} New York, entries to "
+                f"{p['last_entry_minutes']} min before the close | VWAP trail {'on' if p['vwap_trail'] else 'off'} | "
+                f"stop at the far band | flat {p['flat_minutes']} min before the close | "
+                f"{p['max_trades_per_day']} trade(s)/day")
+
+
+STRATEGIES = {cls.key: cls for cls in (SessionBreakout, IndexReversion, CommodityTrend, IntradayMomentum)}
 
 
 def make_strategy(key: str, params: dict) -> Strategy:
