@@ -7,8 +7,8 @@ Two kinds:
 - Strategy settings, shared by that strategy on every broker (like the
   scanners' STREAK_LENGTH): BREAKOUT_*, REVERSION_*, TREND_*, SCALPER_*,
   SURGE_* (the opening surge scanner and its followers), INTRADAY_* (intraday
-  momentum), and the portfolio bots' SLOW_TREND_* (OANDA), ROTATION_* and
-  ETF_TREND_* (Alpaca).
+  momentum), and the portfolio bots' SLOW_TREND_* (OANDA), ROTATION_*,
+  ETF_TREND_* and DIP_* (Alpaca).
 - Per-bot settings, one set per broker and strategy:
   <BROKER>_<BREAKOUT|REVERSION|TREND|SCALPER|INTRADAY>_MARKETS / _BUDGET / _MAX_POSITIONS,
   plus _ACCOUNT_ID on OANDA and Capital.com (falling back to the broker's
@@ -35,14 +35,16 @@ STRATEGY_NAMES = {
     "etf-rotation": "Monthly ETF rotation",
     "etf-trend": "Weekly ETF trend rotation (35 funds)",
     "intraday-momentum": "Intraday momentum (Nasdaq 100)",
+    "dip-rotation": "60/40 dip rotation (daily)",
 }
 STRATEGY_PREFIX = {"session-breakout": "BREAKOUT", "index-reversion": "REVERSION", "commodity-trend": "TREND",
                    "scalper": "SCALPER", "surge-follower": "SURGE", "slow-trend": "SLOW_TREND",
-                   "etf-rotation": "ROTATION", "etf-trend": "ETF_TREND", "intraday-momentum": "INTRADAY"}
+                   "etf-rotation": "ROTATION", "etf-trend": "ETF_TREND", "intraday-momentum": "INTRADAY",
+                   "dip-rotation": "DIP"}
 # The portfolio bots (engine/rebalancer.py): they hold every one of their
 # markets at a target size and rebalance on a schedule, rather than trading
 # one signal at a time.
-REBALANCERS = ("slow-trend", "etf-rotation", "etf-trend")
+REBALANCERS = ("slow-trend", "etf-rotation", "etf-trend", "dip-rotation")
 
 # The surge followers trade the US shares the surge scanner finds, on the
 # brokers that offer them: how each writes a ticker ("{}" is the ticker).
@@ -102,6 +104,9 @@ DEFAULT_MARKETS = {
     ("capital", "intraday-momentum"): "US100",
     ("ig", "intraday-momentum"): "US Tech 100:IX.D.NASDAQ.IFS.IP",
     ("alpaca", "intraday-momentum"): "QQQ",
+    # The 60/40 dip rotation: a share fund, then a bond fund. VTI and GOVT
+    # because the other Alpaca bots trade SPY/VOO/IVV and IEF/VGIT.
+    ("alpaca", "dip-rotation"): "VTI,GOVT",
 }
 
 # The budget each bot treats as its whole account, in the account's
@@ -121,11 +126,12 @@ DEFAULT_BUDGET = {
     # Pepperstone's smallest NAS100 trade (0.1 lot) is worth about 2,400 GBP.
     ("oanda", "intraday-momentum"): 2000, ("pepperstone", "intraday-momentum"): 3000,
     ("capital", "intraday-momentum"): 1000, ("ig", "intraday-momentum"): 10000, ("alpaca", "intraday-momentum"): 1000,
+    ("alpaca", "dip-rotation"): 1000,
 }
 # The portfolio bots hold all their markets at once, so theirs isn't used.
 DEFAULT_MAX_POSITIONS = {"session-breakout": 2, "index-reversion": 2, "commodity-trend": 2, "scalper": 2,
                          "surge-follower": 3, "slow-trend": 50, "etf-rotation": 50,
-                         "etf-trend": 50, "intraday-momentum": 1}
+                         "etf-trend": 50, "intraday-momentum": 1, "dip-rotation": 50}
 
 # MetaTrader 5 tags each bot's positions with its own number; the
 # Pepperstone scanner and EMA bot use 928001 and 928002.
@@ -367,6 +373,18 @@ def strategy_params(strategy: str) -> dict:
         if not "09:30" < params["first_check"] < "16:00":
             raise SettingsError("INTRADAY_FIRST_CHECK must be after the 09:30 New York open and before 16:00")
         return params
+    if strategy == "dip-rotation":
+        p = "DIP_"
+        return {
+            "share_percent": number(p + "SHARE_PERCENT", 60, minimum=0, maximum=100),
+            "entry_rsi": number(p + "ENTRY_RSI", 10, minimum=1, maximum=50),
+            "trend_days": number(p + "TREND_DAYS", 200, minimum=20, maximum=400, whole=True),
+            "exit_days": number(p + "EXIT_DAYS", 5, minimum=2, maximum=50, whole=True),
+            "minutes_before_close": number(p + "MINUTES_BEFORE_CLOSE", 10, minimum=3, maximum=60, whole=True),
+            "rebalance_band": number(p + "REBALANCE_BAND", 5, minimum=0, maximum=50),
+            "max_spread_percent": number(p + "MAX_SPREAD_PERCENT", 0.5, minimum=0.01, maximum=10),
+            "max_leverage": 1.0,  # bought outright, never on margin
+        }
     raise SettingsError(f"unknown strategy {strategy!r}")
 
 
@@ -441,6 +459,8 @@ def bot_settings(broker: str, strategy: str) -> BotSettings:
                    if m.strip()]
         if not markets:
             raise SettingsError(f"{prefix}MARKETS names no markets")
+        if strategy == "dip-rotation" and len(set(m.upper() for m in markets)) != 2:
+            raise SettingsError(f"{prefix}MARKETS must name two funds: shares, then bonds (e.g. VTI,GOVT)")
     account_id = ""
     if broker in ("oanda", "capital"):
         account_id = _raw(prefix + "ACCOUNT_ID") or _raw(f"{broker.upper()}_ACCOUNT_ID")

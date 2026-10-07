@@ -1003,7 +1003,7 @@ second by second, right at the open; treat the demo accounts as the test.
 ## Portfolio bots: slow trend and ETF rotations
 
 **Concept.** Every other bot here trades one signal at a time, with a stop
-and a target. These three hold all of their markets at a target size and
+and a target. These four hold all of their markets at a target size and
 move each position towards it on a schedule - once a day, a week or a
 month (`strategy-bots/engine/rebalancer.py`). They came out of a study of bonds
 and commodities on 30 September 2026 (below): the only approach tested
@@ -1015,14 +1015,16 @@ spread over many markets.
 | `oanda_slow_trend_bot.py` (**OANDA slow trend**) | ig-bot-env | 10 commodity CFDs, long, flat or short: Brent, WTI, natural gas, gold, silver, copper, corn, wheat, soybeans, sugar (budget 5,000) |
 | `alpaca_etf_rotation_bot.py` (**Alpaca monthly ETF rotation**) | alpaca-bot-env | 5 funds, bought outright: VOO (US shares), EFA (other developed markets), IEF (7-10 year Treasuries), DBC (commodities), VNQ (US property) - or SHY (1-3 year Treasuries) in their place (budget $100) |
 | `alpaca_etf_trend_bot.py` (**Alpaca weekly ETF trend rotation**) | alpaca-bot-env | Up to 35 funds, bought outright, whichever are trending up: US, developed, emerging, Japanese, European and Chinese shares; Treasuries, TIPS, corporate, high-yield, emerging and world bonds; US property; gold, silver, broad commodities, oil, gas, farm goods, metals; six currencies - the rest in BIL (1-3 month Treasury bills) (budget $5,000) |
+| `alpaca_dip_rotation_bot.py` (**Alpaca 60/40 dip rotation**) | alpaca-bot-env | VTI (all US shares) and GOVT (US Treasuries), bought outright: 60/40, or all VTI during a short dip (budget $1,000) |
 
 ```powershell
 python strategy-bots\oanda_slow_trend_bot.py       # ig-bot-env
 python strategy-bots\alpaca_etf_rotation_bot.py    # alpaca-bot-env
 python strategy-bots\alpaca_etf_trend_bot.py       # alpaca-bot-env
+python strategy-bots\alpaca_dip_rotation_bot.py    # alpaca-bot-env
 ```
 
-All three run on the strategy bots' runner, so `STRATEGY_DRY_RUN`, the
+All four run on the strategy bots' runner, so `STRATEGY_DRY_RUN`, the
 own-trades-only rule, the saved notes in `strategy-bots/state/` and
 closing from the dashboard all work as there (a position closed from the
 dashboard is put back at the next rebalance). On starting, each logs where
@@ -1095,6 +1097,41 @@ stays the budget.
   VNQ and DBC; IAU, SIVR and DBO for the commodity bot's GLD, SLV and USO.
   Override the list with `ALPACA_ETF_TREND_MARKETS`.
 
+**60/40 dip rotation (`DIP_*`).**
+- Normally `SHARE_PERCENT` (60%) of the budget in the share fund and the
+  rest in the bond fund - the first and second of `ALPACA_DIP_MARKETS`
+  (VTI and GOVT; the other Alpaca bots already trade SPY/VOO/IVV and
+  IEF/VGIT).
+- During a dip in the share fund, all of it in shares. A dip starts at a
+  close with RSI(2) under `ENTRY_RSI` (10) while the close is above its
+  `TREND_DAYS` (200) day average - a sharp pullback in a rising market,
+  not a falling one - and ends at the first close above its `EXIT_DAYS`
+  (5) day average (Connors' RSI(2) rule, 2008). It's worked out afresh
+  each day from Alpaca's daily bars, so nothing is remembered between days.
+- When: every trading day, `MINUTES_BEFORE_CLOSE` (10) before the NYSE
+  close (13:00 on half days), with the price then standing in for the
+  close - Alpaca takes no fractional orders at the closing auction. Sells
+  first, then buys; drift under `REBALANCE_BAND` (5%) of the budget is
+  left alone, so outside dips it trades every few weeks at most.
+- Tested 7 October 2026 (scratch scripts; daily total-return closes, 3 bp
+  a switch):
+
+| | A year | Volatility | Sharpe | Worst fall |
+|---|---|---|---|---|
+| VTI/GOVT 60/40, Mar 2012 - Oct 2026 | 9.2% | 10.0% | 0.77 | -21% |
+| **VTI/GOVT 60/40 + dips (this bot)** | **11.0%** | **11.1%** | **0.84** | **-22%** |
+| SPY/IEF 60/40, 2003 - 2026 | 8.7% | 10.7% | 0.67 | -31% |
+| SPY/IEF 60/40 + dips | 10.2% | 11.8% | 0.74 | -31% |
+| SPY alone, 2003 - 2026 | 11.6% | 18.5% | 0.59 | -55% |
+
+  In a dip on about one day in eight. Deciding at 15:50 New York instead
+  of at the close (SPY 1-minute bars, 2016-2026) kept about +1% a year over
+  the plain 60/40 instead of +1.6%. The RSI(2) rule itself held up after
+  it was published: since 2009 every one of 140 variants (7 index funds x
+  thresholds 5-25, with and without the 200-day filter, two exits) made
+  money after costs. On its own, though, it sits in cash nine days in ten
+  and earned less than holding the index - hence this overlay.
+
 **Backtest (30 September 2026; research scripts, not in the repo).** Daily,
 2008-2026, textbook rules, no tuning. OANDA's commodity and bond prices
 leave out the futures roll - its natural gas was 11.06 in 2005 and 2.89
@@ -1154,7 +1191,10 @@ to show anything. The rotation is an investment that mostly sidesteps
 big falls, not a trading edge: since 2022 it has only just beaten cash,
 and holding US shares made twice as much. The weekly 35-fund version
 expects less than the 5-fund one, with similar falls; run it to compare
-the two side by side.
+the two side by side. The 60/40 dip rotation is a better-timed 60/40:
+expect roughly a 60/40's ups and downs (a fifth of the budget lost in a
+bad year), with 1-2% a year more on top in the long run - invisible over
+a few months of demo trading.
 
 ## IG position sizing (both IG bots)
 

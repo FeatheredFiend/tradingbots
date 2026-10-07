@@ -44,7 +44,21 @@ each position towards it on a schedule.
    Alpaca bots trade are swapped for near-twins (IVV for SPY, IAU for GLD,
    ...), so they can share the account.
 
-All three run on the strategy bots' runner (StrategyBot: saved notes and own
+4. 60/40 dip rotation (Alpaca, `dip-rotation`, DIP_*) - SHARE_PERCENT (60%)
+   of the budget in a share fund (VTI) and the rest in a bond fund (GOVT),
+   except during a dip in the share fund, when it's all in shares. A dip
+   starts at a close with RSI(2) under ENTRY_RSI (10) while the close is
+   above its TREND_DAYS (200) day average, and ends at the first close
+   above the EXIT_DAYS (5) day average (Connors' RSI(2) rule). Decided and
+   traded every trading day MINUTES_BEFORE_CLOSE (10) before the NYSE close,
+   on the price then; drift under REBALANCE_BAND (5%) of the budget is left
+   alone. Backtested on daily closes (2012-2026, VTI/GOVT): ~11% a year
+   against ~9% for a plain 60/40, Sharpe 0.84 against 0.77, the same worst
+   fall (-22%); deciding at 15:50 rather than the close kept about +1% a
+   year (SPY 1-minute bars, 2016-2026). A better-timed 60/40, not a trading
+   edge: in a dip about one day in eight.
+
+All four run on the strategy bots' runner (StrategyBot: saved notes and own
 trades only, anyone else's position left alone, dashboard reports and
 closes, the error cutoff) and the same broker adapters. A position closed
 from the dashboard is taken back to its target at the next rebalance (the
@@ -58,7 +72,7 @@ from dataclasses import dataclass
 
 from . import clock
 from .brokers.base import BrokerError
-from .indicators import ema
+from .indicators import ema, rsi
 from .runner import TRADE_REPORT_DELAYS, StrategyBot
 
 YEAR_SECONDS = 365.25 * 86400
@@ -121,6 +135,33 @@ def month_end_closes(bars: list, now: float, zone: str = "new_york") -> list:
         if month < this_month:
             closes[month] = bar.close
     return sorted(closes.items())
+
+
+def dip_state(closes: list, entry_rsi: float, trend_days: int, exit_days: int) -> tuple:
+    """(in a dip after the last close?, why). A dip starts at a close with
+    RSI(2) under `entry_rsi` above the `trend_days` average, and ends at a
+    close above the `exit_days` average (no new one that same day). Replayed
+    over all the closes, so there's nothing to remember between days.
+    (None, why) without enough of them."""
+    if len(closes) < trend_days + 2:
+        return None, f"only {len(closes)} daily closes, needs {trend_days + 2}"
+    strength = rsi(closes, 2)
+    inside, started = False, None
+    for i in range(trend_days - 1, len(closes)):
+        if inside and closes[i] > sum(closes[i - exit_days + 1:i + 1]) / exit_days:
+            inside = False
+        elif not inside and strength[i] is not None and strength[i] < entry_rsi and \
+                closes[i] > sum(closes[i - trend_days + 1:i + 1]) / trend_days:
+            inside, started = True, i
+    trend, recent = sum(closes[-trend_days:]) / trend_days, sum(closes[-exit_days:]) / exit_days
+    why = (f"RSI2 {strength[-1]:.0f}, close {closes[-1]:.2f} vs {trend_days}-day average {trend:.2f}, "
+           f"{exit_days}-day {recent:.2f}")
+    if inside:
+        days = len(closes) - 1 - started
+        why += " -> in a dip " + ("from today" if not days else f"for {days} day(s)")
+    else:
+        why += " -> no dip"
+    return inside, why
 
 
 def above_average(month_closes: list, months: int) -> tuple:
@@ -351,11 +392,67 @@ class EtfTrend(PortfolioStrategy):
                 f"week, {p['minutes_after_open']} min after the open, when {p['rebalance_band']:g}% off")
 
 
+class DipRotation(PortfolioStrategy):
+    key = "dip-rotation"
+
+    def __init__(self, params: dict):
+        super().__init__(params)
+        self.history_bars = params["trend_days"] + 60  # the average's own length and plenty for RSI(2)
+
+    def period(self, broker, now: float):
+        """Every trading day, from MINUTES_BEFORE_CLOSE before the NYSE close (13:00 on
+        half days) to a minute before it."""
+        if broker.session_opened_at(now) is None:
+            return None
+        day = clock.local_date("new_york", now)
+        hours = clock.nyse_hours(day)
+        closes = hours[1] if hours else clock.at("new_york", day, clock.NYSE_CLOSE)
+        if not closes - self.p["minutes_before_close"] * 60 <= now < closes - 60:
+            return None
+        return day.isoformat()
+
+    def targets(self, markets: dict, history: dict, quotes: dict, budget: float, broker, now: float) -> dict:
+        p = self.p
+        if len(markets) != 2:
+            return {s: Target(s, note="needs two funds: shares, then bonds") for s in markets}
+        shares, bonds = markets
+        quote = quotes.get(shares)
+        if quote is None or not quote.mid:
+            return {s: Target(s, note=f"no {shares} price to decide by") for s in markets}
+        # The closes before today, and today's price now as its close.
+        today = clock.local_date("new_york", now)
+        closes = [b.close for b in history.get(shares) or []
+                  if clock.local_date("new_york", b.time + 6 * 3600) < today] + [quote.mid]
+        dip, why = dip_state(closes, p["entry_rsi"], p["trend_days"], p["exit_days"])
+        if dip is None:
+            return {s: Target(s, note=why) for s in markets}
+        weight = 1.0 if dip else p["share_percent"] / 100
+        views = {}
+        for symbol, dollars in ((shares, budget * weight), (bonds, budget * (1 - weight))):
+            t, price = Target(symbol, note=f"{shares} {why} -> {weight:.0%} in {shares}"), quotes.get(symbol)
+            if price is None or not price.mid:
+                t.note += " | no price"
+            else:
+                t.size = broker.round_size(markets[symbol], dollars / price.mid) if dollars >= MIN_ORDER else 0.0
+                t.band = max(MIN_ORDER, budget * p["rebalance_band"] / 100) / price.mid
+                t.note += f" | ${dollars:,.2f}"
+            views[symbol] = t
+        return views
+
+    def summary(self) -> str:
+        p = self.p
+        return (f"60/40 dip rotation: {p['share_percent']:g}% in the share fund, the rest in the bond fund; all in "
+                f"shares during a dip (RSI2 under {p['entry_rsi']:g} above the {p['trend_days']}-day average, until "
+                f"a close above the {p['exit_days']}-day average); decided and traded {p['minutes_before_close']} min "
+                f"before each close; drift under {p['rebalance_band']:g}% of the budget left alone")
+
+
 MIN_ORDER = 1.0  # dollars - Alpaca's smallest fractional order
 
 
 def make_portfolio_strategy(key: str, params: dict) -> PortfolioStrategy:
-    return {"slow-trend": SlowTrend, "etf-rotation": EtfRotation, "etf-trend": EtfTrend}[key](params)
+    return {"slow-trend": SlowTrend, "etf-rotation": EtfRotation, "etf-trend": EtfTrend,
+            "dip-rotation": DipRotation}[key](params)
 
 
 def plan(current: float, target: Target, market, broker) -> list:
@@ -448,6 +545,8 @@ class RebalanceBot(StrategyBot):
         elif self.strategy.key == "etf-trend":
             when = (f"in each week's first session, {self.p['minutes_after_open']} min after the open - this "
                     f"week's straight away if the market's open")
+        elif self.strategy.key == "dip-rotation":
+            when = f"every trading day, {self.p['minutes_before_close']} min before the close"
         else:
             when = (f"in each month's first session, {self.p['minutes_after_open']} min after the open - this "
                     f"month's straight away if the market's open")

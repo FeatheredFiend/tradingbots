@@ -73,10 +73,11 @@ FAMILIES = {
     "etf-rotation": "Monthly ETF rotation",
     "etf-trend": "Weekly ETF trend rotation (35 funds)",
     "intraday-momentum": "Intraday momentum (Nasdaq 100)",
+    "dip-rotation": "60/40 dip rotation (daily)",
 }
 # Portfolio bots (strategy-bots/engine/rebalancer.py) hold all their markets
 # at once, so they have no max positions.
-PORTFOLIO_FAMILIES = ("slow-trend", "etf-rotation", "etf-trend")
+PORTFOLIO_FAMILIES = ("slow-trend", "etf-rotation", "etf-trend", "dip-rotation")
 # The strategy bots in strategy-bots/: each of these on every broker, except
 # forex on Alpaca, which has none. (key, env prefix, default markets per broker).
 STRATEGY_BOTS = {
@@ -102,6 +103,7 @@ STRATEGY_BOTS = {
     "intraday-momentum": ("INTRADAY", {
         "oanda": "NAS100_USD", "pepperstone": "NAS100", "capital": "US100", "ig": "US Tech 100:IX.D.NASDAQ.IFS.IP",
         "alpaca": "QQQ"}),
+    "dip-rotation": ("DIP", {"alpaca": "VTI, GOVT"}),
 }
 # Each strategy bot's own budget, when <BROKER>_<PREFIX>_BUDGET is empty (IG bots have none).
 STRATEGY_BOT_BUDGETS = {
@@ -113,7 +115,7 @@ STRATEGY_BOT_BUDGETS = {
     ("oanda", "scalper"): 100, ("pepperstone", "scalper"): 1000, ("capital", "scalper"): 100, ("alpaca", "scalper"): 100,
     ("oanda", "slow-trend"): 5000, ("alpaca", "etf-rotation"): 100, ("alpaca", "etf-trend"): 5000,
     ("oanda", "intraday-momentum"): 2000, ("pepperstone", "intraday-momentum"): 3000,
-    ("capital", "intraday-momentum"): 1000, ("alpaca", "intraday-momentum"): 1000,
+    ("capital", "intraday-momentum"): 1000, ("alpaca", "intraday-momentum"): 1000, ("alpaca", "dip-rotation"): 1000,
 }
 # Each strategy bot's max positions when <BROKER>_<PREFIX>_MAX_POSITIONS is empty.
 STRATEGY_BOT_MAX_POSITIONS = {"intraday-momentum": 1}
@@ -633,6 +635,21 @@ SETTING_GROUPS = [
         Setting("ETF_TREND_MOMENTUM_DAYS", "Momentum look-back", "Calendar days - default 365", number=True),
         Setting("ETF_TREND_VOLATILITY_BARS", "Volatility span", "Daily bars - default 60", number=True),
         Setting("ETF_TREND_MAX_SPREAD_PERCENT", "Max spread", "% of the price - default 0.5", number=True),
+    ]),
+    ("60/40 dip rotation (Alpaca)", "60% in a share fund and 40% in a bond fund (the first and second of "
+                                    "ALPACA_DIP_MARKETS, default VTI and GOVT), but all in shares during a dip: a "
+                                    "close with RSI(2) under 10 above the 200-day average, until a close above the "
+                                    "5-day average. Decided and traded 10 minutes before each close. Backtested "
+                                    "2012-2026: ~11% a year against ~9% for a plain 60/40, the same worst fall - a "
+                                    "better-timed 60/40, not a trading edge.", [
+        Setting("DIP_SHARE_PERCENT", "In shares", "% of the budget outside a dip - default 60", number=True),
+        Setting("DIP_ENTRY_RSI", "Dip at RSI(2) under", "Default 10", number=True),
+        Setting("DIP_TREND_DAYS", "Only above the", "Day average - default 200", number=True),
+        Setting("DIP_EXIT_DAYS", "Dip ends above the", "Day average - default 5", number=True),
+        Setting("DIP_MINUTES_BEFORE_CLOSE", "Trade at", "Minutes before the close - default 10", number=True),
+        Setting("DIP_REBALANCE_BAND", "Rebalance band", "Drift under this % of the budget is left alone - default 5",
+                number=True),
+        Setting("DIP_MAX_SPREAD_PERCENT", "Max spread", "% of the price - default 0.5", number=True),
     ]),
     ("OANDA","Practice account: hub > Tools > API > Generate. Give bots that trade the same markets "
               "sub-accounts of their own - OANDA nets a market's trades together.", [

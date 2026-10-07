@@ -23,7 +23,7 @@ from engine.brokers.base import Account, Broker, Market, Position, Quote  # noqa
 from engine.indicators import Bar  # noqa: E402
 from engine.rebalancer import (EtfRotation, RebalanceBot, SlowTrend, Target, above_average,  # noqa: E402
                                annual_volatility, month_end_closes, plan, trend_signal)
-from engine.settings import BotSettings, SettingsError, strategy_params  # noqa: E402
+from engine.settings import BotSettings, SettingsError, bot_settings, strategy_params  # noqa: E402
 
 DAY = 86400
 
@@ -401,6 +401,111 @@ class EtfTrendTests(unittest.TestCase):
                              [("close", "DOWN", None), ("open", "UP", "long"), ("open", "BIL", "long")])
             broker.orders.clear()
             bot.cycle()                                                 # the same week again: nothing
+        self.assertEqual(broker.orders, [])
+
+
+class DipRotationTests(unittest.TestCase):
+    TODAY_NOW = utc(2026, 10, 7, 19, 52)  # Wed 7 Oct, 15:52 New York
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        patcher = mock.patch.object(runner, "STATE_DIR", self.tmp.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+        # A steady rise with small daily wiggles: 300 daily bars up to yesterday (6 Oct, New York midnight)...
+        closes = [c * (1 + i * 0.001) for i, c in enumerate(alternating(300, 0.002))]
+        bars = daily(closes, start=utc(2026, 10, 6, 4) - 299 * DAY)
+        # ...and Alpaca's part-day bar for today, which the bot must ignore for the price now.
+        bars.append(Bar(utc(2026, 10, 7, 4), 999, 999, 999, 999))
+        self.closes = closes
+        self.history = {"VTI": bars, "GOVT": daily([80.0] * 300, start=utc(2026, 10, 6, 4) - 299 * DAY)}
+        self.quotes = {"VTI": quote(closes[-1] * 1.003), "GOVT": quote(80.0)}
+
+    def bot(self, positions=None, budget=1000.0):
+        s = settings("dip-rotation", ["VTI", "GOVT"], budget=budget)
+        broker = FakeBroker(s, self.history, self.quotes, positions, min_size=0.0, step=1e-6)
+        bot = RebalanceBot(s, rebalancer.DipRotation(s.params), broker, mock.Mock(), mock.Mock())
+        bot.markets = broker.resolve(s.markets)
+        return bot, broker
+
+    def targets(self, bot):
+        return bot.strategy.targets(bot.markets, self.history, self.quotes, bot.settings.budget, bot.broker,
+                                    self.TODAY_NOW)
+
+    def dip_today(self):
+        """Yesterday closed 1.5% down; now it's another 2% down - still far above the 200-day average."""
+        self.history["VTI"][-2].close = self.closes[-2] * 0.985
+        self.quotes["VTI"] = quote(self.closes[-2] * 0.985 * 0.98)
+
+    def test_settings(self):
+        p = strategy_params("dip-rotation")
+        self.assertEqual((p["share_percent"], p["entry_rsi"], p["trend_days"], p["exit_days"],
+                          p["minutes_before_close"], p["max_leverage"]), (60, 10, 200, 5, 10, 1.0))
+        s = bot_settings("alpaca", "dip-rotation")
+        self.assertEqual((s.markets, s.slug, s.name), (["VTI", "GOVT"], "alpaca-dip-rotation",
+                                                       "Alpaca 60/40 dip rotation"))
+        with mock.patch.dict(os.environ, {"ALPACA_DIP_MARKETS": "VTI,GOVT,GLD"}), self.assertRaises(SettingsError):
+            bot_settings("alpaca", "dip-rotation")
+
+    def test_dip_state(self):
+        rising = [100 * (1.001 ** i) * (1.002 if i % 2 else 0.998) for i in range(260)]
+        self.assertFalse(rebalancer.dip_state(rising, 10, 200, 5)[0])
+        dipped = rising + [rising[-1] * 0.985, rising[-1] * 0.985 * 0.98]
+        inside, why = rebalancer.dip_state(dipped, 10, 200, 5)
+        self.assertTrue(inside, why)
+        self.assertIn("from today", why)
+        # Still under the 5-day average the next day: still in it. Back above it: over.
+        self.assertTrue(rebalancer.dip_state(dipped + [dipped[-1] * 1.001], 10, 200, 5)[0])
+        self.assertFalse(rebalancer.dip_state(dipped + [rising[-1] * 1.01], 10, 200, 5)[0])
+        # The same drop below the 200-day average is no dip: a falling market, not a pullback.
+        falling = [100 * (0.999 ** i) * (1.002 if i % 2 else 0.998) for i in range(260)]
+        self.assertFalse(rebalancer.dip_state(falling + [falling[-1] * 0.985, falling[-1] * 0.965], 10, 200, 5)[0])
+        self.assertIsNone(rebalancer.dip_state(rising[:150], 10, 200, 5)[0])
+
+    def test_trades_in_the_minutes_before_the_close(self):
+        s = rebalancer.DipRotation(strategy_params("dip-rotation"))
+        broker = mock.Mock(session_opened_at=mock.Mock(return_value=utc(2026, 10, 7, 13, 30)))
+        self.assertIsNone(s.period(broker, utc(2026, 10, 7, 19, 49)))                 # 15:49
+        self.assertEqual(s.period(broker, utc(2026, 10, 7, 19, 50)), "2026-10-07")    # 15:50
+        self.assertIsNone(s.period(broker, utc(2026, 10, 7, 19, 59, 30)))             # the last minute
+        self.assertEqual(s.period(broker, utc(2026, 11, 27, 17, 52)), "2026-11-27")   # 12:52 on a half day
+        self.assertIsNone(s.period(broker, utc(2026, 11, 27, 20, 52)))                # 15:52: it shut at 13:00
+        broker.session_opened_at.return_value = None
+        self.assertIsNone(s.period(broker, utc(2026, 10, 7, 19, 52)))
+
+    def test_sixty_forty_outside_a_dip(self):
+        t = self.targets(self.bot()[0])
+        self.assertAlmostEqual(t["VTI"].size * self.quotes["VTI"].mid, 600, places=3)
+        self.assertAlmostEqual(t["GOVT"].size * 80, 400, places=3)
+        self.assertAlmostEqual(t["VTI"].band * self.quotes["VTI"].mid, 50)         # 5% of the budget
+        self.assertIn("no dip", t["VTI"].note)
+
+    def test_all_in_shares_during_a_dip(self):
+        self.dip_today()
+        t = self.targets(self.bot()[0])
+        self.assertAlmostEqual(t["VTI"].size * self.quotes["VTI"].mid, 1000, places=3)
+        self.assertEqual(t["GOVT"].size, 0)
+        self.assertIn("in a dip for 1 day(s)", t["VTI"].note)  # yesterday's 1.5% drop started it
+
+    def test_todays_part_day_bar_is_not_a_close(self):
+        # The 999 bar for today would make it no dip if it were read as yesterday's close.
+        self.dip_today()
+        self.assertIn("in a dip", self.targets(self.bot()[0])["VTI"].note)
+
+    def test_dip_rebalance_sells_the_bonds_then_buys_shares(self):
+        self.dip_today()
+        price = self.quotes["VTI"].mid
+        mine = {"VTI": Position("VTI", "long", 600 / price, price), "GOVT": Position("GOVT", "long", 5.0, 80.0)}
+        bot, broker = self.bot(mine)
+        bot.state.positions = {"VTI": {"direction": "long"}, "GOVT": {"direction": "long"}}
+        with mock.patch.object(bot.strategy, "period", return_value="2026-10-07"), \
+                mock.patch.object(rebalancer.time, "time", return_value=self.TODAY_NOW):
+            bot.cycle()
+            self.assertEqual([o[:3] for o in broker.orders], [("close", "GOVT", None), ("open", "VTI", "long")])
+            self.assertAlmostEqual(broker.orders[1][3] * price, 400, places=3)
+            broker.orders.clear()
+            bot.cycle()                                                 # the same day again: nothing
         self.assertEqual(broker.orders, [])
 
 
